@@ -35,6 +35,10 @@ pub mod side_dock;
 mod task_picker;
 pub mod model;
 pub mod monitor;
+pub mod webdav;
+#[cfg(windows)]
+pub mod webdav_player;
+pub mod webdav_ui;
 pub mod renderer;
 pub mod otp;
 pub mod quota;

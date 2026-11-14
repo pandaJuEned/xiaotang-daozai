@@ -642,6 +642,10 @@ pub struct App {
     pub monitor_history: Option<crate::monitor::HistoryStore>,
     /// 仪表盘底部历史：每秒一条，供六列概览与折线使用。
     pub monitor_trend: crate::monitor::Trend,
+    /// WebDAV 音乐的连接与浏览状态。
+    pub webdav: crate::webdav_ui::Ui,
+    /// 上次落盘的 WebDAV 配置，用来判断是否需要再写。
+    pub webdav_saved: crate::webdav::Config,
     /// 最近一次采集快照。设置页的实况卡用它，避免为了显示数值再开一条通道。
     pub monitor_last: Option<crate::monitor::MonitorSnapshot>,
     /// 仪表盘窗口置顶。会话内状态，不改配置文件。
@@ -918,6 +922,7 @@ impl App {
             monitor_cfg: crate::monitor::MonitorConfig::load(), monitor_open: false,
             monitor_interfaces: Vec::new(), monitor_history: None,
             monitor_trend: Default::default(), monitor_last: None,
+            webdav: Default::default(), webdav_saved: crate::webdav::Config::load(),
             monitor_pinned: true, monitor_click: false, monitor_menu: false,
             monitor_page: 0,
             listener_status: "尚未连接".into(),

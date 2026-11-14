@@ -1537,6 +1537,7 @@ impl App {
                             ui.add_space(3.0);
                             ui.small("正数提前，负数延后；默认提前 0.35 秒。");
                         });
+                        self.webdav_settings(ui);
                     }
                     2=>{
                         settings_label(ui,"计时时长");
