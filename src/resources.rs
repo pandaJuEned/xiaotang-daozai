@@ -22,6 +22,9 @@ impl Lease {
 impl Drop for Lease {fn drop(&mut self){self.0.active.fetch_sub(1,Ordering::Release);}}
 
 pub static POLLER:Lane=Lane::new("daozai-media",1);
+/// 系统监控采样（P2）：上限 2 允许「旧线程正在退出 / 新实例刚启动」短暂交接，
+/// 避免配置改动后重启服务被 Lane 拒绝（与 ARTWORK 同一策略）。
+pub static SYSTEM_MONITOR:Lane=Lane::new("daozai-monitor",2);
 // 允许旧实例正在退出与新实例短暂交接；阻塞任务跨缓存重建仍受此上限约束。
 pub static ARTWORK:Lane=Lane::new("daozai-artwork",2);
 pub static COVER:Lane=Lane::new("daozai-cover",2);

@@ -13,9 +13,14 @@ pub(crate) const MUSIC: usize = 6;
 pub(crate) const FOCUS: usize = 7;
 pub(crate) const BELL: usize = 8;
 pub(crate) const PET: usize = 9;
+/// 网速槽（P3）：固定排在末尾，不参与用户拖动排序，避免扩容 `DEFAULT_ORDER`。
+/// 必须追加在 WIDTHS 末尾——`quota_slot()` 用 `WIDTHS.len()` 作动态额度环起点，会自动顺延。
+pub(crate) const NETSPEED: usize = 10;
 /// 天气徽标的基础槽宽；温度文字更长时由 `widen` 补足。
 pub(crate) const WEATHER_WIDTH: f32 = 38.0;
-const WIDTHS: [f32; 10] = [44.0,20.0,27.0,27.0,27.0,WEATHER_WIDTH,14.0,crate::focus_bar::WIDTH,20.0,32.0];
+/// 网速用简洁格式绘制（↓1.2M ↑300K），固定宽度足够，不撑宽岛体。
+pub(crate) const NETSPEED_WIDTH: f32 = 92.0;
+const WIDTHS: [f32; 11] = [44.0,20.0,27.0,27.0,27.0,WEATHER_WIDTH,14.0,crate::focus_bar::WIDTH,20.0,32.0,NETSPEED_WIDTH];
 
 pub(crate) const DEFAULT_ORDER: [usize;6]=[BATTERY,PET,CLOCK,QUOTA,MUSIC,FOCUS];
 pub(crate) fn valid_order(order:&[usize])->bool {
@@ -44,7 +49,12 @@ pub(crate) struct Layout {
 }
 
 impl Layout {
+    /// 保持原有 7 参数签名，避免改动全部现有调用点（含 UI 回归测试）。
     pub fn new(battery:bool,quotas:usize,music:bool,focus:bool,bell:bool,pet:bool,weather:bool)->Self {
+        Self::with_net(battery,quotas,music,focus,bell,pet,weather,false)
+    }
+    /// 带网速槽的排布；`net=false` 时与 `new` 完全一致。
+    pub fn with_net(battery:bool,quotas:usize,music:bool,focus:bool,bell:bool,pet:bool,weather:bool,net:bool)->Self {
         fn place(cursor:&mut f32,width:f32)->f32 {let x=*cursor+width/2.0;*cursor+=width+12.0;x}
         let mut widths=WIDTHS.to_vec(); widths.resize(WIDTHS.len()+quotas.saturating_sub(3),27.0);
         let mut x=vec![None;widths.len()];let mut cursor=16.0;
@@ -67,7 +77,7 @@ impl Layout {
                 _=>{},
             }
         }
-        for (slot,on) in [(MUSIC,music&&!bell),(FOCUS,focus),(BELL,bell)] {
+        for (slot,on) in [(MUSIC,music&&!bell),(FOCUS,focus),(BELL,bell),(NETSPEED,net)] {
             if on {x[slot]=Some(place(&mut cursor,WIDTHS[slot]));}
         }
         let width=cursor-12.0+16.0;
@@ -87,7 +97,8 @@ impl Layout {
     pub fn reorder(&mut self,order:&[usize]) {
         if !valid_order(order){return;}
         let original=self.x.clone();let mut cursor=-self.width/2.0+16.0;
-        for slot in order.iter().copied().chain(std::iter::once(BELL)) {
+        // 网速与铃铛一样固定排在末尾：不参与用户排序，但必须随重排重新落位，避免与前面的槽重叠。
+        for slot in order.iter().copied().chain(std::iter::once(BELL)).chain(std::iter::once(NETSPEED)) {
             let slots:Vec<usize>=if slot==QUOTA{self.quota_slots().collect()}
                 else if slot==CLOCK&&self.x[WEATHER].is_some(){vec![CLOCK,WEATHER]}
                 else{vec![slot]};
@@ -119,7 +130,7 @@ pub(crate) struct Motion {
     initialized: bool,
 }
 impl Default for Motion {
-    fn default()->Self {Self {target:Layout::new(false,0,false,false,false,false,false),positions:vec![Spring::new(0.0,360.0,0.76);10],initialized:false}}
+    fn default()->Self {Self {target:Layout::new(false,0,false,false,false,false,false),positions:vec![Spring::new(0.0,360.0,0.76);11],initialized:false}}
 }
 impl Motion {
     pub fn step(&mut self,target:Layout,dt:f32,animate:bool) {
@@ -143,6 +154,20 @@ impl Motion {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn netspeed_slot_sits_at_the_end_without_shifting_other_components() {
+        use super::*;
+        let base = Layout::new(true, 3, true, true, false, true, false);
+        let with_net = Layout::with_net(true, 3, true, true, false, true, false, true);
+        assert!(base.x[NETSPEED].is_none());
+        assert!(with_net.x[NETSPEED].is_some());
+        assert!((with_net.width - base.width - NETSPEED_WIDTH - 12.0).abs() < 0.01);
+        let mut reordered = with_net.clone();
+        reordered.reorder(&DEFAULT_ORDER);
+        assert!(reordered.x[NETSPEED].is_some(), "重排后网速槽仍须就位");
+        assert!(reordered.width < crate::app::WIN_W);
+    }
+
     use super::*;
     #[test] fn deepseek_balance_follows_more_and_never_overlaps(){
         for order in [DEFAULT_ORDER,[FOCUS,MUSIC,QUOTA,CLOCK,PET,BATTERY]] {for quotas in 1..=6 {for battery in [false,true]{

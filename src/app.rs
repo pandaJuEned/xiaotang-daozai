@@ -37,7 +37,10 @@ pub const MAIL_PAGE: usize = 5;
 pub const QUOTA_PAGE: usize = 6;
 pub const CALENDAR_PAGE: usize = 7;
 pub const WEATHER_PAGE: usize = 8;
+/// 系统监控页（第 10 个功能页面）。
+pub const MONITOR_PAGE: usize = 9;
 pub(crate) const WEATHER_H: f32 = 232.0;
+pub(crate) const MONITOR_H: f32 = 236.0;
 pub(crate) const CALENDAR_H: f32 = 216.0;
 pub const BAR_W: f32 = 163.0; // 收起药丸宽
 pub const BAR_H: f32 = 30.0; // 收起药丸高
@@ -64,8 +67,8 @@ fn pill_shadow(painter:&egui::Painter,rect:Rect,radius:f32,strength:f32){
         painter.rect_filled(r,radius+grow*0.8,Color32::from_black_alpha((255.0*a*strength) as u8));
     }
 }
-pub(crate) const PAGE_NAMES: [&str; 9] = ["音乐", "专注", "健康", "置物架", "待办", "邮箱", "AI 额度", "日程", "天气"];
-pub(crate) const PAGE_SETTINGS_TABS: [usize; 9] = [1,2,3,5,4,7,11,8,12];
+pub(crate) const PAGE_NAMES: [&str; 10] = ["音乐", "专注", "健康", "置物架", "待办", "邮箱", "AI 额度", "日程", "天气", "系统监控"];
+pub(crate) const PAGE_SETTINGS_TABS: [usize; 10] = [1,2,3,5,4,7,11,8,12,13];
 
 // ---------- 动效参数 ----------
 /// 悬停意图缓冲：光标停留这么久才真正展开（期间药丸轻微胀大作为反馈），防误触。
@@ -131,6 +134,8 @@ pub struct Env {
     pub glass_blur: bool,
     /// 不支持逐像素透明的兼容后端需要按内容轮廓裁剪窗口。
     pub opaque_surface: bool,
+    /// 系统监控采样（P2）；模块关闭或非 Windows 时为 None。
+    pub monitor: Option<crate::monitor::MonitorSnapshot>,
 }
 
 impl Env {
@@ -194,6 +199,8 @@ pub enum Cmd {
     CalendarImport,
     /// 重启岛仔（切换渲染方式后生效）。
     RestartApp,
+    /// 系统监控配置已修改：外壳在下一帧重建采集服务。
+    MonitorReconfigure,
 }
 
 /// 毛玻璃皮肤下原生窗口区域的组成部分（相对 `win` 左上角，逻辑点）。
@@ -625,6 +632,26 @@ const DRAG_MAGNET: f32 = 5.0;
 pub struct App {
     pub opts: Options,
     pub settings: model::Settings,
+    /// 系统监控配置（P3）：设置窗口与托盘共用这一份，外壳从此处读取后启停采集服务。
+    pub monitor_cfg: crate::monitor::MonitorConfig,
+    /// 独立监控悬浮窗是否打开（托盘开关与设置页共用）。
+    pub monitor_open: bool,
+    /// 可用网卡（P4）：外壳在 Windows 启动时填充 `(InterfaceIndex, 名称)`，非 Windows 为空。
+    pub monitor_interfaces: Vec<(u32, String)>,
+    /// 历史流量缓存（P4）：打开历史页签时读一次，避免每帧读盘。
+    pub monitor_history: Option<crate::monitor::HistoryStore>,
+    /// 仪表盘底部历史：每秒一条，供六列概览与折线使用。
+    pub monitor_trend: crate::monitor::Trend,
+    /// 最近一次采集快照。设置页的实况卡用它，避免为了显示数值再开一条通道。
+    pub monitor_last: Option<crate::monitor::MonitorSnapshot>,
+    /// 仪表盘窗口置顶。会话内状态，不改配置文件。
+    pub monitor_pinned: bool,
+    /// 仪表盘鼠标穿透：开启后点击穿过窗口，需从托盘菜单关掉。
+    pub monitor_click: bool,
+    /// 齿轮菜单是否展开。
+    pub monitor_menu: bool,
+    /// 仪表盘底部翻页：0 = 负载（CPU/内存/GPU），1 = 网络（下行/上行）。
+    pub monitor_page: usize,
     /// 本次运行实际使用兼容渲染（Direct3D 12）；设置里的开关与它不同时提示重启。
     pub render_compat_running: bool,
     pub(crate) todos: model::TodoList,
@@ -655,7 +682,7 @@ pub struct App {
     page_dir: f32,
     page_t0: f64,
     slide: Spring,
-    dots: [Spring; 9],
+    dots: [Spring; 10],
     wheel_delta: f32,
     wheel_at: f64,
     wheel_page_at: f64,
@@ -888,6 +915,11 @@ impl App {
             media: NowPlaying::default(),
             music_artwork: None,
             forced_open_until:0.0, settings_open:false, settings_window:std::sync::Arc::new(std::sync::Mutex::new(crate::settings_window::State::load())), displays:Vec::new(), browser_at_top:false, browser_minimal_active:false, glass_tint:0.0, fluid:Default::default(), fluid_origin:Pos2::ZERO, fluid_art:None, fluid_title:String::new(), screen:None, settings_focus_requested:false, settings_tab:0, settings_category:0, messenger_statuses:Default::default(), notification_apps:model::NotificationApps::load(), subpage:None, task_dialog:None,
+            monitor_cfg: crate::monitor::MonitorConfig::load(), monitor_open: false,
+            monitor_interfaces: Vec::new(), monitor_history: None,
+            monitor_trend: Default::default(), monitor_last: None,
+            monitor_pinned: true, monitor_click: false, monitor_menu: false,
+            monitor_page: 0,
             listener_status: "尚未连接".into(),
             notification_bell_until: 0.0, notification_bell_at: -10.0, notice: None, hud_notice: None, hud_alpha: 0.0, notice_width:Spring::new(0.0,CLOSE.0,CLOSE.1), notice_details:false, pending_messengers:Vec::new(), messenger_scroll:0.0, alerts: Default::default(), history: Default::default(), pending: vec![],
             todo_first: 0, todo_choosing: false, pet: Default::default(), last_drink: None,
@@ -1662,7 +1694,7 @@ impl App {
     }
 
     pub(crate) fn expanded_height(&self)->f32 {
-        if self.page==CALENDAR_PAGE {CALENDAR_H}else if self.page==WEATHER_PAGE {WEATHER_H}else if self.page==6{176.0}else if self.page==5&&self.mail.open_uid.is_some(){236.0}else{PH}
+        if self.page==CALENDAR_PAGE {CALENDAR_H}else if self.page==WEATHER_PAGE {WEATHER_H}else if self.page==MONITOR_PAGE {MONITOR_H}else if self.page==6{176.0}else if self.page==5&&self.mail.open_uid.is_some(){236.0}else{PH}
     }
 
     // ---------------------------------------------------------------
@@ -1721,7 +1753,7 @@ impl App {
         self.update_media(env,&ctx);
         let bell=self.t<self.notification_bell_until&&!self.compact_notices();
         self.resident_power=(env.battery,env.charging);
-        let mut layout=Layout::new(self.settings.show_battery&&env.battery.is_some(),self.quota_bar_indices().len(),self.media.is_music()&&!bell,self.pomo.running,bell,self.pet_enabled(),self.weather_pill().is_some());
+        let mut layout=Layout::with_net(self.settings.show_battery&&env.battery.is_some(),self.quota_bar_indices().len(),self.media.is_music()&&!bell,self.pomo.running,bell,self.pet_enabled(),self.weather_pill().is_some(),self.settings.show_net_speed&&env.monitor.is_some());
         layout.reorder(&self.settings.resident_order);
         for (position,extra) in self.quota_balance_layout(&ctx){layout.balance_tail(position,extra);}
         if self.settings.clock_period!=0 { layout.widen_clock(40.0); }
@@ -2699,6 +2731,17 @@ impl App {
         if self.pomo.running && compact_alpha>0.004 {
             crate::focus_bar::draw(&base.faded(compact_alpha),local_cx+layout.x[bar::FOCUS].unwrap(),15.0,self.t,&self.pomo,self.phase_secs(self.pomo.phase),false);
         }
+        // 常驻栏网速：强制简洁格式固定宽度，避免文字变长撑宽岛体导致 region/命中区抖动。
+        if self.settings.show_net_speed && compact_alpha>0.004 {
+            if let (Some(m),Some(x))=(env.monitor,layout.x[bar::NETSPEED]) {
+                let mut style=self.monitor_cfg.display;
+                style.short_mode=true;style.space=false;
+                let down=crate::monitor::format_speed(m.down_bps,&style);
+                let up=crate::monitor::format_speed(m.up_bps,&style);
+                let text=format!("↓{down} ↑{up}");
+                base.faded(compact_alpha).text(local_cx+x,21.0,&text,12.0,W::Bold,theme::WHITE,H::Center);
+            }
+        }
     }
 
     /// 常驻内容：顶部停靠走共享元素过渡（药丸里的电池、时钟飞到顶栏）；
@@ -2796,6 +2839,7 @@ impl App {
             4 => ("待办", "清单", theme::GREEN),
             5 => ("邮箱", "", theme::CYAN),
             6 => ("AI", "额度", theme::SOFT_GREEN),
+            MONITOR_PAGE => ("系统", "监控", theme::CYAN),
             8 if self.weather.solar_open => ("日出", "日落", theme::YELLOW),
             8 => ("当地", "天气", theme::CYAN),
             _ => ("岛仔", "设置", theme::WHITE),
@@ -2809,7 +2853,8 @@ impl App {
     fn nav(&mut self, c: &Card) {
         let pages: Vec<_>=self.settings.page_order.iter().copied().filter(|page|self.settings.visible_pages[*page]).collect();
         if pages.len()<2 { return; }
-        let arrow_y=if self.page==6||self.page==8{88.0}else{68.0};
+        // 高页面（额度、天气、系统监控）的箭头要下移，跟内容中线对齐。
+        let arrow_y=if self.page==6||self.page==8||self.page==MONITOR_PAGE{88.0}else{68.0};
         let l = c.hit(8.0, arrow_y-13.0, 26.0, 26.0, "nav-l");
         let r = c.hit(385.0, arrow_y-13.0, 26.0, 26.0, "nav-r");
         let (lh, lp) = c.hover_t(&l);
@@ -2857,6 +2902,7 @@ impl App {
             6 => self.page_quota(c),
             8 => self.page_weather(c,env,cmds),
             CALENDAR_PAGE => self.page_calendar(c,env),
+            MONITOR_PAGE => self.page_monitor(c,env),
             _ => self.page_settings(c),
         }
     }

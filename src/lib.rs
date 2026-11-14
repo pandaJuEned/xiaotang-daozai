@@ -3,6 +3,7 @@
 //! - `app` / `pages`：与平台无关的界面与动效（外壳与录制器共用）
 //! - `anim` / `paint` / `shape` / `theme`：弹簧、矢量绘制、面板轮廓、配色字体
 //! - `model` / `lyrics` / `smtc` / `icons`：数据、歌词、系统媒体、文件图标
+//! - `monitor`：系统监控纯逻辑（速率、单位、流量、阈值），平台无关
 //! - `native` / `tray`：仅 Windows 的窗口区域、命中穿透与托盘
 
 pub mod display_layout;
@@ -33,6 +34,7 @@ pub mod clipboard;
 pub mod side_dock;
 mod task_picker;
 pub mod model;
+pub mod monitor;
 pub mod renderer;
 pub mod otp;
 pub mod quota;
@@ -41,6 +43,9 @@ pub mod weather;
 mod weather_ui;
 mod pages;
 mod extras;
+mod monitor_page;
+mod monitor_ui;
+mod monitor_widget;
 mod pet;
 mod pet_expressions;
 mod bar_layout;
@@ -53,6 +58,8 @@ pub mod backdrop;
 pub mod composition;
 #[cfg(windows)]
 pub mod system;
+#[cfg(windows)]
+pub mod monitor_win;
 pub mod paint;
 pub mod shape;
 mod fluid;

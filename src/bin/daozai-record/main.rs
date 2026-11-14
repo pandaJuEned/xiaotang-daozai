@@ -453,6 +453,7 @@ fn main() {
             backdrop: None,
             glass_blur: false,
             opaque_surface: false,
+            monitor: None,
         };
 
         let mut vp = egui::ViewportInfo::default();

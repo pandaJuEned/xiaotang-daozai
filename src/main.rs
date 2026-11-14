@@ -85,6 +85,12 @@ struct Shell {
     quota: daozai::quota::Service,
     quota_sig: Option<(bool,Vec<daozai::quota::Account>)>,
     quota_at: PollClock,
+    /// P2/P3：系统监控采集服务与最近一帧快照（仅 Windows）。
+    /// 配置只有一份，放在 `app.monitor_cfg`，设置页与托盘共用，避免两处不同步。
+    #[cfg(windows)]
+    monitor: Option<daozai::monitor_win::Service>,
+    #[cfg(windows)]
+    monitor_state: Option<daozai::monitor::MonitorSnapshot>,
 }
 
 const MODULE_OFF:&str="该功能已在「页面管理」中关闭";
@@ -92,6 +98,21 @@ const MODULE_OFF:&str="该功能已在「页面管理」中关闭";
 impl Shell {
     /// 按模块开关启停后台服务：关闭的模块不保留任何线程，重新开启时从头对齐配置。
     fn reconcile_modules(&mut self,ctx:&egui::Context){
+        #[cfg(windows)]
+        {
+            // 资源保护熔断时一并停掉采样，与其他后台任务同一策略。
+            // 页面被关掉、又没开常驻栏网速与监控窗口时停采样，符合「关闭的功能不在后台运行」。
+            let wanted = self.app.module_on(app::MONITOR_PAGE)
+                || self.app.settings.show_net_speed
+                || self.app.monitor_open;
+            let on=self.app.monitor_cfg.enabled && wanted && !daozai::resources::GUARD.tripped();
+            if on!=self.monitor.is_some() {
+                self.monitor=if on {
+                    Some(daozai::monitor_win::Service::start(ctx.clone(),self.app.monitor_cfg.clone()))
+                } else { None };
+                if !on {self.monitor_state=None;}
+            }
+        }
         let mail_on=self.app.module_on(app::MAIL_PAGE);
         if mail_on!=self.mail.is_some() {self.mail=mail_on.then(daozai::mail::Service::start);self.mail_sig=None;}
         let cal_on=self.app.module_on(app::CALENDAR_PAGE);
@@ -121,6 +142,12 @@ impl Shell {
         diagnostics::startup("加载本地配置");
         let mut app = App::new(&cc.egui_ctx, Options::default());
         app.render_compat_running=running_compat;
+        #[cfg(windows)]
+        {
+            // P4：网卡列表只在启动时取一次，热插拔后重启生效（与设置页下拉共用）。
+            app.monitor_interfaces = daozai::monitor_win::list_interfaces()
+                .into_iter().map(|i|(i.index,i.name)).collect();
+        }
         #[cfg(feature="record")] let quota_demo=std::env::var("DAOZAI_QUOTA_DEMO").is_ok();
         #[cfg(not(feature="record"))] let quota_demo=false;
         diagnostics::startup("初始化额度配置");
@@ -145,6 +172,7 @@ impl Shell {
             pet: app.settings.pet,
             minimal: app.settings.minimal,
             autostart,
+            monitor: app.monitor_open,
         });
         diagnostics::startup("初始化通知监听");
         #[cfg(windows)]
@@ -207,6 +235,8 @@ impl Shell {
             cal_sig: None,
             clipboard_watch: None,
             quota: daozai::quota::Service::start(), quota_sig: None, quota_at: PollClock::default(),
+            #[cfg(windows)] monitor: None,
+            #[cfg(windows)] monitor_state: None,
         }
     }
 
@@ -236,10 +266,16 @@ impl Shell {
                         Err(e) => self.app.say(e),
                     }
                 }
+                Event::ToggleMonitor => {
+                    self.app.monitor_open = !self.app.monitor_open;
+                    // 关闭时顺手关掉穿透，否则下次打开会点不动窗口。
+                    if !self.app.monitor_open { self.app.monitor_click = false; }
+                    self.app.say(if self.app.monitor_open { "监控窗口已打开" } else { "监控窗口已关闭" });
+                }
             }
         }
         if let Some(t) = &self.tray {
-            t.sync(tray::State { pet: self.app.settings.pet, minimal: self.app.settings.minimal, autostart: self.autostart });
+            t.sync(tray::State { pet: self.app.settings.pet, minimal: self.app.settings.minimal, autostart: self.autostart, monitor: self.app.monitor_open });
         }
     }
 
@@ -309,6 +345,10 @@ impl Shell {
             opaque_surface: {
                 #[cfg(windows)] {self.native.as_ref().is_some_and(|w|w.opaque_surface())}
                 #[cfg(not(windows))] {false}
+            },
+            monitor: {
+                #[cfg(windows)] {self.monitor_state}
+                #[cfg(not(windows))] {None}
             },
         }
     }
@@ -414,6 +454,26 @@ impl eframe::App for Shell {
                 self.system_state=new;
                 self.system_ready=true;
                 self.fullscreen=observation.fullscreen;
+            }
+            if let Some(service)=&self.monitor {
+                while let Some(snapshot)=service.try_recv(){
+                    // 仪表盘六列概览与折线共用一个时间轴，按快照到达顺序入库。
+                    self.app.monitor_trend.push(daozai::monitor::TrendSample{
+                        at: chrono::Local::now().timestamp(),
+                        cpu: snapshot.cpu_percent.unwrap_or(0.0),
+                        mem: snapshot.mem_percent().unwrap_or(0.0),
+                        gpu: snapshot.gpu_percent.unwrap_or(0.0),
+                        disk: snapshot.disk_percent.unwrap_or(0.0),
+                        down: snapshot.down_bps as f32,
+                        up: snapshot.up_bps as f32,
+                    });
+                    self.monitor_state=Some(snapshot);
+                    self.app.monitor_last=Some(snapshot);
+                }
+                // P4：阈值告警交给系统托盘气泡，声音跟随全局「提醒声音」开关。
+                while let Some(text)=service.try_alert() {
+                    if let Some(tray)=&self.tray{tray.notify("岛仔 · 系统监控",&text,self.app.settings.sound);}
+                }
             }
             self.hidden=daozai::display_layout::hide_for_fullscreen(self.app.settings.hide_fullscreen,self.fullscreen,daozai::display_layout::selected(&self.app.displays,&self.app.settings.display_id).map(|d|d.bounds));
             // 毛玻璃：在岛体左右两侧和画布底边（都在窗口区域之外）取样，估计岛背后的明暗。
@@ -692,6 +752,13 @@ impl eframe::App for Shell {
                     }
                 },
                 Cmd::Focus => ctx.send_viewport_cmd(egui::ViewportCommand::Focus),
+                Cmd::MonitorReconfigure => {
+                    // 配置已由设置页写盘；这里只让旧服务退出，下一帧 reconcile_modules 用新配置重建。
+                    #[cfg(windows)] {
+                        self.monitor=None;
+                        self.monitor_state=None;
+                    }
+                },
             }
         }
 
@@ -699,6 +766,7 @@ impl eframe::App for Shell {
         #[cfg(windows)] let autostart = self.autostart;
         #[cfg(not(windows))] let autostart = false;
         self.app.settings_ui(ctx, autostart);
+        self.app.monitor_window(ctx, &env);
         self.app.mail_reader_ui(ctx);
         #[cfg(windows)] let repaint_after=if self.hidden{Duration::from_secs(1)}else{out.repaint_after};
         #[cfg(not(windows))] let repaint_after=out.repaint_after;
