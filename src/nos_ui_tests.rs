@@ -145,3 +145,31 @@ fn nos_remote_mode_keeps_the_manually_entered_server_address() {
     assert_eq!(h.app.nos_config().base_url,"http://192.168.1.10:8000",
         "关闭本地服务时岛仔只是客户端，不该改写手填的服务器地址");
 }
+
+#[test]
+fn nos_meetings_enter_the_calendar_but_todos_stay_on_the_todo_page(){
+    use super::{ENV_LOCK,H};
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+    let mut h=H::new();
+    let day=(chrono::Local::now().date_naive()+chrono::Duration::days(1)).format("%Y-%m-%d").to_string();
+    let event=|uid:&str,title:&str,kind:&str,start:&str,end:&str|crate::nos::Event{
+        uid:uid.into(),kind:kind.into(),title:title.into(),date:day.clone(),
+        start_time:start.into(),end_time:end.into(),all_day:false,
+        location:"会议室".into(),color:String::new(),teacher:String::new(),
+        course_id:String::new(),semester_id:"s1".into(),week:Some(11),status:String::new()};
+    let agenda=crate::nos::Agenda{
+        semesters:vec![crate::nos::Semester{id:"s1".into(),name:"2026 秋季".into(),week_start_day:"sunday".into()}],
+        events:vec![
+            event("m1","组会","meeting","14:30","16:10"),
+            event("t1","写周报","todo","09:30",""),
+        ],at:0};
+    h.app.set_nos_agenda(agenda);
+    assert_eq!(h.app.nos_events.len(),1,"会议进日程，待办不能混进日程");
+    assert_eq!(h.app.nos_todos.len(),1,"待办只进待办页");
+    let date=chrono::NaiveDate::parse_from_str(&day,"%Y-%m-%d").unwrap();
+    let titles:Vec<&str>=h.app.calendar_entries(date).iter()
+        .filter(|entry|entry.sources.contains(&crate::calendar_ui::Source::Nos))
+        .map(|entry|entry.event.title.as_str()).collect();
+    assert!(titles.contains(&"组会"),"NOS 会议应出现在日程页：{titles:?}");
+    assert!(!titles.contains(&"写周报"),"NOS 待办不该在日程页重复出现：{titles:?}");
+}
