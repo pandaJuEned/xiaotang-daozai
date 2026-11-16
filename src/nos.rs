@@ -270,6 +270,10 @@ pub fn parse(body: &str, at: i64) -> Result<Agenda, String> {
 /// 构造 agenda 请求地址。
 pub fn agenda_url(base: &str, from: &str, to: &str) -> Result<url::Url, String> {
     let mut url = url::Url::parse(base.trim())
+        .map_err(|_| "课表服务器地址无效".to_string())?
+        // 用户填的是站点根；必须落到聚合接口。否则请求打到静态首页拿到 HTML，
+        // 再按 JSON 解析就只会报含糊的「课表响应格式无效」。
+        .join("/api/daozai/agenda")
         .map_err(|_| "课表服务器地址无效".to_string())?;
     {
         let mut query = url.query_pairs_mut();
@@ -713,8 +717,11 @@ mod tests {
     #[test]
     fn agenda_url_appends_date_range() {
         let url = agenda_url("http://example.com:8000/", "2026-11-14", "2026-11-20").unwrap();
+        assert_eq!(url.path(), "/api/daozai/agenda", "必须打到聚合接口，不能打到静态首页");
         assert!(url.as_str().contains("from=2026-11-14"), "{}", url);
         assert!(url.as_str().contains("to=2026-11-20"), "{}", url);
+        let with_path = agenda_url("http://example.com:8000/nos", "a", "b").unwrap();
+        assert_eq!(with_path.path(), "/api/daozai/agenda", "填了子路径也要落到固定接口");
         assert!(agenda_url("not a url", "a", "b").is_err());
     }
 
