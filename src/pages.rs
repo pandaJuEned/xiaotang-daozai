@@ -884,7 +884,13 @@ impl App {
         // 今天未完成优先，已完成沉底；不在今天的重复待办变暗显示、不能勾选。
         let (done, total) = self.todos.progress(&env.today);
         let order = self.todos.display_order(&env.today);
-        let count = order.len();
+        // 本机待办与 NOS 待办混排在同一个列表里：NOS 项只读，不参与编辑/删除/提醒。
+        let mut rows: Vec<(crate::model::TodoItem, Option<usize>, bool)> = order.iter()
+            .map(|&i|(self.todos.items[i].clone(),Some(i),false)).collect();
+        let mut nos: Vec<_> = self.nos_todos.iter().enumerate().collect();
+        nos.sort_by_key(|(j,item)|(item.done_for(&env.today),item.due.clone().unwrap_or_default(),*j));
+        rows.extend(nos.into_iter().map(|(j,item)|(item.clone(),None,true)));
+        let count = rows.len();
         let pop = self.todo_pop.pos.abs().min(0.4);
         let hc = c.scaled(60.0, 50.0, 1.0 + pop * 0.25);
         let w = hc.text(42.0, 61.0, &format!("{done}"), size::HERO, W::Bold, if done > 0 && done == total { theme::GREEN } else { theme::WHITE }, H::Left);
@@ -923,16 +929,32 @@ impl App {
             let ctx = c.ui.ctx().clone();
             let cap = if editing { 2 } else { 3 };
             let mut shown = 0;
-            for &i in order.iter().skip(self.todo_first.min(count.saturating_sub(1))) {
+            for (item, local, is_nos) in rows.iter().skip(self.todo_first.min(count.saturating_sub(1))) {
                 if shown >= cap {
                     break;
                 }
+                let y = row_y(row);
+                // NOS 待办：只读混排 —— 蓝点 + 标题 + 截止时刻 + NOS 标签，不能勾选/编辑/删除。
+                if *is_nos {
+                    let due = item.due.as_deref().unwrap_or("");
+                    let clock = due.get(11..16).unwrap_or("");
+                    let hint = format!("来自不止课表 · 截止 {due}\n只读，请到 NOS 中修改");
+                    let r = c.hit(202.0, y - 10.0, 169.0, 20.0, ("todo-nos", item.text.as_str())).on_hover_text(hint);
+                    if r.hovered() { c.fill(202.0, y - 10.0, 169.0, 20.0, 7.0, Color32::from_white_alpha(10)); }
+                    c.ring(212.0, y, 5.2, 1.3, theme::BLUE);
+                    let text = c.fit(&item.text, size::BODY, W::Regular, 82.0);
+                    c.text(223.0, y + 3.8, &text, size::BODY, W::Regular, Color32::from_gray(205), H::Left);
+                    if !clock.is_empty() { c.text(301.0, y + 3.8, clock, size::TINY, W::Regular, theme::GRAY, H::Left); }
+                    c.text(366.0, y + 3.8, "NOS", size::TINY, W::Regular, theme::BLUE, H::Right);
+                    row += 1;
+                    shown += 1;
+                    continue;
+                }
+                let i = local.expect("本机待办必须有索引");
                 if Some(i) == self.editing {
                     continue;
                 }
-                let item = self.todos.items[i].clone();
                 let today_item = item.scheduled_on(&env.today);
-                let y = row_y(row);
                 let r = c.hit(202.0, y - 10.0, 169.0, 20.0, ("todo", i, item.text.as_str()));
                 let (h, _) = c.hover_t(&r);
                 if h > 0.01 {
@@ -948,7 +970,6 @@ impl App {
                         paint::check(c, 212.0, y, 6.0, smoothstep(0.3, 1.0, ct), 1.4, Color32::BLACK);
                     }
                 }
-                // 每周重复：文字右侧小标签（周一三五 / 工作日 / 每天）。
                 let tag = crate::model::repeat_tag(item.repeat);
                 let tag_w = if tag.is_empty() { 0.0 } else { c.text_w(&tag, size::TINY, W::Regular) + 6.0 };
                 let text = c.fit(&item.text, size::BODY, W::Regular, 104.0 - tag_w);

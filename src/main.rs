@@ -137,7 +137,7 @@ impl Shell {
         let nos_on=self.app.settings.nos_enabled && nos_cfg.ready();
         if nos_on!=self.nos.is_some() {
             self.nos=if nos_on {Some(daozai::nos::Service::start(ctx.clone(),nos_cfg))} else {None};
-            if !nos_on {self.app.nos_error=None;self.app.nos_events.clear();self.app.nos_agenda=None;}
+            if !nos_on {self.app.nos_error=None;self.app.nos_events.clear();self.app.nos_todos.clear();self.app.nos_agenda=None;}
         }
         let clipboard_on=self.app.clipboard_active();
         if clipboard_on!=self.clipboard_watch.is_some() {
@@ -735,6 +735,7 @@ impl eframe::App for Shell {
                         self.nos=None;
                         self.app.nos_error=None;
                         self.app.nos_events.clear();
+                        self.app.nos_todos.clear();
                         self.app.nos_agenda=None;
                     }
                     Err(message) => {
@@ -974,6 +975,7 @@ impl eframe::App for Shell {
                     self.nos=None;
                     self.app.nos_error=None;
                     self.app.nos_events.clear();
+                    self.app.nos_todos.clear();
                     self.app.nos_agenda=None;
                 },
                 Cmd::NosRefresh => {
@@ -981,6 +983,7 @@ impl eframe::App for Shell {
                     self.nos=None;
                     self.app.nos_error=None;
                     self.app.nos_events.clear();
+                    self.app.nos_todos.clear();
                     self.app.nos_agenda=None;
                 },
                 Cmd::NosTest(base_url, token) => {

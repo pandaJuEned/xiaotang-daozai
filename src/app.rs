@@ -845,6 +845,8 @@ pub struct App {
     pub nos_events: Vec<mail::Meeting>,
     /// 课表原始数据；常驻栏的「下一节课」直接用它。
     pub nos_agenda: Option<crate::nos::Agenda>,
+    /// NOS 待办：只读混排进待办页，不写回本机 todo.txt。
+    pub nos_todos: Vec<model::TodoItem>,
     /// 当前学期名（显示用）。
     pub(crate) nos_semester: String,
     /// 课表最近一次错误（设置页显示）。
@@ -983,6 +985,7 @@ impl App {
             calendar: CalendarState::load(),
             nos_events: Vec::new(),
             nos_agenda: None,
+            nos_todos: Vec::new(),
             nos_semester: String::new(),
             nos_error: None,
             nos_server_status: crate::nos_server::Status::default(),
@@ -1249,6 +1252,16 @@ impl App {
     /// 收到一份课表：转成统一事件模型，供日程页与常驻栏使用。
     pub fn set_nos_agenda(&mut self, agenda: crate::nos::Agenda) {
         self.nos_events = agenda.events.iter().filter_map(crate::calendar_ui::nos_meeting).collect();
+        // NOS 待办 → 岛仔待办模型：只读展示，due 用「日期 + 时刻」，已完成的标记完成。
+        self.nos_todos = agenda.events.iter().filter(|event|event.is_todo()).map(|event|{
+            let due=if event.start_time.is_empty(){format!("{} 23:59",event.date)}else{format!("{} {}",event.date,event.start_time)};
+            let mut item=model::TodoItem::new(event.title.clone());
+            item.due=Some(due);
+            if event.todo_done(){item.done_on=Some(event.date.clone());}
+            // 不再由岛仔重复提醒：NOS 自己的提醒由服务端管理，避免双份。
+            item.reminded=true;
+            item
+        }).collect();
         self.nos_semester = agenda.current_semester().map(|s|s.name.clone()).unwrap_or_default();
         // 原始数据也要留着：常驻栏的「下一节课」直接用它（要按开始时刻筛选）。
         self.nos_agenda = Some(agenda);
@@ -1257,6 +1270,15 @@ impl App {
     /// 当前课表的下一节课（按现在时刻找）。
     pub fn nos_next_course(&self, now: i64) -> Option<&crate::nos::Event> {
         self.nos_agenda.as_ref().and_then(|agenda|agenda.next_course(now))
+    }
+
+    /// 此刻正在进行的日程：日历 / 邮件 / 本机 / 课表四类来源混排后取第一个进行中的。
+    /// 全天事件与没有结束时间的事件不算「进行中」，避免整天挂着。
+    pub fn current_calendar_event(&self, now: i64) -> Option<mail::Meeting> {
+        let today = chrono::Local::now().date_naive();
+        self.calendar_entries(today).into_iter()
+            .find(|entry|!entry.event.all_day && entry.event.start<=now && entry.event.end.is_some_and(|end|end>now))
+            .map(|entry|entry.event.clone())
     }
 
     pub(crate) fn refresh_calendar_month_status(&mut self) {
@@ -1831,7 +1853,8 @@ impl App {
         self.update_media(env,&ctx);
         let bell=self.t<self.notification_bell_until&&!self.compact_notices();
         self.resident_power=(env.battery,env.charging);
-        let mut layout=Layout::with_net(self.settings.show_battery&&env.battery.is_some(),self.quota_bar_indices().len(),self.media.is_music()&&!bell,self.pomo.running,bell,self.pet_enabled(),self.weather_pill().is_some(),self.settings.show_net_speed&&env.monitor.is_some(),self.settings.show_course&&self.nos_next_course(chrono::Local::now().timestamp()).is_some());
+        let now_secs=chrono::Local::now().timestamp();
+        let mut layout=Layout::with_status(self.settings.show_battery&&env.battery.is_some(),self.quota_bar_indices().len(),self.media.is_music()&&!bell,self.pomo.running,bell,self.pet_enabled(),self.weather_pill().is_some(),self.settings.show_net_speed&&env.monitor.is_some(),self.settings.show_course&&self.nos_next_course(now_secs).is_some(),self.settings.show_calendar_status&&self.current_calendar_event(now_secs).is_some());
         layout.reorder(&self.settings.resident_order);
         for (position,extra) in self.quota_balance_layout(&ctx){layout.balance_tail(position,extra);}
         if self.settings.clock_period!=0 { layout.widen_clock(40.0); }
@@ -2826,6 +2849,15 @@ impl App {
                 if let Some(event)=self.nos_next_course(chrono::Local::now().timestamp()) {
                     let clock=crate::nos::clock_label(&event.start_time);
                     let text=if clock.is_empty(){event.title.clone()}else{format!("{clock} {}",event.title)};
+                    base.faded(compact_alpha).text(local_cx+x,21.0,&text,12.0,W::Bold,theme::WHITE,H::Center);
+                }
+            }
+        }
+        // 常驻栏日程进行中：显示当前正在进行的日程标题；没有进行中的日程时槽位自动消失。
+        if self.settings.show_calendar_status && compact_alpha>0.004 {
+            if let Some(x)=layout.x[bar::CALENDAR] {
+                if let Some(event)=self.current_calendar_event(chrono::Local::now().timestamp()) {
+                    let text=format!("进行中 · {}",event.title);
                     base.faded(compact_alpha).text(local_cx+x,21.0,&text,12.0,W::Bold,theme::WHITE,H::Center);
                 }
             }

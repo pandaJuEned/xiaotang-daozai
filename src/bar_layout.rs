@@ -19,13 +19,17 @@ pub(crate) const NETSPEED: usize = 10;
 /// 课表槽：显示下一节课（时间 + 课名），固定排在末尾，不参与用户拖动排序。
 /// 与 NETSPEED 同一策略 —— 追加在 WIDTHS 末尾，避免扩容 `DEFAULT_ORDER`。
 pub(crate) const COURSE: usize = 11;
+/// 日程进行中槽：收起时显示正在进行的日程标题，固定排在末尾，不参与拖动排序。
+pub(crate) const CALENDAR: usize = 12;
 /// 天气徽标的基础槽宽；温度文字更长时由 `widen` 补足。
 pub(crate) const WEATHER_WIDTH: f32 = 38.0;
 /// 网速用简洁格式绘制（↓1.2M ↑300K），固定宽度足够，不撑宽岛体。
 pub(crate) const NETSPEED_WIDTH: f32 = 92.0;
 /// 课表槽用简洁格式（08:00 高数），固定宽度足够。
 pub(crate) const COURSE_WIDTH: f32 = 92.0;
-const WIDTHS: [f32; 12] = [44.0,20.0,27.0,27.0,27.0,WEATHER_WIDTH,14.0,crate::focus_bar::WIDTH,20.0,32.0,NETSPEED_WIDTH,COURSE_WIDTH];
+/// 日程进行中槽用简洁格式（进行中 · 周会），固定宽度足够。
+pub(crate) const CALENDAR_WIDTH: f32 = 112.0;
+const WIDTHS: [f32; 13] = [44.0,20.0,27.0,27.0,27.0,WEATHER_WIDTH,14.0,crate::focus_bar::WIDTH,20.0,32.0,NETSPEED_WIDTH,COURSE_WIDTH,CALENDAR_WIDTH];
 
 pub(crate) const DEFAULT_ORDER: [usize;6]=[BATTERY,PET,CLOCK,QUOTA,MUSIC,FOCUS];
 pub(crate) fn valid_order(order:&[usize])->bool {
@@ -60,6 +64,10 @@ impl Layout {
     }
     /// 带网速槽与课表槽的排布；`net=false`、`course=false` 时与 `new` 完全一致。
     pub fn with_net(battery:bool,quotas:usize,music:bool,focus:bool,bell:bool,pet:bool,weather:bool,net:bool,course:bool)->Self {
+        Self::with_status(battery,quotas,music,focus,bell,pet,weather,net,course,false)
+    }
+    /// 在 `with_net` 基础上追加「进行中日程」槽；`calendar=false` 时与 `with_net` 完全一致。
+    pub fn with_status(battery:bool,quotas:usize,music:bool,focus:bool,bell:bool,pet:bool,weather:bool,net:bool,course:bool,calendar:bool)->Self {
         fn place(cursor:&mut f32,width:f32)->f32 {let x=*cursor+width/2.0;*cursor+=width+12.0;x}
         let mut widths=WIDTHS.to_vec(); widths.resize(WIDTHS.len()+quotas.saturating_sub(3),27.0);
         let mut x=vec![None;widths.len()];let mut cursor=16.0;
@@ -82,7 +90,7 @@ impl Layout {
                 _=>{},
             }
         }
-        for (slot,on) in [(MUSIC,music&&!bell),(FOCUS,focus),(BELL,bell),(NETSPEED,net),(COURSE,course)] {
+        for (slot,on) in [(MUSIC,music&&!bell),(FOCUS,focus),(BELL,bell),(NETSPEED,net),(COURSE,course),(CALENDAR,calendar)] {
             if on {x[slot]=Some(place(&mut cursor,WIDTHS[slot]));}
         }
         let width=cursor-12.0+16.0;
@@ -104,7 +112,7 @@ impl Layout {
         let original=self.x.clone();let mut cursor=-self.width/2.0+16.0;
         // 网速与铃铛一样固定排在末尾：不参与用户排序，但必须随重排重新落位，避免与前面的槽重叠。
         // 课表槽同理，永远排在网速之后。
-        for slot in order.iter().copied().chain(std::iter::once(BELL)).chain(std::iter::once(NETSPEED)).chain(std::iter::once(COURSE)) {
+        for slot in order.iter().copied().chain(std::iter::once(BELL)).chain(std::iter::once(NETSPEED)).chain(std::iter::once(COURSE)).chain(std::iter::once(CALENDAR)) {
             let slots:Vec<usize>=if slot==QUOTA{self.quota_slots().collect()}
                 else if slot==CLOCK&&self.x[WEATHER].is_some(){vec![CLOCK,WEATHER]}
                 else{vec![slot]};
@@ -196,6 +204,24 @@ mod tests {
             "网速与课表槽不能重叠：net={net} course={course}"
         );
         assert!(reordered.width < crate::app::WIN_W);
+    }
+
+    #[test]
+    fn calendar_status_slot_sits_after_course_and_survives_reorder() {
+        use super::*;
+        let base = Layout::new(true, 3, true, true, false, true, false);
+        let with_status = Layout::with_status(true, 3, true, true, false, true, false, false, false, true);
+        assert!(base.x[CALENDAR].is_none(), "默认不显示进行中日程槽");
+        assert!(with_status.x[CALENDAR].is_some(), "启用后日程槽须就位");
+        assert!((with_status.width - base.width - CALENDAR_WIDTH - 12.0).abs() < 0.01);
+        let mut reordered = with_status.clone();
+        reordered.reorder(&DEFAULT_ORDER);
+        assert!(reordered.x[CALENDAR].is_some(), "重排后日程槽仍须就位");
+        let all = Layout::with_status(true, 3, true, true, false, true, false, true, true, true);
+        let mut reordered = all.clone();
+        reordered.reorder(&DEFAULT_ORDER);
+        let last = [NETSPEED, COURSE, CALENDAR].map(|slot| reordered.x[slot].expect("末尾槽"));
+        assert!(last[0] < last[1] && last[1] < last[2], "三个末尾槽须依网速→课表→日程排序：{last:?}");
     }
 
     use super::*;

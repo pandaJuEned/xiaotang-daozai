@@ -42,7 +42,7 @@ const BACKOFF_BASE: f64 = 120.0;
 pub struct Event {
     /// 稳定标识；同一条课在多次拉取间保持不变。
     pub uid: String,
-    /// `course`（课程）/ `meeting`（会议）/ `exam`（期末考试）。
+    /// `course`（课程）/ `meeting`（会议）/ `exam`（期末考试）/ `todo`（待办）。
     pub kind: String,
     pub title: String,
     /// `YYYY-MM-DD`。
@@ -68,6 +68,9 @@ pub struct Event {
     /// 教学周号；非排课事件为空。
     #[serde(default)]
     pub week: Option<i64>,
+    /// 待办状态（`pending` / `done` 等）；其它事件为空。老服务端没有该字段时为空串。
+    #[serde(default)]
+    pub status: String,
 }
 
 impl Event {
@@ -79,6 +82,16 @@ impl Event {
     /// 是否是考试。
     pub fn is_exam(&self) -> bool {
         self.kind == "exam"
+    }
+
+    /// 是否是待办。
+    pub fn is_todo(&self) -> bool {
+        self.kind == "todo"
+    }
+
+    /// 待办是否已完成（`status` 非 `pending` 都算完成）。
+    pub fn todo_done(&self) -> bool {
+        !self.status.is_empty() && self.status != "pending"
     }
 
     /// 上课地点；没有地点时回退到教师名，都没有则空串。
@@ -259,6 +272,7 @@ pub fn parse(body: &str, at: i64) -> Result<Agenda, String> {
                 course_id: item["course_id"].as_str().unwrap_or_default().trim().to_string(),
                 semester_id: item["semester_id"].as_str().unwrap_or_default().trim().to_string(),
                 week: item["week"].as_i64(),
+                status: item["status"].as_str().unwrap_or_default().trim().to_string(),
             });
         }
     }

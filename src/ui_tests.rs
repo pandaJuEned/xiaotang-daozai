@@ -8382,3 +8382,30 @@ fn every_module_settings_tab_maps_to_its_page(){
     }
     pages.sort();assert_eq!(pages,(0..crate::app::PAGE_NAMES.len()).collect::<Vec<_>>(),"每个功能页面各有一个设置分页");
 }
+
+#[test]
+fn resident_toggles_independently_control_quota_and_ongoing_calendar_slot() {
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());let mut h=H::new();
+    // 设置持久化。
+    h.app.settings.show_quota=false;h.app.settings.show_calendar_status=true;h.app.settings.save();
+    let loaded=crate::model::Settings::load();
+    assert!(!loaded.show_quota && loaded.show_calendar_status,"两个状态组件开关应各自落盘");
+    // 进行中日程：只取非全天、已开始且未结束的事件。
+    let now=chrono::Local::now().timestamp();
+    let meeting=|uid:&str,title:&str,start:i64,end:Option<i64>,all_day:bool|crate::mail::Meeting{
+        uid:uid.into(),title:title.into(),start,end,all_day,at:String::new()};
+    h.app.calendar.local=vec![
+        crate::local_calendar::Entry{event:meeting("past","已结束",now-200,Some(now-100),false),reminder:None},
+        crate::local_calendar::Entry{event:meeting("now","组会",now-50,Some(now+50),false),reminder:None},
+        crate::local_calendar::Entry{event:meeting("future","下一场",now+100,Some(now+200),false),reminder:None},
+        crate::local_calendar::Entry{event:meeting("allday","休假",now-500,Some(now+500),true),reminder:None},
+    ];
+    let current=h.app.current_calendar_event(now);
+    assert_eq!(current.and_then(|e|e.title.into()),Some("组会".to_string()),"只显示正在进行的日程");
+    // 常驻栏槽位：默认两个都不占；开日程槽后占位且重排不丢。
+    assert!(h.app.resident.current().x[crate::bar_layout::CALENDAR].is_none());
+    h.app.settings.show_calendar_status=true;h.frame(vec![]);
+    assert!(h.app.resident.current().x[crate::bar_layout::CALENDAR].is_some(),"开启后日程槽应就位");
+    h.app.settings.show_calendar_status=false;h.frame(vec![]);
+    assert!(h.app.resident.current().x[crate::bar_layout::CALENDAR].is_none(),"关闭后日程槽应消失");
+}

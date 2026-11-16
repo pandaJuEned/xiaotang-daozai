@@ -205,6 +205,10 @@ pub struct Settings {
     pub show_net_speed: bool,
     /// 常驻栏显示下一节课；没有课表数据时自动隐藏。
     pub show_course: bool,
+    /// 常驻栏显示 AI 余额额度环；关闭后 AI 额度页仍正常，只是不在岛上占位。
+    pub show_quota: bool,
+    /// 常驻栏显示正在进行的日程；没有进行中的日程时自动隐藏。
+    pub show_calendar_status: bool,
     pub clock_12h: bool,
     pub clock_period: u8,
     pub resident_order: Vec<usize>,
@@ -283,7 +287,7 @@ pub struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { display_id: String::new(), skin: Skin::Classic, island_shape: IslandShape::Notch, glass_blur: true, island_size: 100, island_offset: 0, dock: Dock::Top, settings_theme: Default::default(), pet: true, minimal: false, browser_minimal: false, avoid_browsers: true, avoid_apps: Vec::new(), visible_pages: [true; 10], page_order: [0,1,2,3,4,5,6,7,8,9], show_battery: true, show_net_speed: false, show_course: false, clock_12h: false, clock_period: 0, resident_order: Vec::new(), system_hud: true, bluetooth_notifications: true, read_notifications:false, wechat_notifications:false, wecom_notifications:false, feishu_notifications:false, dingtalk_notifications:false, wechat_tray_open:false, qq_only:false, notification_preview:false, notifications: true, sound: false, lyrics_enabled:true, island_lyrics:false, lyric_delay_ms:-350, hide_fullscreen: true, avoid_top_bar: true, focus_minutes: 25, rest_minutes: 5, water_minutes: 45, serving_ml: 250, water_start: 9, water_end: 22, sit_remind: true, sit_minutes: 60, lunch_rest: true, lunch_start: 720, lunch_end: 810, mail_enabled: true, mail_sync_operations:false, mail_code: true, mail_code_hide_seconds:60, mail_interval: 120, mail_ics: 15, ignored_mail_events: Vec::new(), calendar_prompt: true, calendar_auto_sync: true, clipboard_history: true, weather_city: String::new(), weather_position: None, weather_saved: Vec::new(), render_compat: false, render_compat_reason: String::new(), nos_enabled: false, nos_base_url: String::new(), nos_server_enabled: false, nos_server_auto_start: false, nos_server_dir: String::new(), nos_server_python: String::new(), nos_server_host: crate::nos_server::DEFAULT_HOST.into(), nos_server_port: crate::nos_server::DEFAULT_PORT }
+        Self { display_id: String::new(), skin: Skin::Classic, island_shape: IslandShape::Notch, glass_blur: true, island_size: 100, island_offset: 0, dock: Dock::Top, settings_theme: Default::default(), pet: true, minimal: false, browser_minimal: false, avoid_browsers: true, avoid_apps: Vec::new(), visible_pages: [true; 10], page_order: [0,1,2,3,4,5,6,7,8,9], show_battery: true, show_net_speed: false, show_course: false, show_quota: true, show_calendar_status: false, clock_12h: false, clock_period: 0, resident_order: Vec::new(), system_hud: true, bluetooth_notifications: true, read_notifications:false, wechat_notifications:false, wecom_notifications:false, feishu_notifications:false, dingtalk_notifications:false, wechat_tray_open:false, qq_only:false, notification_preview:false, notifications: true, sound: false, lyrics_enabled:true, island_lyrics:false, lyric_delay_ms:-350, hide_fullscreen: true, avoid_top_bar: true, focus_minutes: 25, rest_minutes: 5, water_minutes: 45, serving_ml: 250, water_start: 9, water_end: 22, sit_remind: true, sit_minutes: 60, lunch_rest: true, lunch_start: 720, lunch_end: 810, mail_enabled: true, mail_sync_operations:false, mail_code: true, mail_code_hide_seconds:60, mail_interval: 120, mail_ics: 15, ignored_mail_events: Vec::new(), calendar_prompt: true, calendar_auto_sync: true, clipboard_history: true, weather_city: String::new(), weather_position: None, weather_saved: Vec::new(), render_compat: false, render_compat_reason: String::new(), nos_enabled: false, nos_base_url: String::new(), nos_server_enabled: false, nos_server_auto_start: false, nos_server_dir: String::new(), nos_server_python: String::new(), nos_server_host: crate::nos_server::DEFAULT_HOST.into(), nos_server_port: crate::nos_server::DEFAULT_PORT }
     }
 }
 
@@ -357,6 +361,8 @@ impl Settings {
                 "show_battery" => s.show_battery = v != "0",
                 "show_net_speed" => s.show_net_speed = v != "0",
                 "show_course" => s.show_course = v != "0",
+                "show_quota" => s.show_quota = v != "0",
+                "show_calendar_status" => s.show_calendar_status = v != "0",
                 "visible_pages" if (6..=10).contains(&v.len()) && v.bytes().all(|b| b==b'0' || b==b'1') => {
                     for (enabled,value) in s.visible_pages.iter_mut().zip(v.bytes()) { *enabled=value==b'1'; }
                     for enabled in &mut s.visible_pages[v.len()..]{*enabled=v.bytes().any(|b|b==b'1');}
@@ -452,6 +458,8 @@ impl Settings {
                 ("show_battery".into(), (self.show_battery as u8).to_string()),
                 ("show_net_speed".into(), (self.show_net_speed as u8).to_string()),
                 ("show_course".into(), (self.show_course as u8).to_string()),
+                ("show_quota".into(), (self.show_quota as u8).to_string()),
+                ("show_calendar_status".into(), (self.show_calendar_status as u8).to_string()),
                 ("read_notifications".into(),(self.read_notifications as u8).to_string()),
                 ("wechat_notifications".into(),(self.wechat_notifications as u8).to_string()),
                 ("wecom_notifications".into(),(self.wecom_notifications as u8).to_string()),

@@ -1370,6 +1370,10 @@ impl App {
                             setting_row(ui,"网速","收起时显示实时下行/上行速率；无监控数据时自动隐藏",&mut self.settings.show_net_speed);
                             ui.separator();
                             setting_row(ui,"下一节课","收起时显示下一节课的开始时刻与课名；无课表数据时自动隐藏",&mut self.settings.show_course);
+                            ui.separator();
+                            setting_row(ui,"AI 余额","收起时显示已常驻账号的额度环；关闭后 AI 额度页仍正常",&mut self.settings.show_quota);
+                            ui.separator();
+                            setting_row(ui,"进行中日程","收起时显示当前正在进行的日程标题；无进行中日程时自动隐藏",&mut self.settings.show_calendar_status);
                         });
                         settings_label(ui,"功能页面");
                         settings_card(ui,|ui|{

@@ -351,7 +351,7 @@ impl App {
     pub fn quota_event(&mut self,event:quota::Event){self.quota.receive(event);}
     pub fn quota_set_source(&mut self,path:std::path::PathBuf){self.quota.source=path.to_string_lossy().into_owned();}
     pub(crate) fn quota_bar_indices(&self)->Vec<usize>{
-        if !self.quota.config.enabled || !self.quota.config.compact || !self.settings.visible_pages[6] || self.settings.minimal || self.t<self.notification_bell_until{return vec![];}
+        if !self.settings.show_quota || !self.quota.config.enabled || !self.quota.config.compact || !self.settings.visible_pages[6] || self.settings.minimal || self.t<self.notification_bell_until{return vec![];}
         self.quota.config.pinned_indices()
     }
     /// 常驻胶囊里每个额度槽的实际宽度：图标右侧跟数字的账号需要额外占位。
