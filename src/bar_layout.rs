@@ -16,11 +16,16 @@ pub(crate) const PET: usize = 9;
 /// 网速槽（P3）：固定排在末尾，不参与用户拖动排序，避免扩容 `DEFAULT_ORDER`。
 /// 必须追加在 WIDTHS 末尾——`quota_slot()` 用 `WIDTHS.len()` 作动态额度环起点，会自动顺延。
 pub(crate) const NETSPEED: usize = 10;
+/// 课表槽：显示下一节课（时间 + 课名），固定排在末尾，不参与用户拖动排序。
+/// 与 NETSPEED 同一策略 —— 追加在 WIDTHS 末尾，避免扩容 `DEFAULT_ORDER`。
+pub(crate) const COURSE: usize = 11;
 /// 天气徽标的基础槽宽；温度文字更长时由 `widen` 补足。
 pub(crate) const WEATHER_WIDTH: f32 = 38.0;
 /// 网速用简洁格式绘制（↓1.2M ↑300K），固定宽度足够，不撑宽岛体。
 pub(crate) const NETSPEED_WIDTH: f32 = 92.0;
-const WIDTHS: [f32; 11] = [44.0,20.0,27.0,27.0,27.0,WEATHER_WIDTH,14.0,crate::focus_bar::WIDTH,20.0,32.0,NETSPEED_WIDTH];
+/// 课表槽用简洁格式（08:00 高数），固定宽度足够。
+pub(crate) const COURSE_WIDTH: f32 = 92.0;
+const WIDTHS: [f32; 12] = [44.0,20.0,27.0,27.0,27.0,WEATHER_WIDTH,14.0,crate::focus_bar::WIDTH,20.0,32.0,NETSPEED_WIDTH,COURSE_WIDTH];
 
 pub(crate) const DEFAULT_ORDER: [usize;6]=[BATTERY,PET,CLOCK,QUOTA,MUSIC,FOCUS];
 pub(crate) fn valid_order(order:&[usize])->bool {
@@ -51,10 +56,10 @@ pub(crate) struct Layout {
 impl Layout {
     /// 保持原有 7 参数签名，避免改动全部现有调用点（含 UI 回归测试）。
     pub fn new(battery:bool,quotas:usize,music:bool,focus:bool,bell:bool,pet:bool,weather:bool)->Self {
-        Self::with_net(battery,quotas,music,focus,bell,pet,weather,false)
+        Self::with_net(battery,quotas,music,focus,bell,pet,weather,false,false)
     }
-    /// 带网速槽的排布；`net=false` 时与 `new` 完全一致。
-    pub fn with_net(battery:bool,quotas:usize,music:bool,focus:bool,bell:bool,pet:bool,weather:bool,net:bool)->Self {
+    /// 带网速槽与课表槽的排布；`net=false`、`course=false` 时与 `new` 完全一致。
+    pub fn with_net(battery:bool,quotas:usize,music:bool,focus:bool,bell:bool,pet:bool,weather:bool,net:bool,course:bool)->Self {
         fn place(cursor:&mut f32,width:f32)->f32 {let x=*cursor+width/2.0;*cursor+=width+12.0;x}
         let mut widths=WIDTHS.to_vec(); widths.resize(WIDTHS.len()+quotas.saturating_sub(3),27.0);
         let mut x=vec![None;widths.len()];let mut cursor=16.0;
@@ -77,7 +82,7 @@ impl Layout {
                 _=>{},
             }
         }
-        for (slot,on) in [(MUSIC,music&&!bell),(FOCUS,focus),(BELL,bell),(NETSPEED,net)] {
+        for (slot,on) in [(MUSIC,music&&!bell),(FOCUS,focus),(BELL,bell),(NETSPEED,net),(COURSE,course)] {
             if on {x[slot]=Some(place(&mut cursor,WIDTHS[slot]));}
         }
         let width=cursor-12.0+16.0;
@@ -98,7 +103,8 @@ impl Layout {
         if !valid_order(order){return;}
         let original=self.x.clone();let mut cursor=-self.width/2.0+16.0;
         // 网速与铃铛一样固定排在末尾：不参与用户排序，但必须随重排重新落位，避免与前面的槽重叠。
-        for slot in order.iter().copied().chain(std::iter::once(BELL)).chain(std::iter::once(NETSPEED)) {
+        // 课表槽同理，永远排在网速之后。
+        for slot in order.iter().copied().chain(std::iter::once(BELL)).chain(std::iter::once(NETSPEED)).chain(std::iter::once(COURSE)) {
             let slots:Vec<usize>=if slot==QUOTA{self.quota_slots().collect()}
                 else if slot==CLOCK&&self.x[WEATHER].is_some(){vec![CLOCK,WEATHER]}
                 else{vec![slot]};
@@ -158,13 +164,37 @@ mod tests {
     fn netspeed_slot_sits_at_the_end_without_shifting_other_components() {
         use super::*;
         let base = Layout::new(true, 3, true, true, false, true, false);
-        let with_net = Layout::with_net(true, 3, true, true, false, true, false, true);
+        let with_net = Layout::with_net(true, 3, true, true, false, true, false, true, false);
         assert!(base.x[NETSPEED].is_none());
         assert!(with_net.x[NETSPEED].is_some());
         assert!((with_net.width - base.width - NETSPEED_WIDTH - 12.0).abs() < 0.01);
         let mut reordered = with_net.clone();
         reordered.reorder(&DEFAULT_ORDER);
         assert!(reordered.x[NETSPEED].is_some(), "重排后网速槽仍须就位");
+        assert!(reordered.width < crate::app::WIN_W);
+    }
+
+    #[test]
+    fn course_slot_sits_after_netspeed_and_survives_reorder() {
+        use super::*;
+        let base = Layout::new(true, 3, true, true, false, true, false);
+        let with_course = Layout::with_net(true, 3, true, true, false, true, false, false, true);
+        assert!(base.x[COURSE].is_none(), "默认不显示课表槽");
+        assert!(with_course.x[COURSE].is_some(), "启用后课表槽须就位");
+        assert!((with_course.width - base.width - COURSE_WIDTH - 12.0).abs() < 0.01);
+        let mut reordered = with_course.clone();
+        reordered.reorder(&DEFAULT_ORDER);
+        assert!(reordered.x[COURSE].is_some(), "重排后课表槽仍须就位");
+        // 网速与课表同时开启时，两个槽不能重叠。
+        let both = Layout::with_net(true, 3, true, true, false, true, false, true, true);
+        let mut reordered = both.clone();
+        reordered.reorder(&DEFAULT_ORDER);
+        let net = reordered.x[NETSPEED].expect("网速槽");
+        let course = reordered.x[COURSE].expect("课表槽");
+        assert!(
+            (net - course).abs() >= (NETSPEED_WIDTH + COURSE_WIDTH) / 2.0,
+            "网速与课表槽不能重叠：net={net} course={course}"
+        );
         assert!(reordered.width < crate::app::WIN_W);
     }
 

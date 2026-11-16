@@ -136,6 +136,8 @@ pub struct Env {
     pub opaque_surface: bool,
     /// 系统监控采样（P2）；模块关闭或非 Windows 时为 None。
     pub monitor: Option<crate::monitor::MonitorSnapshot>,
+    /// 课表事件流（NOS）；模块关闭或尚未拉到数据时为 None。
+    pub nos: Option<crate::nos::Agenda>,
 }
 
 impl Env {
@@ -201,6 +203,24 @@ pub enum Cmd {
     RestartApp,
     /// 系统监控配置已修改：外壳在下一帧重建采集服务。
     MonitorReconfigure,
+    /// 课表配置已修改：外壳在下一帧重建课表服务。
+    NosReconfigure,
+    /// 立即刷新一次课表。
+    NosRefresh,
+    /// 测试课表服务器连接（令牌只在内存里传给工作线程）。
+    NosTest(String, String),
+    /// 启动本机 NOS Web 服务（独立 uvicorn 进程）。
+    NosServerStart,
+    /// 停止本机 NOS Web 服务；外部遗留进程按 PID 记录一并停止。
+    NosServerStop,
+    /// 先停再起，用于改了目录 / 端口 / 令牌之后生效。
+    NosServerRestart,
+    /// 自动探测本机 NOS Web 目录。
+    NosServerDetect,
+    /// 用默认浏览器打开 NOS Web 页面。
+    NosServerOpenWeb,
+    /// 打开本次服务的日志文件。
+    NosServerOpenLog,
 }
 
 /// 毛玻璃皮肤下原生窗口区域的组成部分（相对 `win` 左上角，逻辑点）。
@@ -821,6 +841,18 @@ pub struct App {
     mail_lines_cache: Vec<(std::sync::Arc<str>, std::sync::Arc<str>, u32, std::sync::Arc<Vec<crate::mail_format::Line>>)>,
     /// v0.5.6：日历（CalDAV）配置、未来 24 小时事件与设置表单。
     pub(crate) calendar: CalendarState,
+    /// 课表（NOS）事件，已转成统一事件模型；与其它来源一起进日程页。
+    pub nos_events: Vec<mail::Meeting>,
+    /// 课表原始数据；常驻栏的「下一节课」直接用它。
+    pub nos_agenda: Option<crate::nos::Agenda>,
+    /// 当前学期名（显示用）。
+    pub(crate) nos_semester: String,
+    /// 课表最近一次错误（设置页显示）。
+    pub nos_error: Option<String>,
+    /// 本地 NOS Web 服务的最近一次探测结果（外壳每几秒后台刷新一次）。
+    pub nos_server_status: crate::nos_server::Status,
+    /// 本地服务的操作结果；设置页直接显示，避免只弹气泡让用户以为没反应。
+    pub nos_server_note: Option<String>,
     pub(crate) quota: crate::quota_ui::State,
     /// 天气页的当前数据与后台拉取状态。
     pub(crate) weather: crate::weather::State,
@@ -949,6 +981,12 @@ impl App {
             mail: MailState { accounts: mail::load_accounts(), ..Default::default() },
             mail_lines_cache: Vec::new(),
             calendar: CalendarState::load(),
+            nos_events: Vec::new(),
+            nos_agenda: None,
+            nos_semester: String::new(),
+            nos_error: None,
+            nos_server_status: crate::nos_server::Status::default(),
+            nos_server_note: None,
             quota: crate::quota_ui::State::load(),
             weather,
             updates: Default::default(),
@@ -1184,6 +1222,41 @@ impl App {
     pub fn calendar_configs_match(&self, known: &[calendar::Config]) -> bool {
         if self.calendar.feeds.is_empty() {known==self.calendar.config.as_slice()}
         else {known.len()==self.calendar.feeds.len() && known.iter().zip(&self.calendar.feeds).all(|(known,feed)|*known==feed.config)}
+    }
+
+    /// 课表配置：地址来自设置，令牌来自 Windows 凭据管理器。
+    /// 令牌取不到时返回空串（模块视为未配置，不留空转的线程）。
+    pub fn nos_config(&self) -> crate::nos::Config {
+        crate::nos::Config {
+            base_url: self.settings.nos_base_url.trim().to_string(),
+            token: crate::nos::secrets::load().unwrap_or_default(),
+        }
+    }
+
+    /// 本地 NOS Web 服务的启动配置。令牌与 `nos_config()` 共用同一份凭据，
+    /// 这样「启动服务」与「课表拉取」天然对齐，不会出现服务端和客户端令牌不一致。
+    pub fn nos_server_config(&self) -> crate::nos_server::Config {
+        crate::nos_server::Config {
+            work_dir: self.settings.nos_server_dir.trim().to_string(),
+            python: self.settings.nos_server_python.trim().to_string(),
+            host: self.settings.nos_server_host.trim().to_string(),
+            port: self.settings.nos_server_port,
+            token: crate::nos::secrets::load().unwrap_or_default(),
+            log_dir: crate::model::config_dir(),
+        }
+    }
+
+    /// 收到一份课表：转成统一事件模型，供日程页与常驻栏使用。
+    pub fn set_nos_agenda(&mut self, agenda: crate::nos::Agenda) {
+        self.nos_events = agenda.events.iter().filter_map(crate::calendar_ui::nos_meeting).collect();
+        self.nos_semester = agenda.current_semester().map(|s|s.name.clone()).unwrap_or_default();
+        // 原始数据也要留着：常驻栏的「下一节课」直接用它（要按开始时刻筛选）。
+        self.nos_agenda = Some(agenda);
+    }
+
+    /// 当前课表的下一节课（按现在时刻找）。
+    pub fn nos_next_course(&self, now: i64) -> Option<&crate::nos::Event> {
+        self.nos_agenda.as_ref().and_then(|agenda|agenda.next_course(now))
     }
 
     pub(crate) fn refresh_calendar_month_status(&mut self) {
@@ -1758,7 +1831,7 @@ impl App {
         self.update_media(env,&ctx);
         let bell=self.t<self.notification_bell_until&&!self.compact_notices();
         self.resident_power=(env.battery,env.charging);
-        let mut layout=Layout::with_net(self.settings.show_battery&&env.battery.is_some(),self.quota_bar_indices().len(),self.media.is_music()&&!bell,self.pomo.running,bell,self.pet_enabled(),self.weather_pill().is_some(),self.settings.show_net_speed&&env.monitor.is_some());
+        let mut layout=Layout::with_net(self.settings.show_battery&&env.battery.is_some(),self.quota_bar_indices().len(),self.media.is_music()&&!bell,self.pomo.running,bell,self.pet_enabled(),self.weather_pill().is_some(),self.settings.show_net_speed&&env.monitor.is_some(),self.settings.show_course&&self.nos_next_course(chrono::Local::now().timestamp()).is_some());
         layout.reorder(&self.settings.resident_order);
         for (position,extra) in self.quota_balance_layout(&ctx){layout.balance_tail(position,extra);}
         if self.settings.clock_period!=0 { layout.widen_clock(40.0); }
@@ -2745,6 +2818,16 @@ impl App {
                 let up=crate::monitor::format_speed(m.up_bps,&style);
                 let text=format!("↓{down} ↑{up}");
                 base.faded(compact_alpha).text(local_cx+x,21.0,&text,12.0,W::Bold,theme::WHITE,H::Center);
+            }
+        }
+        // 常驻栏课表：显示下一节课（开始时刻 + 课名）。简洁格式固定宽度，不撑宽岛体。
+        if self.settings.show_course && compact_alpha>0.004 {
+            if let Some(x)=layout.x[bar::COURSE] {
+                if let Some(event)=self.nos_next_course(chrono::Local::now().timestamp()) {
+                    let clock=crate::nos::clock_label(&event.start_time);
+                    let text=if clock.is_empty(){event.title.clone()}else{format!("{clock} {}",event.title)};
+                    base.faded(compact_alpha).text(local_cx+x,21.0,&text,12.0,W::Bold,theme::WHITE,H::Center);
+                }
             }
         }
     }

@@ -687,12 +687,21 @@ mod tests {
 
     #[test]
     fn settings_groups_keep_every_page_reachable() {
-        let groups = ["常规", "音乐与歌词", "专注与饮水", "专注与饮水", "待办与置物", "待办与置物", "通知、邮箱与日程", "通知、邮箱与日程", "通知、邮箱与日程", "关于", "页面管理", "AI 额度", "天气", "系统监控", "流量历史"];
+        let groups = ["常规", "音乐与歌词", "专注与饮水", "专注与饮水", "待办与置物", "待办与置物", "通知、邮箱与日程", "通知、邮箱与日程", "通知、邮箱与日程", "关于", "页面管理", "AI 额度", "天气", "系统监控", "流量历史", "课表"];
         for (tab, expected) in groups.iter().enumerate() {
             let matches: Vec<_> = SETTINGS_GROUPS.iter().filter(|(_,start,end)| (*start..=*end).contains(&tab)).collect();
             assert_eq!(matches.len(), 1, "页面 {tab} 必须且只能属于一个分组");
             assert_eq!(matches[0].0, *expected);
         }
+    }
+
+    #[test]
+    fn nos_course_settings_tab_sits_in_the_visible_part_of_the_sidebar() {
+        let group = SETTINGS_GROUPS.iter().find(|(name,_,_)|*name=="课表").expect("侧边栏必须有课表分组");
+        assert_eq!((group.1,group.2),(15,15),"课表对应第 15 号页签");
+        let position = SETTINGS_GROUPS.iter().position(|(name,_,_)|*name=="课表").unwrap();
+        assert!(position < SETTINGS_GROUPS.len()-4,
+            "课表不能排在末尾，设置窗口被拖矮时末尾几项会被裁掉");
     }
 
     #[test]
@@ -1214,9 +1223,9 @@ fn setting_choices(ui:&mut egui::Ui,title:&str,value:&mut u32,values:[u32;3],uni
     let options:Vec<(u32,&str)>=values.iter().zip(labels.iter()).map(|(v,l)|(*v,l.as_str())).collect();
     settings_control_row_right(ui,title,|ui|{settings_segmented(ui,value,&options,62.0);});
 }
-const SETTINGS_GROUPS: [(&str,usize,usize);11] = [
+const SETTINGS_GROUPS: [(&str,usize,usize);12] = [
     ("常规",0,0), ("页面管理",10,10), ("音乐与歌词",1,1), ("专注与饮水",2,3),
-    ("待办与置物",4,5), ("通知、邮箱与日程",6,8), ("AI 额度",11,11), ("天气",12,12),
+    ("待办与置物",4,5), ("通知、邮箱与日程",6,8), ("课表",15,15), ("AI 额度",11,11), ("天气",12,12),
     ("系统监控",13,13), ("流量历史",14,14), ("关于",9,9),
 ];
 
@@ -1250,11 +1259,13 @@ impl App {
             if ctx.input(|i|i.viewport().close_requested()){self.settings_open=false;self.quota_close_connection();}
             let before=format!("{:?}",self.settings);
             egui::SidePanel::left("settings-sidebar").resizable(false).exact_width(180.0).frame(egui::Frame::new().fill(settings_color(ctx,Color32::from_rgb(29,29,32),Color32::from_rgb(237,239,243))).stroke(egui::Stroke::new(1.0,settings_color(ctx,Color32::from_rgb(42,42,45),Color32::from_rgb(216,219,225)))).inner_margin(egui::Margin::symmetric(10,12))).show(ctx,|ui|{
+                // 页签已增至 16 个，窗口被拖矮时末尾几项会被裁掉；放进滚动区保证都能到达。
+                egui::ScrollArea::vertical().id_salt("settings-sidebar-scroll").auto_shrink([false,false]).show(ui,|ui|{
                 ui.add_space(5.0);
                 ui.label(egui::RichText::new("设置").size(11.0).color(settings_color(ctx,Color32::from_gray(150),Color32::from_gray(105))));
                 ui.add_space(7.0);
                 for (name,start,end) in SETTINGS_GROUPS {
-                    if start==9 {ui.add_space((ui.available_height()-38.0).max(0.0));}
+                    if start==9 {ui.add_space(10.0);ui.separator();ui.add_space(6.0);}
                     let selected=(start..=end).contains(&self.settings_tab);
                     let (rect,response)=ui.allocate_exact_size(egui::vec2(ui.available_width(),36.0),egui::Sense::click());
                     if response.clicked() && !selected{self.settings_tab=start;}
@@ -1272,6 +1283,7 @@ impl App {
                         12=>egui::include_image!("../assets/settings-icons/system/weather.svg"),
                         13=>egui::include_image!("../assets/settings-icons/system/general.svg"),
                         14=>egui::include_image!("../assets/settings-icons/system/quota.svg"),
+                        15=>egui::include_image!("../assets/settings-icons/calendar-days.svg"),
                         _=>egui::include_image!("../assets/settings-icons/system/about.svg"),
                     };
                     let icon_bg=egui::Rect::from_center_size(egui::pos2(rect.left()+21.0,rect.center().y),egui::vec2(25.0,25.0));
@@ -1279,6 +1291,7 @@ impl App {
                     ui.painter().text(egui::pos2(rect.left()+40.0,rect.center().y),egui::Align2::LEFT_CENTER,name,egui::FontId::proportional(13.0),if selected{settings_color(ctx,Color32::WHITE,Color32::from_rgb(30,34,41))}else{settings_color(ctx,Color32::from_gray(225),Color32::from_gray(55))});
                     ui.add_space(3.0);
                 }
+                });
             });
             egui::CentralPanel::default().frame(egui::Frame::new().fill(settings_color(ctx,Color32::from_rgb(25,25,27),Color32::from_rgb(246,247,249))).inner_margin(egui::Margin::symmetric(22,16))).show(ctx,|ui|{
                 ui.spacing_mut().item_spacing=egui::vec2(8.0,5.0);
@@ -1302,8 +1315,8 @@ impl App {
                     }
                 }
                 ui.visuals_mut().selection.bg_fill=settings_color(ctx,Color32::from_rgb(45,105,165),Color32::from_rgb(209,226,248));
-                let titles=["常规","音乐与歌词","专注","健康提醒","待办","置物","通知","邮箱","日程","关于","页面管理","AI 额度","天气","系统监控","流量历史"];
-                ui.label(egui::RichText::new(titles[self.settings_tab.min(14)]).size(18.0).strong().color(settings_color(ctx,Color32::WHITE,Color32::from_rgb(30,34,41))));
+                let titles=["常规","音乐与歌词","专注","健康提醒","待办","置物","通知","邮箱","日程","关于","页面管理","AI 额度","天气","系统监控","流量历史","课表"];
+                ui.label(egui::RichText::new(titles[self.settings_tab.min(15)]).size(18.0).strong().color(settings_color(ctx,Color32::WHITE,Color32::from_rgb(30,34,41))));
                 if let Some((_,start,end))=SETTINGS_GROUPS.iter().find(|(_,start,end)|(*start..=*end).contains(&self.settings_tab)) {
                     if start!=end {
                         ui.add_space(7.0);
@@ -1339,6 +1352,7 @@ impl App {
                         if !self.module_on(page) {ui.disable();}
                     }
                     match self.settings_tab {
+                    15=>self.nos_settings(ui),
                     14=>self.monitor_history_settings(ui),
                     13=>self.monitor_settings(ui),
                     12=>self.weather_settings(ui),
@@ -1354,6 +1368,8 @@ impl App {
                             setting_row(ui,"岛上歌词","收起时显示歌词，无歌词时显示封面和歌名",&mut self.settings.island_lyrics);
                             ui.separator();
                             setting_row(ui,"网速","收起时显示实时下行/上行速率；无监控数据时自动隐藏",&mut self.settings.show_net_speed);
+                            ui.separator();
+                            setting_row(ui,"下一节课","收起时显示下一节课的开始时刻与课名；无课表数据时自动隐藏",&mut self.settings.show_course);
                         });
                         settings_label(ui,"功能页面");
                         settings_card(ui,|ui|{

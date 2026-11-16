@@ -91,6 +91,20 @@ struct Shell {
     monitor: Option<daozai::monitor_win::Service>,
     #[cfg(windows)]
     monitor_state: Option<daozai::monitor::MonitorSnapshot>,
+    /// 课表服务（NOS）。跨平台，配置就绪且开关打开时才存在。
+    nos: Option<daozai::nos::Service>,
+    /// 「测试连接」的结果通道。
+    nos_test_rx: Option<std::sync::mpsc::Receiver<String>>,
+    /// 本机 NOS Web 独立服务：岛仔拉起的 uvicorn 进程，置 None 即停止。
+    nos_server: Option<daozai::nos_server::Server>,
+    /// 「随岛仔启动」只尝试一次，避免每帧重复拉起。
+    nos_server_auto_done: bool,
+    /// 服务状态探测的节流时钟。
+    nos_server_at: PollClock,
+    /// 后台探测结果通道；界面只读 `app.nos_server_status`。
+    nos_server_probe_rx: Option<std::sync::mpsc::Receiver<daozai::nos_server::Status>>,
+    /// 启动后的「就绪」回执通道。
+    nos_server_ready_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
 }
 
 const MODULE_OFF:&str="该功能已在「页面管理」中关闭";
@@ -117,6 +131,14 @@ impl Shell {
         if mail_on!=self.mail.is_some() {self.mail=mail_on.then(daozai::mail::Service::start);self.mail_sig=None;}
         let cal_on=self.app.module_on(app::CALENDAR_PAGE);
         if cal_on!=self.cal.is_some() {self.cal=cal_on.then(daozai::calendar::Service::start);self.cal_sig=None;}
+        // 课表：配置就绪（地址 + 令牌都有）且开关打开时才起线程。
+        // 令牌在凭据管理器里，取不到时视为未配置，不留空转的线程。
+        let nos_cfg=self.app.nos_config();
+        let nos_on=self.app.settings.nos_enabled && nos_cfg.ready();
+        if nos_on!=self.nos.is_some() {
+            self.nos=if nos_on {Some(daozai::nos::Service::start(ctx.clone(),nos_cfg))} else {None};
+            if !nos_on {self.app.nos_error=None;self.app.nos_events.clear();self.app.nos_agenda=None;}
+        }
         let clipboard_on=self.app.clipboard_active();
         if clipboard_on!=self.clipboard_watch.is_some() {
             self.clipboard_watch=if clipboard_on {let ctx=ctx.clone();daozai::clipboard::watch(self.app.clipboard.clone(),move||ctx.request_repaint())}else{None};
@@ -237,7 +259,109 @@ impl Shell {
             quota: daozai::quota::Service::start(), quota_sig: None, quota_at: PollClock::default(),
             #[cfg(windows)] monitor: None,
             #[cfg(windows)] monitor_state: None,
+            nos: None,
+            nos_test_rx: None,
+            nos_server: None,
+            nos_server_auto_done: false,
+            nos_server_at: PollClock::default(),
+            nos_server_probe_rx: None,
+            nos_server_ready_rx: None,
         }
+    }
+
+    /// 启动本机 NOS Web 服务，并把课表地址自动对齐到这台服务。
+    /// 令牌与课表客户端共用一份凭据：既注入给 uvicorn 当 `NOS_API_TOKEN`，也用于拉数据。
+    fn nos_server_start(&mut self, ctx: &egui::Context) {
+        let mut cfg = self.app.nos_server_config();
+
+        // 首次使用不该卡在「目录/令牌没填」上：目录能自动探测，令牌能自动生成。
+        // 生成的令牌写进同一份凭据，服务端与客户端从此天然对齐，用户无需手工编随机串。
+        if cfg.work_dir.trim().is_empty() {
+            if let Some(dir) = daozai::nos_server::detect_work_dir() {
+                cfg.work_dir = dir.to_string_lossy().into_owned();
+                self.app.settings.nos_server_dir = cfg.work_dir.clone();
+                self.app.settings.save();
+            }
+        }
+        let token = match daozai::nos::secrets::ensure_token() {
+            Ok(value) => value,
+            Err(error) => {
+                self.app.nos_server_note = Some(format!("无法准备访问令牌：{error}"));
+                return;
+            }
+        };
+        cfg.token = token;
+
+        // 刚点过「重启」时旧进程的监听端口可能还没释放，短暂等一下再判定是否重复启动。
+        for _ in 0..10 {
+            if !daozai::nos_server::port_open(cfg.host(), cfg.port) { break; }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        self.app.settings.nos_base_url = cfg.base_url();
+        self.app.settings.nos_enabled = true;
+        self.app.settings.save();
+        match daozai::nos_server::start(&cfg) {
+            Ok(server) => {
+                let pid = server.pid;
+                self.nos_server = Some(server);
+                let mut status = self.app.nos_server_status.starting();
+                status.pid = Some(pid);
+                self.app.nos_server_status = status;
+                self.app.nos_server_note = Some(format!(
+                    "正在启动…（PID {pid}）；日志 {}", cfg.log_path().display()
+                ));
+                // uvicorn 首次启动可能要几秒，等待放在后台，不卡住界面。
+                let (tx, rx) = std::sync::mpsc::channel::<Result<String, String>>();
+                self.nos_server_ready_rx = Some(rx);
+                let task_ctx = ctx.clone();
+                let _ = std::thread::Builder::new()
+                    .name("daozai-nos-server-ready".into())
+                    .spawn(move || {
+                        let deadline = Instant::now() + Duration::from_secs(20);
+                        loop {
+                            if daozai::nos_server::ping(&cfg.base_url(), &cfg.token).is_ok() {
+                                let _ = tx.send(Ok("NOS Web 服务已就绪，课表开始同步".into()));
+                                break;
+                            }
+                            if Instant::now() >= deadline {
+                                let _ = tx.send(Err(format!(
+                                    "20 秒内未就绪，请查看日志 {}", cfg.log_path().display()
+                                )));
+                                break;
+                            }
+                            std::thread::sleep(Duration::from_millis(400));
+                        }
+                        task_ctx.request_repaint();
+                    });
+            }
+            Err(error) => {
+                self.app.nos_server_note = Some(format!("启动失败：{error}"));
+            }
+        }
+    }
+
+    /// 停止服务。若进程是上次会话遗留的（本次岛仔没有句柄），按 PID 文件里记录的
+    /// 进程号停止进程树，不提供任意 PID 的清理入口。
+    fn nos_server_stop(&mut self) {
+        if self.nos_server.take().is_some() {
+            self.app.nos_server_note=Some("已停止 NOS Web 服务".into());
+            self.app.say("已停止 NOS Web 服务");
+        } else {
+            let cfg = self.app.nos_server_config();
+            if let Some(record) = daozai::nos_server::read_pid(&cfg.pid_path()) {
+                daozai::nos_server::stop_pid(record.pid);
+                let _ = std::fs::remove_file(cfg.pid_path());
+                let note=format!("已停止遗留的 NOS Web 进程（PID {}）", record.pid);
+                self.app.nos_server_note=Some(note.clone());
+                self.app.say(note);
+            } else {
+                self.app.nos_server_note=Some("当前没有由岛仔启动的 NOS Web 服务".into());
+                self.app.say("当前没有由岛仔启动的 NOS Web 服务");
+                return;
+            }
+        }
+        self.app.nos_server_status = daozai::nos_server::Status::default();
+        self.nos_server_ready_rx = None;
     }
 
     #[cfg(windows)]
@@ -350,6 +474,7 @@ impl Shell {
                 #[cfg(windows)] {self.monitor_state}
                 #[cfg(not(windows))] {None}
             },
+            nos: self.app.nos_agenda.clone(),
         }
     }
 }
@@ -475,6 +600,23 @@ impl eframe::App for Shell {
                     if let Some(tray)=&self.tray{tray.notify("岛仔 · 系统监控",&text,self.app.settings.sound);}
                 }
             }
+            // 课表：消费后台拉取结果。成功时更新快照；失败时保留上一次成功的课表，
+            // 只把错误记下来供设置页显示（离线也能看到今天的课）。
+            if let Some(service)=&self.nos {
+                if let Some(result)=service.try_recv() {
+                    match result {
+                        Ok(agenda)=>{self.app.set_nos_agenda(agenda);self.app.nos_error=None;}
+                        Err(message)=>{self.app.nos_error=Some(message);}
+                    }
+                }
+            }
+            // 「测试连接」的结果回到主线程再提示（跨线程不能直接改 App）。
+            if let Some(rx)=&self.nos_test_rx {
+                if let Ok(message)=rx.try_recv() {
+                    self.app.say(message);
+                    self.nos_test_rx=None;
+                }
+            }
             self.hidden=daozai::display_layout::hide_for_fullscreen(self.app.settings.hide_fullscreen,self.fullscreen,daozai::display_layout::selected(&self.app.displays,&self.app.settings.display_id).map(|d|d.bounds));
             // 毛玻璃：在岛体左右两侧和画布底边（都在窗口区域之外）取样，估计岛背后的明暗。
             if self.app.settings.skin.is_glass() && !self.hidden {
@@ -568,6 +710,74 @@ impl eframe::App for Shell {
                 self.seek_rx=None;
                 if !success{self.app.say(message);}
             }
+        }
+        // ---- 本机 NOS Web 独立服务：随岛仔启动 / 启动回执 / 周期探测 ----
+        if !self.nos_server_auto_done {
+            self.nos_server_auto_done = true;
+            if self.app.settings.nos_server_enabled && self.app.settings.nos_server_auto_start {
+                let cfg = self.app.nos_server_config();
+                if cfg.validate().is_ok() {
+                    if daozai::nos_server::port_open(cfg.host(), cfg.port) {
+                        self.app.say("检测到 NOS Web 已在运行，直接连接");
+                    } else {
+                        self.nos_server_start(ctx);
+                    }
+                }
+            }
+        }
+        if let Some(rx) = &self.nos_server_ready_rx {
+            if let Ok(result) = rx.try_recv() {
+                match result {
+                    Ok(message) => {
+                        self.app.nos_server_note=Some(message.clone());
+                        self.app.say(message);
+                        // 等价于 Cmd::NosReconfigure：下一帧用对齐后的本地地址重建拉取线程。
+                        self.nos=None;
+                        self.app.nos_error=None;
+                        self.app.nos_events.clear();
+                        self.app.nos_agenda=None;
+                    }
+                    Err(message) => {
+                        self.app.nos_server_note=Some(message.clone());
+                        self.app.say(message);
+                    }
+                }
+                self.nos_server_ready_rx=None;
+            }
+        }
+        let nos_server_exited=self.nos_server.as_mut().is_some_and(|server|!server.alive());
+        if nos_server_exited {
+            self.app.nos_server_note=Some("服务进程已退出，请查看日志".into());
+            self.app.say("NOS Web 服务进程已退出，详情见日志");
+            self.nos_server=None;
+            self.app.nos_server_status=daozai::nos_server::Status::default();
+        }
+        if self.app.settings.nos_server_enabled {
+            if self.nos_server_at.ready(Duration::from_secs(4)) {
+                self.nos_server_at=PollClock::now();
+                if self.nos_server_probe_rx.is_none() {
+                    let cfg=self.app.nos_server_config();
+                    let pid=self.nos_server.as_ref().map(|server|server.pid);
+                    let (tx,rx)=std::sync::mpsc::channel::<daozai::nos_server::Status>();
+                    let probe_ctx=ctx.clone();
+                    let spawned=daozai::resources::ASYNC.spawn(move||{
+                        let status=daozai::nos_server::probe(&cfg,pid);
+                        let _=tx.send(status);
+                        probe_ctx.request_repaint();
+                    });
+                    if spawned.is_some() {self.nos_server_probe_rx=Some(rx);}
+                }
+            }
+            if let Some(rx)=&self.nos_server_probe_rx {
+                match rx.try_recv() {
+                    Ok(status)=>{self.app.nos_server_status=status;self.nos_server_probe_rx=None;}
+                    Err(std::sync::mpsc::TryRecvError::Disconnected)=>{self.nos_server_probe_rx=None;}
+                    Err(std::sync::mpsc::TryRecvError::Empty)=>{}
+                }
+            }
+        } else {
+            self.app.nos_server_status=daozai::nos_server::Status::default();
+            self.nos_server_probe_rx=None;
         }
         let env = self.env(ctx);
         self.reconcile_modules(ctx);
@@ -758,6 +968,64 @@ impl eframe::App for Shell {
                         self.monitor=None;
                         self.monitor_state=None;
                     }
+                },
+                Cmd::NosReconfigure => {
+                    // 配置已由设置页写盘；这里只让旧服务退出，下一帧 reconcile_modules 用新配置重建。
+                    self.nos=None;
+                    self.app.nos_error=None;
+                    self.app.nos_events.clear();
+                    self.app.nos_agenda=None;
+                },
+                Cmd::NosRefresh => {
+                    // 立即重拉：重启服务并清掉旧数据。
+                    self.nos=None;
+                    self.app.nos_error=None;
+                    self.app.nos_events.clear();
+                    self.app.nos_agenda=None;
+                },
+                Cmd::NosTest(base_url, token) => {
+                    // 测试连接在后台线程里做，避免阻塞界面；结果经通道回到主线程再提示。
+                    let ctx=ctx.clone();
+                    let (tx,rx)=std::sync::mpsc::channel::<String>();
+                    std::thread::Builder::new().name("daozai-nos-test".into()).spawn(move||{
+                        let agent=daozai::nos::http_agent();
+                        let message=match daozai::nos::test_connection(&agent,&base_url,&token) {
+                            Ok(text)=>format!("连接成功 · {text}"),
+                            Err(error)=>format!("连接失败：{error}"),
+                        };
+                        let _=tx.send(message);
+                        ctx.request_repaint();
+                    });
+                    self.nos_test_rx=Some(rx);
+                },
+                Cmd::NosServerStart => self.nos_server_start(ctx),
+                Cmd::NosServerStop => self.nos_server_stop(),
+                Cmd::NosServerRestart => {
+                    self.nos_server=None;
+                    self.nos_server_ready_rx=None;
+                    self.nos_server_start(ctx);
+                },
+                Cmd::NosServerDetect => {
+                    if let Some(dir)=daozai::nos_server::detect_work_dir() {
+                        self.app.settings.nos_server_dir=dir.to_string_lossy().into_owned();
+                        self.app.settings.save();
+                        self.app.say(format!("已找到 NOS Web 目录：{}",self.app.settings.nos_server_dir));
+                    } else {
+                        self.app.say("没找到 NOS Web 目录，请手动填写 web 目录的绝对路径，或设置环境变量 NOS_WEB_DIR");
+                    }
+                },
+                Cmd::NosServerOpenWeb => {
+                    let url=self.app.nos_server_config().base_url();
+                    if let Err(error)=open_path(std::path::Path::new(&url)){self.app.say(error);}
+                },
+                Cmd::NosServerOpenLog => {
+                    let cfg=self.app.nos_server_config();
+                    let path=cfg.log_path();
+                    if !path.is_file() {
+                        let _=std::fs::create_dir_all(&cfg.log_dir);
+                        let _=std::fs::write(&path,b"");
+                    }
+                    if let Err(error)=open_path(&path){self.app.say(error);}
                 },
             }
         }

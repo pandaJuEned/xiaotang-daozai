@@ -203,6 +203,8 @@ pub struct Settings {
     pub show_battery: bool,
     /// 常驻栏显示实时网速（P3）；无监控数据时自动隐藏。
     pub show_net_speed: bool,
+    /// 常驻栏显示下一节课；没有课表数据时自动隐藏。
+    pub show_course: bool,
     pub clock_12h: bool,
     pub clock_period: u8,
     pub resident_order: Vec<usize>,
@@ -262,11 +264,26 @@ pub struct Settings {
     pub render_compat: bool,
     /// 自动切换到兼容渲染的原因；手动开启时为空。
     pub render_compat_reason: String,
+    /// 课表模块：是否启用「不止课表」（NOS）联动。
+    pub nos_enabled: bool,
+    /// 课表服务器地址（如 `http://192.168.1.10:8000`）。令牌不存这里，走凭据管理器。
+    pub nos_base_url: String,
+    /// 本地服务模式：NOS Web 端由岛仔拉起/停止，而不是连一台现成的服务器。
+    pub nos_server_enabled: bool,
+    /// 岛仔启动时自动拉起本地 NOS Web 服务。
+    pub nos_server_auto_start: bool,
+    /// NOS 仓库里的 `web/` 目录（其下应有 `app/main.py`）。
+    pub nos_server_dir: String,
+    /// Python 可执行文件路径；留空时优先用 web 目录下的 venv。
+    pub nos_server_python: String,
+    /// uvicorn 监听地址，默认 127.0.0.1（只对本机开放）。
+    pub nos_server_host: String,
+    pub nos_server_port: u16,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { display_id: String::new(), skin: Skin::Classic, island_shape: IslandShape::Notch, glass_blur: true, island_size: 100, island_offset: 0, dock: Dock::Top, settings_theme: Default::default(), pet: true, minimal: false, browser_minimal: false, avoid_browsers: true, avoid_apps: Vec::new(), visible_pages: [true; 10], page_order: [0,1,2,3,4,5,6,7,8,9], show_battery: true, show_net_speed: false, clock_12h: false, clock_period: 0, resident_order: Vec::new(), system_hud: true, bluetooth_notifications: true, read_notifications:false, wechat_notifications:false, wecom_notifications:false, feishu_notifications:false, dingtalk_notifications:false, wechat_tray_open:false, qq_only:false, notification_preview:false, notifications: true, sound: false, lyrics_enabled:true, island_lyrics:false, lyric_delay_ms:-350, hide_fullscreen: true, avoid_top_bar: true, focus_minutes: 25, rest_minutes: 5, water_minutes: 45, serving_ml: 250, water_start: 9, water_end: 22, sit_remind: true, sit_minutes: 60, lunch_rest: true, lunch_start: 720, lunch_end: 810, mail_enabled: true, mail_sync_operations:false, mail_code: true, mail_code_hide_seconds:60, mail_interval: 120, mail_ics: 15, ignored_mail_events: Vec::new(), calendar_prompt: true, calendar_auto_sync: true, clipboard_history: true, weather_city: String::new(), weather_position: None, weather_saved: Vec::new(), render_compat: false, render_compat_reason: String::new() }
+        Self { display_id: String::new(), skin: Skin::Classic, island_shape: IslandShape::Notch, glass_blur: true, island_size: 100, island_offset: 0, dock: Dock::Top, settings_theme: Default::default(), pet: true, minimal: false, browser_minimal: false, avoid_browsers: true, avoid_apps: Vec::new(), visible_pages: [true; 10], page_order: [0,1,2,3,4,5,6,7,8,9], show_battery: true, show_net_speed: false, show_course: false, clock_12h: false, clock_period: 0, resident_order: Vec::new(), system_hud: true, bluetooth_notifications: true, read_notifications:false, wechat_notifications:false, wecom_notifications:false, feishu_notifications:false, dingtalk_notifications:false, wechat_tray_open:false, qq_only:false, notification_preview:false, notifications: true, sound: false, lyrics_enabled:true, island_lyrics:false, lyric_delay_ms:-350, hide_fullscreen: true, avoid_top_bar: true, focus_minutes: 25, rest_minutes: 5, water_minutes: 45, serving_ml: 250, water_start: 9, water_end: 22, sit_remind: true, sit_minutes: 60, lunch_rest: true, lunch_start: 720, lunch_end: 810, mail_enabled: true, mail_sync_operations:false, mail_code: true, mail_code_hide_seconds:60, mail_interval: 120, mail_ics: 15, ignored_mail_events: Vec::new(), calendar_prompt: true, calendar_auto_sync: true, clipboard_history: true, weather_city: String::new(), weather_position: None, weather_saved: Vec::new(), render_compat: false, render_compat_reason: String::new(), nos_enabled: false, nos_base_url: String::new(), nos_server_enabled: false, nos_server_auto_start: false, nos_server_dir: String::new(), nos_server_python: String::new(), nos_server_host: crate::nos_server::DEFAULT_HOST.into(), nos_server_port: crate::nos_server::DEFAULT_PORT }
     }
 }
 
@@ -339,6 +356,7 @@ impl Settings {
                 "clock_12h" => s.clock_12h = v == "1",
                 "show_battery" => s.show_battery = v != "0",
                 "show_net_speed" => s.show_net_speed = v != "0",
+                "show_course" => s.show_course = v != "0",
                 "visible_pages" if (6..=10).contains(&v.len()) && v.bytes().all(|b| b==b'0' || b==b'1') => {
                     for (enabled,value) in s.visible_pages.iter_mut().zip(v.bytes()) { *enabled=value==b'1'; }
                     for enabled in &mut s.visible_pages[v.len()..]{*enabled=v.bytes().any(|b|b==b'1');}
@@ -386,6 +404,17 @@ impl Settings {
                 "weather_saved" => s.weather_saved=serde_json::from_str::<Vec<crate::weather::Position>>(&v).unwrap_or_default().into_iter().filter(|p|p.valid()).collect(),
                 "render_compat" => s.render_compat = v == "1",
                 "render_compat_reason" => s.render_compat_reason = v.chars().filter(|c| !c.is_control()).take(200).collect(),
+                "nos_enabled" => s.nos_enabled = v == "1",
+                "nos_base_url" => s.nos_base_url = v.trim().chars().filter(|c| !c.is_control()).take(300).collect(),
+                "nos_server_enabled" => s.nos_server_enabled = v == "1",
+                "nos_server_auto_start" => s.nos_server_auto_start = v == "1",
+                "nos_server_dir" => s.nos_server_dir = v.trim().chars().filter(|c| !c.is_control()).take(300).collect(),
+                "nos_server_python" => s.nos_server_python = v.trim().chars().filter(|c| !c.is_control()).take(300).collect(),
+                "nos_server_host" => s.nos_server_host = v.trim().chars().filter(|c| !c.is_control()).take(100).collect(),
+                "nos_server_port" => {
+                    let port=v.parse::<u16>().unwrap_or(crate::nos_server::DEFAULT_PORT);
+                    s.nos_server_port=if port==0 {crate::nos_server::DEFAULT_PORT} else {port};
+                },
                 _ => {}
             }
         }
@@ -422,6 +451,7 @@ impl Settings {
                 ("clock_12h".into(), (self.clock_12h as u8).to_string()),
                 ("show_battery".into(), (self.show_battery as u8).to_string()),
                 ("show_net_speed".into(), (self.show_net_speed as u8).to_string()),
+                ("show_course".into(), (self.show_course as u8).to_string()),
                 ("read_notifications".into(),(self.read_notifications as u8).to_string()),
                 ("wechat_notifications".into(),(self.wechat_notifications as u8).to_string()),
                 ("wecom_notifications".into(),(self.wecom_notifications as u8).to_string()),
@@ -465,6 +495,14 @@ impl Settings {
                 ("weather_saved".into(), serde_json::to_string(&self.weather_saved).unwrap()),
                 ("render_compat".into(), (self.render_compat as u8).to_string()),
                 ("render_compat_reason".into(), self.render_compat_reason.clone()),
+                ("nos_enabled".into(), (self.nos_enabled as u8).to_string()),
+                ("nos_base_url".into(), self.nos_base_url.clone()),
+                ("nos_server_enabled".into(), (self.nos_server_enabled as u8).to_string()),
+                ("nos_server_auto_start".into(), (self.nos_server_auto_start as u8).to_string()),
+                ("nos_server_dir".into(), self.nos_server_dir.clone()),
+                ("nos_server_python".into(), self.nos_server_python.clone()),
+                ("nos_server_host".into(), self.nos_server_host.clone()),
+                ("nos_server_port".into(), self.nos_server_port.to_string()),
             ],
         );
     }

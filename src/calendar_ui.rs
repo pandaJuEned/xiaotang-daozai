@@ -39,14 +39,34 @@ fn occurs_on(event:&mail::Meeting,day:NaiveDate)->bool {
     start<=day && day<=last
 }
 
+/// 课表事件 → 统一事件模型。节次已由服务端展开成绝对时刻，这里只做类型转换。
+///
+/// 全天事件没有时刻，`start` 取当天零点；结束时间缺失时不推测时长。
+pub(crate) fn nos_meeting(event:&crate::nos::Event)->Option<mail::Meeting> {
+    let start=if event.all_day||event.start_time.is_empty(){
+        chrono::NaiveDate::parse_from_str(&event.date,"%Y-%m-%d").ok()?.and_hms_opt(0,0,0)?.and_local_timezone(chrono::Local).single()?.timestamp()
+    } else {
+        crate::nos::wall_clock(&event.date,&event.start_time)?
+    };
+    let end=if event.all_day||event.end_time.is_empty(){None}
+    else {crate::nos::wall_clock(&event.date,&event.end_time).filter(|end|*end>start)};
+    let at=if event.all_day||event.start_time.is_empty(){
+        chrono::DateTime::from_timestamp(start,0).map(|at|at.with_timezone(&chrono::Local).format("%m-%d").to_string()).unwrap_or_default()
+    } else {
+        crate::nos::clock_label(&event.start_time)
+    };
+    Some(mail::Meeting{uid:format!("nos-{}",event.uid),title:event.title.clone(),start,end,all_day:event.all_day,at,})
+}
+
 #[derive(Clone,Copy,PartialEq,Eq)]
-pub(crate) enum Source<'a> { Calendar(Option<calendar::Provider>), Mail(&'a str), Local }
+pub(crate) enum Source<'a> { Calendar(Option<calendar::Provider>), Mail(&'a str), Local, /// 课表（NOS）。
+    Nos }
 impl Source<'_> {
     fn icon_key(self)->&'static str {
-        match self {Self::Calendar(Some(provider))=>provider.key(),Self::Calendar(None)=>"calendar",Self::Mail(_)=>"mail",Self::Local=>"local"}
+        match self {Self::Calendar(Some(provider))=>provider.key(),Self::Calendar(None)=>"calendar",Self::Mail(_)=>"mail",Self::Local=>"local",Self::Nos=>"nos"}
     }
     fn label(self)->String {
-        match self {Self::Calendar(provider)=>provider.map(|p|p.label()).unwrap_or("工作日历").to_string(),Self::Mail(account)=>format!("邮件 · {account}"),Self::Local=>"本机日程".into()}
+        match self {Self::Calendar(provider)=>provider.map(|p|p.label()).unwrap_or("工作日历").to_string(),Self::Mail(account)=>format!("邮件 · {account}"),Self::Local=>"本机日程".into(),Self::Nos=>"课表".into()}
     }
     fn color(self)->Color32 {
         match self {
@@ -56,6 +76,7 @@ impl Source<'_> {
             Self::Calendar(_)=>Color32::from_rgb(112,162,255),
             Self::Mail(_)=>Color32::from_rgb(199,168,255),
             Self::Local=>Color32::from_rgb(105,208,157),
+            Self::Nos=>Color32::from_rgb(236,168,88),
         }
     }
 }
@@ -113,13 +134,14 @@ pub(crate) fn source_icon(c:&Card,source:Source<'_>,x:f32,y:f32,size:f32) {
         Source::Calendar(Some(calendar::Provider::WeCom))=>egui::include_image!("../assets/calendar/wecom.svg"),
         Source::Mail(_)=>egui::include_image!("../assets/calendar/mail.svg"),
         Source::Calendar(Some(calendar::Provider::Feishu))=>egui::include_image!("../assets/calendar/feishu.svg"),
+        Source::Nos=>egui::include_image!("../assets/calendar/nos.svg"),
         _=>egui::include_image!("../assets/settings-icons/calendar-days.svg"),
     };
     let egui::ImageSource::Bytes{uri,bytes}=icon else{return};
     let pixels=(rect.width()*c.ui.ctx().pixels_per_point()).ceil() as u32;
     let icon=egui::Image::from_bytes(format!("{uri}/{pixels}.svg"),bytes);
     if let Ok(egui::load::TexturePoll::Ready{texture})=icon.fit_to_exact_size(rect.size()).load_for_size(c.ui.ctx(),rect.size()) {
-        let tint=if matches!(source,Source::Calendar(None|Some(calendar::Provider::ICloud|calendar::Provider::Custom|calendar::Provider::Exchange))|Source::Local){source.color()}else{Color32::WHITE};
+        let tint=if matches!(source,Source::Calendar(None|Some(calendar::Provider::ICloud|calendar::Provider::Custom|calendar::Provider::Exchange))|Source::Local|Source::Nos){source.color()}else{Color32::WHITE};
         c.painter.image(texture.id,rect,egui::Rect::from_min_max(egui::Pos2::ZERO,egui::pos2(1.0,1.0)),tint);
     }
 }
@@ -250,7 +272,9 @@ impl App {
         let mut events:Vec<Entry<'_>>=vec![];
         let mut seen=std::collections::HashMap::<String,usize>::new();
         let local=self.calendar.local.iter().map(|entry|(&entry.event,Source::Local));
-        for (event,source) in work.chain(mail).chain(local).filter(|(event,_)|occurs_on(event,day)) {
+        // 课表（NOS）：与服务端返回的课表事件合并进同一份日程。
+        let nos=self.nos_events.iter().map(|event|(event,Source::Nos));
+        for (event,source) in work.chain(mail).chain(local).chain(nos).filter(|(event,_)|occurs_on(event,day)) {
             let key=entry_key(event);
             if let Some(&index)=seen.get(&key) {
                 let entry=&mut events[index];
@@ -294,7 +318,9 @@ impl App {
         let grid=calendar::month_grid(self.calendar.view.month);
         let mut dots:std::collections::HashMap<NaiveDate,Vec<Source<'_>>>=std::collections::HashMap::new();
         let local=self.calendar.local.iter().map(|entry|(&entry.event,Source::Local));
-        for (event,source) in work.chain(mail).chain(local) {
+        // 课表（NOS）也要在月历上打点，与其它来源一致。
+        let nos=self.nos_events.iter().map(|event|(event,Source::Nos));
+        for (event,source) in work.chain(mail).chain(local).chain(nos) {
             let Some((start,last))=event_days(event) else{continue;};
             if last<grid[0] || start>grid[41]{continue;}
             for date in grid.iter().filter(|date|start<=**date && **date<=last) {
