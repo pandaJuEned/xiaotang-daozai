@@ -2456,6 +2456,41 @@ fn resident_quota_moves_left_and_releases_battery_space(){
 }
 
 #[test]
+fn quota_reset_notifies_once_when_a_depleted_window_refills(){
+    use crate::quota::{Account,Provider,Snapshot,Window};
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());let mut h=H::new();
+    h.app.settings.quota_reset_notice=true;h.app.settings.notifications=true;
+    h.app.quota.config.accounts.push(Account{id:"day".into(),provider:Provider::Codex,alias:"个人".into(),source:"day.json".into(),slot:None,enabled:true,pinned:true});
+    let now=chrono::Local::now().timestamp();
+    let send=|h:&mut H,remaining:f32,reset:i64|{
+        h.app.quota_event(crate::quota::Event{id:"day".into(),result:Ok(Snapshot{at:now,windows:vec![Window{label:"5 小时".into(),seconds:Some(18000),remaining,reset:Some(reset),amount:None}],..Default::default()})});
+    };
+    // 第一次只是记录：刚过 22:58 那个重置点，当时只剩 8%。
+    send(&mut h,8.0,now-60);
+    assert!(h.app.history.is_empty(),"第一次看到窗口不该提醒");
+    // 翻页：重置推到 5 小时后、剩余回到 100% → 提醒一次。
+    send(&mut h,100.0,now+18000);
+    assert_eq!(h.app.history.front().map(|a|a.title.as_str()),Some("额度已重置"),"快用完的窗口回血应提醒");
+    let notice=h.app.history.front().expect("应有提醒").clone();
+    assert!(notice.body.contains("个人")&&notice.body.contains("5 小时")&&notice.body.contains("100%"),"提醒要说清账号与窗口：{}",notice.body);
+    assert_eq!(notice.page,6,"点提醒应回到 AI 额度页");
+    // 再刷一次：重置时刻没变，不重复提醒。
+    let count=h.app.history.len();
+    send(&mut h,99.0,now+18000);
+    assert_eq!(h.app.history.len(),count,"同一个窗口只提醒一次");
+    // 关掉开关后，同样的回血不再提醒。
+    h.app.settings.quota_reset_notice=false;
+    send(&mut h,10.0,now-30);
+    send(&mut h,100.0,now+18000);
+    assert_eq!(h.app.history.len(),count,"关闭开关后不应再提醒");
+    // 开关要能落盘，重启后仍然有效。
+    h.app.settings.save();
+    assert!(!crate::model::Settings::load().quota_reset_notice,"重置提醒开关应写进设置文件");
+    h.app.settings.quota_reset_notice=true;h.app.settings.save();
+    assert!(crate::model::Settings::load().quota_reset_notice,"默认也是开着的");
+}
+
+#[test]
 fn resident_quotas_coexist_with_music_and_focus(){
     let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());let mut h=H::new();h.app.settings.pet=false;h.quota_accounts(3);
     h.media=crate::smtc::NowPlaying{title:"Track".into(),artist:"Artist".into(),playing:true,duration:120.0,..Default::default()};
@@ -8410,4 +8445,28 @@ fn resident_toggles_independently_control_quota_and_ongoing_calendar_slot() {
     assert!(h.app.resident.current().x[crate::bar_layout::CALENDAR].is_some(),"开启后日程槽应就位");
     h.app.settings.show_calendar_status=false;h.frame(vec![]);
     assert!(h.app.resident.current().x[crate::bar_layout::CALENDAR].is_none(),"关闭后日程槽应消失");
+}
+#[test]
+fn resident_bar_shows_the_refill_time_only_when_quota_is_low(){
+    use crate::quota::{Event,Snapshot,Window};
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+    let mut h=H::new();h.app.settings.pet=false;h.app.settings.show_battery=true;h.quota_accounts(1);
+    let id=h.app.quota.config.accounts[0].id.clone();
+    let now=chrono::Local::now().timestamp();
+    let reset=now+3600;
+    let send=|h:&mut H,remaining:f32|{
+        h.app.quota_event(Event{id:id.clone(),result:Ok(Snapshot{at:now,windows:vec![Window{label:"5 小时".into(),seconds:Some(18000),remaining,reset:Some(reset),amount:None}],..Default::default()})});
+    };
+    let clock=chrono::DateTime::from_timestamp(reset,0).unwrap().with_timezone(&chrono::Local).format("%H:%M").to_string();
+    let shows_clock=|h:&H|h.shapes.iter().any(|shape|matches!(&shape.shape,egui::Shape::Text(text) if text.galley.text()==clock));
+    // 还剩四成：常驻栏不该多出任何时刻文字。
+    send(&mut h,40.0);
+    for _ in 0..60 {h.frame(vec![]);}
+    assert!(!shows_clock(&h),"额度充裕时不该显示回血时刻");
+    let roomy=h.app.current_width();
+    // 掉到 8%：环右侧长出回血时刻，胶囊也跟着变宽。
+    send(&mut h,8.0);
+    for _ in 0..60 {h.frame(vec![]);}
+    assert!(shows_clock(&h),"快用完且 12 小时内回血时应在岛上显示时刻");
+    assert!(h.app.current_width()>roomy+10.0,"时刻要给额度槽多申请一点宽度");
 }

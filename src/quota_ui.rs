@@ -20,6 +20,9 @@ pub(crate) struct State {
     pub detail_account:Option<String>,
     pub kiro_connecting:Option<quota::kiro::Connect>,
     pub stale:HashMap<String,String>,
+    /// 上次看到的「窗口重置时刻 + 剩余百分比」，键是 `账号|窗口`。
+    /// 用来判断某个额度窗口是不是刚刚翻页（重置后提醒一次）。
+    pub reset_seen:HashMap<String,(i64,f32)>,
     pub gemini_connecting:Option<quota::gemini::Connect>,pub gemini_email:String,pub gemini_cookie:String,
     pub doubao_connecting:Option<quota::doubao::Connect>,pub doubao_cookie:String,
 }
@@ -30,6 +33,13 @@ impl State {
     fn ring_tail_text(&self,id:&str)->Option<String>{self.rows.get(id)?.as_ref().ok()?.rings().first()?.amount.as_ref().map(Amount::short)}
     /// 常驻胶囊里紧跟图标的文字：余额类给余额，点数类给剩余点数。
     fn tail_text(&self,id:&str)->Option<String>{self.balance_text(id).or_else(||self.ring_tail_text(id))}
+    /// 见底倒计时的尾巴：只在「快用完 + 快回血」时给一个「23:00」。
+    /// 已经有数值型尾巴（如 Kiro 点数）的账号不抢位置——那个数字更该看。
+    fn low_reset_text(&self,id:&str)->Option<String>{
+        if self.tail_text(id).is_some(){return None;}
+        let snapshot=self.rows.get(id)?.as_ref().ok()?;
+        low_reset_tail(snapshot,chrono::Local::now().timestamp())
+    }
     pub fn load()->Self {
         if cfg!(test){return Self::default();}
         let mut state=Self::restore(Config::load(),crate::model::config_dir().join("ai-quota-cache.json"));
@@ -214,6 +224,32 @@ fn reset_text(at:Option<i64>,now:&chrono::DateTime<chrono::Local>)->String {
     let format=if at.date_naive()==now.date_naive(){"今天 %H:%M 重置"}else if at.year()==now.year(){"%-m月%-d日 %H:%M 重置"}else{"%Y/%-m/%-d %H:%M 重置"};
     at.format(format).to_string()
 }
+/// 只取时刻：常驻栏的倒计时用「23:00」，比「今天 23:00 重置」省一半宽度。
+fn clock_text(at:i64)->String{chrono::DateTime::from_timestamp(at,0).map(|at|at.with_timezone(&chrono::Local).format("%H:%M").to_string()).unwrap_or_default()}
+/// 见底倒计时的门槛：剩余 ≤15% 且 12 小时内会重置。
+const LOW_QUOTA:f32=15.0;
+const LOW_RESET_WINDOW:i64=12*3600;
+/// 见底倒计时的字号：比顶栏时钟小一号，免得被当成「第二个时钟」。
+const RESET_TAIL_SIZE:f32=12.0;
+/// 见底倒计时：额度和时间都紧的时候，最想知道的是「几点回血」。
+/// 平时返回 None，常驻栏一个像素都不多占。
+fn low_reset_tail(snapshot:&Snapshot,now:i64)->Option<String>{
+    snapshot.rings().iter().find_map(|w|{
+        let reset=w.reset?;
+        (w.remaining<=LOW_QUOTA && reset>now && reset-now<=LOW_RESET_WINDOW).then(||clock_text(reset))
+    })
+}
+/// 刚翻页的额度窗口：`before`/`had` 是上一次看到的重置时刻与剩余百分比。
+/// 三个条件同时成立才算「回血」：重置时刻变了、刚过点、重置前确实快用完了。
+fn reset_just_refilled(before:i64,had:f32,window:&quota::Window,now:i64)->bool{
+    let Some(reset)=window.reset else{return false;};
+    let just_reset=before<=now && now-before<3600;
+    before!=reset && just_reset && had<=LOW_QUOTA && window.remaining>=had+20.0
+}
+/// 常驻栏悬停文字：额度摘要 + 重置时刻（知道才带上，不知道就别编）。
+fn bar_tooltip_text(provider:&str,alias:&str,summary:&str,reset_note:&str)->String{
+    if reset_note.is_empty(){format!("{provider} · {alias}\n{summary}")}else{format!("{provider} · {alias}\n{summary}\n{reset_note}")}
+}
 fn snapshot_details(snapshot:&Snapshot)->String{
     if let Some(relay)=&snapshot.relay{return relay.full();}
     if snapshot.kiro.is_some(){return kiro_details(snapshot);}
@@ -348,7 +384,39 @@ impl App {
     pub fn quota_config(&self)->&Config{&self.quota.config}
     pub fn quota_initialize(&mut self){if !crate::model::config_dir().join("ai-quota.json").exists(){self.quota.config.discover();self.quota.config.save();}}
     pub fn quota_pending(&mut self,accounts:&[Account]){self.quota.busy.extend(accounts.iter().map(|a|a.id.clone()));}
-    pub fn quota_event(&mut self,event:quota::Event){self.quota.receive(event);}
+    pub fn quota_event(&mut self,event:quota::Event){
+        let id=event.id.clone();
+        self.quota.receive(event);
+        self.quota_notice_reset(&id);
+    }
+    /// 重置后提醒一次：窗口翻页、且上一次确实快用完了，才值得说一句。
+    /// 没用过的窗口每 5 小时都会翻页，一律不提醒——否则就成了定时噪音。
+    fn quota_notice_reset(&mut self,id:&str){
+        // 先把窗口抄出来：后面要改 reset_seen 还要弹提示，不能一直借着 rows。
+        let windows:Vec<quota::Window>=match self.quota.rows.get(id){
+            Some(Ok(snapshot))=>snapshot.windows.iter().chain(snapshot.extra.iter()).cloned().collect(),
+            _=>return,
+        };
+        if windows.is_empty(){return;}
+        let now=chrono::Local::now().timestamp();
+        let enabled=self.settings.quota_reset_notice && self.settings.notifications;
+        let mut notice=None;
+        for window in &windows{
+            let Some(reset)=window.reset else{continue};
+            let key=format!("{id}|{}",window.label);
+            if let Some((seen,had))=self.quota.reset_seen.get(&key).copied(){
+                // 重置时刻变了 = 这个窗口翻页了；刚翻页 + 之前快用完，才提示。
+                if enabled && reset_just_refilled(seen,had,window,now){
+                    notice=Some((window.label.clone(),window.remaining));
+                }
+            }
+            self.quota.reset_seen.insert(key,(reset,window.remaining));
+        }
+        if let Some((label,remaining))=notice{
+            let alias=self.quota.config.accounts.iter().find(|a|a.id==id).map(|a|a.alias.clone()).unwrap_or_default();
+            self.alert("额度已重置",format!("{alias} · {label} · 现在剩余 {remaining:.0}%"),6,false);
+        }
+    }
     pub fn quota_set_source(&mut self,path:std::path::PathBuf){self.quota.source=path.to_string_lossy().into_owned();}
     pub(crate) fn quota_bar_indices(&self)->Vec<usize>{
         if !self.settings.show_quota || !self.quota.config.enabled || !self.quota.config.compact || !self.settings.visible_pages[6] || self.settings.minimal || self.t<self.notification_bell_until{return vec![];}
@@ -356,9 +424,11 @@ impl App {
     }
     /// 常驻胶囊里每个额度槽的实际宽度：图标右侧跟数字的账号需要额外占位。
     pub(crate) fn quota_balance_layout(&self,ctx:&egui::Context)->Vec<(usize,f32)>{
+        let width_of=|text:&str,size:f32|ctx.fonts(|fonts|fonts.layout_no_wrap(text.to_string(),theme::font(size,W::Bold),theme::WHITE).size().x).ceil()+6.0;
         self.quota_bar_indices().iter().enumerate().filter_map(|(position,index)|{
             let account=&self.quota.config.accounts[*index];
-            let extra=if let Some(text)=self.quota.tail_text(&account.id){ctx.fonts(|fonts|fonts.layout_no_wrap(text,theme::font(theme::size::PILL_CLOCK,W::Bold),theme::WHITE).size().x).ceil()+6.0}
+            let extra=if let Some(text)=self.quota.tail_text(&account.id){width_of(&text,theme::size::PILL_CLOCK)}
+                else if let Some(text)=self.quota.low_reset_text(&account.id){width_of(&text,RESET_TAIL_SIZE)}
                 else if account.provider.balance()&&self.quota.balance_loading(&account.id){22.0}
                 else{return None;};
             Some((position,extra))
@@ -396,11 +466,19 @@ impl App {
             let extra=(layout.widths[crate::bar_layout::quota_slot(position)]-27.0).max(0.0);
             let x=if extra>0.0{x-extra/2.0}else{x};
             ring(c,a,snapshot,x,15.0,27.0,accent_colors(&self.quota.config,a));
-            if extra>0.0{let stale=self.quota.stale.contains_key(&a.id);if let Some(text)=self.quota.tail_text(&a.id){c.text(x+15.5,21.0,&text,theme::size::PILL_CLOCK,W::Bold,if stale{theme::GRAY}else{theme::WHITE},H::Left);}}
+            if extra>0.0{
+                let stale=self.quota.stale.contains_key(&a.id);
+                if let Some(text)=self.quota.tail_text(&a.id){c.text(x+15.5,21.0,&text,theme::size::PILL_CLOCK,W::Bold,if stale{theme::GRAY}else{theme::WHITE},H::Left);}
+                // 见底倒计时：额度快用完时，环右边临时长出「23:00」，重置后自动消失。
+                else if let Some(text)=self.quota.low_reset_text(&a.id){c.text(x+15.5,21.0,&text,RESET_TAIL_SIZE,W::Bold,theme::YELLOW,H::Left);}
+            }
             let mut same=self.quota.config.accounts.iter().filter(|other|other.provider==a.provider && other.enabled);
             if same.clone().count()>1{let n=same.position(|other|other.id==a.id).unwrap_or(0)+1;c.circle(x+10.0,24.0,4.5,Color32::from_gray(225));c.text(x+10.0,26.8,&n.to_string(),6.5,W::Bold,Color32::BLACK,H::Center);}
             let summary=snapshot.map(|s|s.rings().iter().map(|w|w.summary()).collect::<Vec<_>>().join(" · ")).unwrap_or_else(||if self.quota.busy.contains(&a.id){"正在更新".into()}else{"额度暂不可用".into()});
-            if bar_tooltip(c.hit(x-14.0,1.0,28.0+extra,28.0,("quota-pin",&a.id)),format!("{} · {}\n{}",a.provider.name(),a.alias,summary)).clicked(){chosen=Some(a.id.clone());}
+            // 悬停里补一行「今天 23:00 重置」：额度页早就写了，常驻栏一直缺这一句。
+            let reset_note=snapshot.and_then(|s|s.rings().first().and_then(|w|w.reset)).map(|at|reset_text(Some(at),&chrono::Local::now())).unwrap_or_default();
+            let tip=bar_tooltip_text(a.provider.name(),&a.alias,&summary,&reset_note);
+            if bar_tooltip(c.hit(x-14.0,1.0,28.0+extra,28.0,("quota-pin",&a.id)),tip).clicked(){chosen=Some(a.id.clone());}
         }
         if let Some(id)=chosen{self.quota.config.selected=id;self.quota.config.save();self.show_page(6);}
     }
@@ -573,6 +651,8 @@ impl App {
             setting_row(ui,"开启 AI 额度","每 3 分钟自动更新",&mut self.quota.config.enabled);
             ui.separator();
             setting_row(ui,"收起时显示常驻账号","WorkBuddy 积分在前，DeepSeek 余额在最后",&mut self.quota.config.compact);
+            ui.separator();
+            setting_row(ui,"重置后提醒一次","额度回血时提示一下；只在重置前快用完的窗口发，没动过的窗口不吵",&mut self.settings.quota_reset_notice);
         });
         ui.add_space(10.0);
         ui.horizontal_wrapped(|ui|{
@@ -1005,6 +1085,47 @@ mod tests {
         assert_eq!(reset_text(Some(i64::MAX),&now),"重置时间未知");
         assert_eq!(reset_text(Some(now.timestamp()),&now),"等待刷新");
         assert_eq!(reset_text(Some(now.timestamp()-1),&now),"等待刷新");
+    }
+
+    fn window(remaining:f32,reset:Option<i64>)->quota::Window{
+        quota::Window{label:"5 小时".into(),seconds:Some(18000),remaining,reset,amount:None}
+    }
+
+    #[test]
+    fn low_reset_tail_only_shows_when_almost_out_and_about_to_refill(){
+        let now=chrono::Local.with_ymd_and_hms(2026,11,16,21,40,0).unwrap().timestamp();
+        let snapshot=|w:quota::Window|Snapshot{at:now-60,windows:vec![w],..Default::default()};
+        // 剩余 8% + 1 小时后重置：给时刻。
+        assert_eq!(low_reset_tail(&snapshot(window(8.0,Some(now+3600))),now),Some(clock_text(now+3600)));
+        // 边界：正好 15% 还在门槛内，15.1% 就不提示了。
+        assert!(low_reset_tail(&snapshot(window(15.0,Some(now+3600))),now).is_some());
+        assert!(low_reset_tail(&snapshot(window(15.1,Some(now+3600))),now).is_none());
+        // 还早（超过 12 小时）、已经过点、没有重置时间：都不提示。
+        assert!(low_reset_tail(&snapshot(window(3.0,Some(now+13*3600))),now).is_none());
+        assert!(low_reset_tail(&snapshot(window(3.0,Some(now-60))),now).is_none());
+        assert!(low_reset_tail(&snapshot(window(3.0,None)),now).is_none());
+    }
+
+    #[test]
+    fn reset_notice_needs_a_depleted_window_and_a_fresh_reset(){        let now=chrono::Local.with_ymd_and_hms(2026,11,16,23,2,0).unwrap().timestamp();
+        // 22:58 重置、当时只剩 6%，23:02 拉到新数据（重置到 04:00、剩余 100%）→ 提示。
+        assert!(reset_just_refilled(now-240,6.0,&window(100.0,Some(now+5*3600)),now));
+        // 重置前没怎么用（还剩 80%）：不提示，否则每个窗口每 5 小时都要吵一次。
+        assert!(!reset_just_refilled(now-240,80.0,&window(100.0,Some(now+5*3600)),now));
+        // 重置时刻没变：同一窗口不重复提示。
+        assert!(!reset_just_refilled(now+5*3600,6.0,&window(99.0,Some(now+5*3600)),now));
+        // 过点太久（例如隔了一天才刷新）：不补发旧提醒。
+        assert!(!reset_just_refilled(now-7200,6.0,&window(100.0,Some(now+5*3600)),now));
+        // 剩余没明显回升（只是普通刷新）：不提示。
+        assert!(!reset_just_refilled(now-240,6.0,&window(9.0,Some(now+5*3600)),now));
+    }
+
+    #[test]
+    fn bar_tooltip_carries_the_reset_time_only_when_it_is_known(){
+        assert_eq!(bar_tooltip_text("Claude","个人","5 小时剩余 62%",""),"Claude · 个人\n5 小时剩余 62%");
+        let with_reset=bar_tooltip_text("Claude","个人","5 小时剩余 62%","今天 23:00 重置");
+        assert!(with_reset.ends_with("今天 23:00 重置"),"知道重置时间就要写出来：{with_reset}");
+        assert_eq!(with_reset.lines().count(),3,"摘要和重置时刻各占一行");
     }
 }
 
