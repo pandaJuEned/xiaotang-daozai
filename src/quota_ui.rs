@@ -40,6 +40,29 @@ impl State {
         let snapshot=self.rows.get(id)?.as_ref().ok()?;
         low_reset_tail(snapshot,chrono::Local::now().timestamp())
     }
+    /// 余额类账号的悬停说明：完整余额、资源包明细、重置规则（以及数据为什么会旧）。
+    /// 常驻栏上只能放缩写（3.54k），悬停里给完整数字才看得出用掉了多少。
+    fn balance_tooltip(&self,account:&Account)->Vec<String>{
+        let snapshot=self.rows.get(&account.id).and_then(|r|r.as_ref().ok());
+        let mut lines=vec![format!("{} · {}",account.provider.name(),account.alias)];
+        if let Some(snapshot)=snapshot{
+            if let Some(credits)=&snapshot.credits{
+                lines.push(format!("可用积分 {}",credits.full()));
+                if !credits.packages.is_empty(){lines.push(credits.packages_text());}
+                if account.provider==Provider::WorkBuddy{lines.push(quota::workbuddy::reset_rule_text(&snapshot.plan));}
+            }else if let Some(wallet)=&snapshot.wallet{
+                lines.push(format!("余额 {}{}",wallet.primary().currency,wallet.primary().full(wallet.primary().total)));
+            }else if let Some(relay)=&snapshot.relay{
+                lines.push(format!("余额 {}",relay.full()));
+            }
+        }
+        // 兜底：还没有结构化数据时退回常驻栏那句缩写。
+        if lines.len()==1{
+            if let Some(text)=self.balance_text(&account.id){lines.push(format!("可用 {text}"));}
+        }
+        if let Some(reason)=self.stale.get(&account.id){lines.push(reason.clone());}
+        lines
+    }
     pub fn load()->Self {
         if cfg!(test){return Self::default();}
         let mut state=Self::restore(Config::load(),crate::model::config_dir().join("ai-quota-cache.json"));
@@ -460,7 +483,11 @@ impl App {
                         c.ui.ctx().request_repaint_after(std::time::Duration::from_millis(160));
                     }
                 }
-                if c.hit(x-(27.0+extra)/2.0,1.0,27.0+extra,28.0,("quota-pin",&a.id)).clicked(){chosen=Some(a.id.clone());}continue;
+                // 余额类账号原本悬停没有提示：补上余额、资源包明细与重置规则。
+                let tip=self.quota.balance_tooltip(a).join("\n");
+                // 用岛仔自己的 bar_tooltip：它不可交互、出现在下方，不会把点击从图标上抢走。
+                let hit=c.hit(x-(27.0+extra)/2.0,1.0,27.0+extra,28.0,("quota-pin",&a.id));
+                if bar_tooltip(hit,tip).clicked(){chosen=Some(a.id.clone());}continue;
             }
             // 有具体点数的额度（如 Kiro）在环右侧跟一段剩余点数，与余额类的排布一致。
             let extra=(layout.widths[crate::bar_layout::quota_slot(position)]-27.0).max(0.0);
@@ -516,7 +543,7 @@ impl App {
             if let Some(credits)=snapshot.and_then(|s|s.credits.as_ref()){
                 c.text(125.0,81.0,"可用积分",10.5,W::Regular,theme::GRAY,H::Left);
                 c.text(125.0,107.0,&credits.full(),23.0,W::Semibold,theme::WHITE,H::Left);
-                let detail=if let Some(reason)=self.quota.stale.get(&a.id){reason.clone()}else{credits.packages.iter().map(|(label,n)|format!("{label} {n}")).collect::<Vec<_>>().join(" · ")};c.text(125.0,131.0,&c.fit(&detail,10.0,W::Regular,225.0),10.0,W::Regular,theme::GRAY,H::Left);
+                let detail=if let Some(reason)=self.quota.stale.get(&a.id){reason.clone()}else{credits.packages_text()};c.text(125.0,131.0,&c.fit(&detail,10.0,W::Regular,225.0),10.0,W::Regular,theme::GRAY,H::Left);
             }else{let text=result.and_then(|r|r.as_ref().err()).map(String::as_str).unwrap_or("正在查询积分…");for(i,line)in c.wrap(text,11.0,W::Regular,226.0,3).iter().enumerate(){c.text(125.0,92.0+i as f32*17.0,line,11.0,W::Regular,theme::GRAY,H::Left);}}
             return;
         }
@@ -680,7 +707,11 @@ impl App {
                     });
                     let result=self.quota.rows.get(&a.id);let snapshot=result.and_then(|r|r.as_ref().ok());let error=self.quota.stale.get(&a.id).or_else(||result.and_then(|r|r.as_ref().err()));
                     if let Some(s)=snapshot{
-                        if a.provider.api_key()||a.provider==Provider::Doubao{ui.label(snapshot_details(s));}else if let Some(credits)=&s.credits{ui.horizontal_wrapped(|ui|{ui.label(egui::RichText::new("可用积分").size(11.0).color(ui.visuals().weak_text_color()));ui.label(egui::RichText::new(credits.full()).size(20.0).strong());ui.label(egui::RichText::new(credits.packages.iter().map(|(label,n)|format!("{label} {n}")).collect::<Vec<_>>().join(" · ")).size(11.0).color(ui.visuals().weak_text_color()));});}else if let Some(wallet)=&s.wallet{
+                        if a.provider.api_key()||a.provider==Provider::Doubao{ui.label(snapshot_details(s));}else if let Some(credits)=&s.credits{
+                            ui.horizontal_wrapped(|ui|{ui.label(egui::RichText::new("可用积分").size(11.0).color(ui.visuals().weak_text_color()));ui.label(egui::RichText::new(credits.full()).size(20.0).strong());ui.label(egui::RichText::new(credits.packages_text()).size(11.0).color(ui.visuals().weak_text_color()));});
+                            // 额度接口不返回周期，这里只能按官方规则说明「什么时候回血」。
+                            if a.provider==Provider::WorkBuddy{ui.label(egui::RichText::new(quota::workbuddy::reset_rule_text(&s.plan)).size(11.0).color(ui.visuals().weak_text_color()));}
+                        }else if let Some(wallet)=&s.wallet{
                             ui.horizontal_wrapped(|ui|{
                                 ui.label(egui::RichText::new(if wallet.available{"可用余额"}else{"余额不可用"}).size(11.0).color(ui.visuals().weak_text_color()));
                                 ui.label(egui::RichText::new(wallet.primary().full(wallet.primary().total)).size(20.0).strong());
@@ -1121,11 +1152,29 @@ mod tests {
     }
 
     #[test]
-    fn bar_tooltip_carries_the_reset_time_only_when_it_is_known(){
-        assert_eq!(bar_tooltip_text("Claude","个人","5 小时剩余 62%",""),"Claude · 个人\n5 小时剩余 62%");
+    fn bar_tooltip_carries_the_reset_time_only_when_it_is_known(){        assert_eq!(bar_tooltip_text("Claude","个人","5 小时剩余 62%",""),"Claude · 个人\n5 小时剩余 62%");
         let with_reset=bar_tooltip_text("Claude","个人","5 小时剩余 62%","今天 23:00 重置");
         assert!(with_reset.ends_with("今天 23:00 重置"),"知道重置时间就要写出来：{with_reset}");
         assert_eq!(with_reset.lines().count(),3,"摘要和重置时刻各占一行");
+    }
+
+    #[test]
+    fn balance_tooltip_explains_workbuddy_reset_rule_and_rounds_packages(){
+        let mut state=State::default();
+        state.rows.insert("wb".into(),Ok(Snapshot{
+            plan:"体验版".into(),
+            credits:Some(quota::workbuddy::Credits{remaining:3544.11000183,packages:vec![("套餐".into(),500.0),("赠送".into(),3044.11000183)]}),
+            at:chrono::Utc::now().timestamp(),
+            ..Default::default()
+        }));
+        state.stale.insert("wb".into(),"上次记录，等待刷新".into());
+        let account=Account{id:"wb".into(),provider:Provider::WorkBuddy,alias:"WorkBuddy".into(),source:"wb.json".into(),slot:None,enabled:true,pinned:true};
+        let lines=state.balance_tooltip(&account);
+        assert_eq!(lines[0],"WorkBuddy · WorkBuddy");
+        assert!(lines.iter().any(|line|line=="可用积分 3,544.11"),"余额要带分组，不能是原始浮点：{lines:?}");
+        assert!(lines.iter().any(|line|line=="套餐 500 · 赠送 3,044.11"),"资源包明细要去掉浮点尾巴：{lines:?}");
+        assert!(lines.iter().any(|line|line.contains("每月 1 日 00:00 重置")),"体验版要说明什么时候回血：{lines:?}");
+        assert!(lines.iter().any(|line|line.contains("上次记录")),"数据旧了也要说：{lines:?}");
     }
 }
 

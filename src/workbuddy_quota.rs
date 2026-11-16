@@ -8,6 +8,25 @@ pub struct Credits {pub remaining:f64,pub packages:Vec<(String,f64)>}
 impl Credits {
     pub fn compact(&self)->String{super::deepseek::Balance{currency:"CNY".into(),total:self.remaining,granted:0.0,topped_up:0.0}.compact().trim_start_matches('¥').to_owned()}
     pub fn full(&self)->String{let text=super::deepseek::Balance{currency:"CNY".into(),total:self.remaining,granted:0.0,topped_up:0.0}.full(self.remaining);text.trim_start_matches('¥').trim_end_matches('0').trim_end_matches('.').to_owned()}
+    /// 资源包明细：「套餐 500 · 赠送 3,044.11」。
+    /// 接口给的原值是 `3044.11000183` 这种浮点尾巴，直接格式化会拖一整串小数。
+    pub fn packages_text(&self)->String{
+        let money=|value:f64|{
+            let text=super::deepseek::Balance{currency:"CNY".into(),total:value,granted:0.0,topped_up:0.0}.full(value).trim_start_matches('¥').to_owned();
+            // 整数金额去掉无意义的 .00，其余保留两位。
+            text.strip_suffix(".00").map(str::to_string).unwrap_or(text)
+        };
+        self.packages.iter().map(|(label,amount)|format!("{label} {}",money(*amount))).collect::<Vec<_>>().join(" · ")
+    }
+}
+/// 积分重置规则（官方文档：积分按月发放、当月有效不结转；赠送部分自到账起 1 个月内有效）。
+/// 额度接口只返回余量、不返回周期，所以能给的只有规则本身，给不出确切时刻。
+pub fn reset_rule_text(plan:&str)->String{
+    if plan.contains("体验")||plan.is_empty(){
+        "套餐积分每月 1 日 00:00 重置 · 赠送积分自到账起 1 个月内有效".into()
+    }else{
+        "套餐积分按订阅周期重置（购买日顺延一个月）· 赠送积分自到账起 1 个月内有效".into()
+    }
 }
 pub fn parse(value:&Value)->Result<Snapshot,String>{
     if value["code"].as_i64()!=Some(0){return Err("WorkBuddy 积分接口暂未返回结果，请稍后重试".into());}
@@ -255,5 +274,20 @@ impl Connect {
         let s=parse(&json!({"code":0,"data":{"Packages":[{"PackageCode":"base","CycleRemainCapacity":"1200"},{"PackageCode":"gift","CycleRemainCapacity":80}]}})).unwrap();let c=s.credits.unwrap();assert_eq!(c.remaining,1280.0);assert_eq!(c.compact(),"1.28k");assert_eq!(c.full(),"1,280");
         for v in [json!({"code":0}),json!({"code":401}),json!({"code":0,"data":{"Packages":[{}]}}),json!({"code":0,"data":{"Packages":[{"CycleRemainCapacity":-1}]}})]{assert!(parse(&v).is_err());}
         assert_eq!(parse(&json!({"code":0,"data":{"Packages":[]}})).unwrap().credits.unwrap().remaining,0.0);
+    }
+
+    #[test]fn credits_packages_drop_the_float_tail(){
+        let credits=Credits{remaining:3544.11000183,packages:vec![("套餐".into(),500.0),("赠送".into(),3044.11000183)]};
+        assert_eq!(credits.packages_text(),"套餐 500 · 赠送 3,044.11","接口原值带一长串小数，展示要收成两位");
+        let single=Credits{remaining:1200.5,packages:vec![("加量包".into(),1200.5)]};
+        assert_eq!(single.packages_text(),"加量包 1,200.50");
+    }
+
+    #[test]fn reset_rule_follows_the_plan(){
+        assert!(reset_rule_text("体验版").contains("每月 1 日 00:00 重置"),"体验版按自然月重置");
+        assert!(reset_rule_text("").contains("每月 1 日 00:00 重置"),"没拿到套餐名时按体验版处理");
+        assert!(reset_rule_text("旗舰版").contains("按订阅周期重置"));
+        assert!(!reset_rule_text("旗舰版").contains("每月 1 日"),"付费版按购买日顺延，不能写成自然月");
+        assert!(reset_rule_text("旗舰版").contains("赠送"),"赠送积分的有效期规则两版都要说");
     }
 }
