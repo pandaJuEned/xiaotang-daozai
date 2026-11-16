@@ -8,6 +8,8 @@ mod calendar_compatibility;
 mod doubao;
 #[path="nos_ui_tests.rs"]
 mod nos_ui;
+#[path="todo_settings_tests.rs"]
+mod todo_settings;
 use eframe::egui::{self, Pos2, Rect, Vec2};
 use std::sync::Mutex;
 

@@ -57,6 +57,7 @@ mod pet;
 mod pet_expressions;
 mod bar_layout;
 mod resident_settings;
+mod todo_settings;
 mod avoidance;
 mod focus_bar;
 #[cfg(windows)]

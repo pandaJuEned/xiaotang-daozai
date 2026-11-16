@@ -1231,7 +1231,7 @@ const SETTINGS_GROUPS: [(&str,usize,usize);12] = [
 
 impl App {
     pub fn settings_ui(&mut self,ctx:&egui::Context,autostart:bool){
-        if !self.settings_open{self.window_layout().close();release_support_codes(ctx);}
+        if !self.settings_open{self.todo_reminder=None;self.window_layout().close();release_support_codes(ctx);}
         self.updates.poll(ctx);
         self.updates.dialog_ui(ctx);
         if !self.settings_open{return;}
@@ -1256,7 +1256,7 @@ impl App {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             }
-            if ctx.input(|i|i.viewport().close_requested()){self.settings_open=false;self.quota_close_connection();}
+            if ctx.input(|i|i.viewport().close_requested()){self.settings_open=false;self.todo_reminder=None;self.quota_close_connection();}
             let before=format!("{:?}",self.settings);
             egui::SidePanel::left("settings-sidebar").resizable(false).exact_width(180.0).frame(egui::Frame::new().fill(settings_color(ctx,Color32::from_rgb(29,29,32),Color32::from_rgb(237,239,243))).stroke(egui::Stroke::new(1.0,settings_color(ctx,Color32::from_rgb(42,42,45),Color32::from_rgb(216,219,225)))).inner_margin(egui::Margin::symmetric(10,12))).show(ctx,|ui|{
                 // 页签已增至 16 个，窗口被拖矮时末尾几项会被裁掉；放进滚动区保证都能到达。
@@ -1618,14 +1618,7 @@ impl App {
                             ui.small("喝水和久坐提醒只在提醒时段内、午休以外弹出。");
                         });
                     }
-                    4=>{
-                        settings_label(ui,"待办清单");
-                        settings_card(ui,|ui|{
-                            ui.label(egui::RichText::new("在待办页添加、编辑任务并设置提醒时间。").size(13.0));
-                            ui.add_space(5.0);
-                            if ui.add_sized([120.0,32.0],egui::Button::new("打开待办页")).clicked(){self.settings_open=false;self.show_page(4);}
-                        });
-                    }
+                    4=>self.todo_settings(ui),
                     5=>{
                         settings_label(ui,"置物架");
                         settings_card(ui,|ui|{
@@ -2024,6 +2017,8 @@ impl App {
                     }
                 });
             });
+            // 待办「提醒与重复」：设置页自己的原生小窗口，跟着设置窗口一起出现/消失。
+            self.todo_reminder_window(ctx);
             self.avoidance.dialog(ctx,&mut self.settings);
             if before!=format!("{:?}",self.settings){self.settings.save();}
             ctx.set_style(original_style);
