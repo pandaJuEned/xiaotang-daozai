@@ -80,9 +80,14 @@ fn nos_todos_join_the_todo_page_read_only_without_touching_local_todos() {
         "NOS 已完成的待办在岛上标记为完成");
     // 本机待办不受影响：set_nos_agenda 前后条数不变，NOS 项不写回 todo.txt。
     assert!(h.app.todos.items.is_empty(),"NOS 待办不能写回本机清单");
-    // 打开待办页渲染，混入的只读行不能把界面弄崩。
+    // 展开岛体切到待办页：NOS 待办的标题与 NOS 标签必须真的画出来。
     h.app.show_page(4);
-    for _ in 0..3 {let _=h.frame(vec![]);}
+    h.hover(H::local(300.0,60.0),0.8);
+    let contains=|needle:&str|h.shapes.iter().any(|shape|matches!(&shape.shape,
+        eframe::egui::Shape::Text(text) if text.galley.text().contains(needle)));
+    assert!(contains("写开题报告"),"待办页应画出 NOS 待办标题");
+    assert!(contains("交材料"),"第二条 NOS 待办也应可见");
+    assert!(contains("NOS"),"NOS 待办应带来源标签");
 }
 
 #[test]
