@@ -416,7 +416,10 @@ fn generate_token() -> Result<String, String> {
 #[cfg(windows)]
 pub mod secrets {
     /// 凭据管理器里的服务名。
-    const SERVICE: &str = "Daozai.Nos";
+    ///
+    /// 测试用独立条目：`delete()` 会真的删凭据，若和正式条目同名，跑一次测试就把用户
+    /// 正在用的 NOS 令牌清掉了（表现为日程拉取突然 401、本地服务令牌对不上）。
+    const SERVICE: &str = if cfg!(test) { "Daozai.Nos.test" } else { "Daozai.Nos" };
 
     pub fn save(token: &str) -> Result<(), String> {
         let entry = keyring::Entry::new(SERVICE, "token")
