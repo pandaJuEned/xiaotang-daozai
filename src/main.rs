@@ -298,6 +298,8 @@ impl Shell {
             std::thread::sleep(Duration::from_millis(100));
         }
         self.app.settings.nos_base_url = cfg.base_url();
+        // 地址被自动对齐后，设置页下次绘制要重新载入草稿，不能继续显示旧的手填值。
+        self.app.reset_nos_url_draft();
         self.app.settings.nos_enabled = true;
         self.app.settings.save();
         match daozai::nos_server::start(&cfg) {

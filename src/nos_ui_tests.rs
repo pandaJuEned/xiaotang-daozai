@@ -255,3 +255,52 @@ fn nos_meal_calendar_preview(){
         raster.free_textures(&out.textures_delta);
     }
 }
+
+#[test]
+fn nos_connection_inputs_keep_typed_text_across_frames() {
+    use super::{ENV_LOCK, H};
+    use eframe::egui;
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+    let mut h=H::new();
+    h.app.settings.nos_server_enabled=false;
+    h.app.settings.nos_base_url.clear();
+    let _=crate::nos::secrets::delete();
+
+    fn draw(h:&mut H,events:Vec<egui::Event>)->Vec<egui::epaint::ClippedShape> {
+        h.t+=1.0/60.0;
+        h.ctx.run(egui::RawInput{
+            screen_rect:Some(egui::Rect::from_min_size(egui::Pos2::ZERO,egui::vec2(690.0,900.0))),
+            time:Some(h.t),events,focused:true,..Default::default()
+        },|ctx|{egui::CentralPanel::default().show(ctx,|ui|h.app.nos_settings(ui));}).shapes
+    }
+    fn label_center(shapes:&[egui::epaint::ClippedShape],label:&str)->egui::Pos2 {
+        shapes.iter().find_map(|shape|match &shape.shape {
+            egui::Shape::Text(text) if text.galley.text()==label && shape.clip_rect.contains(text.visual_bounding_rect().center()) =>
+                Some(text.visual_bounding_rect().center()),
+            _=>None,
+        }).unwrap_or_else(||panic!("未找到标签：{label}"))
+    }
+    fn focus_field(h:&mut H,label:&str) {
+        let pos={let shapes=draw(h,vec![]);let center=label_center(&shapes,label);egui::pos2(center.x+100.0,center.y)};
+        draw(h,vec![egui::Event::PointerMoved(pos)]);
+        draw(h,vec![egui::Event::PointerButton{pos,button:egui::PointerButton::Primary,pressed:true,modifiers:Default::default()}]);
+        draw(h,vec![egui::Event::PointerButton{pos,button:egui::PointerButton::Primary,pressed:false,modifiers:Default::default()}]);
+    }
+
+    focus_field(&mut h,"服务器地址");
+    let url="http://192.168.1.10:8000";
+    draw(&mut h,vec![egui::Event::Text(url.into())]);
+    draw(&mut h,vec![]);
+    assert_eq!(h.app.nos_url_draft.as_deref(),Some(url),"地址应留在草稿里，而不是每帧从设置重建");
+
+    focus_field(&mut h,"访问令牌");
+    let token="long-random-token";
+    draw(&mut h,vec![egui::Event::Text(token.into())]);
+    draw(&mut h,vec![]);
+    assert_eq!(h.app.nos_token_draft.as_deref(),Some(token),"令牌草稿同样要跨帧保留");
+
+    let shapes=draw(&mut h,vec![]);
+    let visible=|text:&str|shapes.iter().any(|shape|matches!(&shape.shape,egui::Shape::Text(t)if t.galley.text()==text));
+    assert!(visible(url),"地址输入后下一帧仍应可见");
+    assert!(visible(token),"令牌输入后下一帧仍应可见");
+}
