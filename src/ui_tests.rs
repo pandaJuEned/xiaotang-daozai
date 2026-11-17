@@ -2900,6 +2900,106 @@ fn quota_update_status_is_visible_for_every_provider_and_keeps_failed_data(){
 }
 
 #[test]
+fn workbuddy_limit_record_shows_on_the_card_and_prefills_the_editor(){
+    use crate::quota::{Event,Provider};
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+    let mut h=H::new();
+    let id=h.app.quota.config.connect_workbuddy("preview-limit".into(),"WorkBuddy".into());
+    h.app.quota_event(Event{id:id.clone(),result:crate::quota::parse(Provider::WorkBuddy,&serde_json::json!({"code":0,"data":{"Packages":[{"CycleRemainCapacity":"2000"}],"CreditGroups":[{"Kind":"plan_base","CycleRemainCapacity":"2000"}],"SubscriptionPackageName":"体验版"}}))});
+    h.app.quota.config.selected=id.clone();
+    h.app.show_page(6);
+    h.hover(H::local(300.0,60.0),1.0);
+    let texts=h.shapes.iter().filter_map(|s|if let egui::Shape::Text(t)=&s.shape{Some(t.galley.text())}else{None}).collect::<Vec<_>>();
+    assert!(texts.contains(&"记录限流"),"没记录时卡片上应有「记录限流」入口");
+    assert!(texts.iter().any(|t|t.contains("套餐")),"没记录时最后一行仍是积分构成");
+    // 点这个入口应该直接打开记录小窗（按卡片的局部坐标点按钮中心）。
+    h.click(H::local(309.5,96.0));
+    assert!(h.app.quota.limit_editor.is_some(),"点「记录限流」应打开记录小窗");
+    h.app.quota.limit_editor=None;h.app.settings_open=false;h.app.show_page(6);h.hover(H::local(300.0,60.0),0.3);
+
+    // 手动记一条二十分钟后恢复的限流。
+    let now=chrono::Local::now();
+    let reset_at=(now+chrono::Duration::minutes(20)).timestamp();
+    h.app.quota.limits.upsert(crate::quota_limit::Limit{account:id.clone(),alias:"WorkBuddy".into(),model:"Hy4 flash".into(),reset_at,created_at:now.timestamp(),notified:false});
+    h.hover(H::local(300.0,60.0),0.5);
+    let texts=h.shapes.iter().filter_map(|s|if let egui::Shape::Text(t)=&s.shape{Some(t.galley.text())}else{None}).collect::<Vec<_>>();
+    assert!(texts.iter().any(|t|t.contains("Hy4 flash 限流中")),"卡片应说明哪个模型在限流：{texts:?}");
+    assert!(texts.iter().any(|t|t.contains("恢复")&&t.contains("分钟")),"卡片应显示还有多久恢复：{texts:?}");
+    assert!(texts.contains(&"改时间"),"已有记录时按钮应变成「改时间」");
+
+    if let Some(dest)=std::env::var_os("DAOZAI_WB_LIMIT_PREVIEW_DIR"){
+        let dest=std::path::PathBuf::from(dest);std::fs::create_dir_all(&dest).unwrap();let mut raster=feature_raster();
+        shoot_feature(&mut h,&mut raster,&dest,"workbuddy-limit",90,Some(H::local(300.0,60.0)),"2026-11-17");
+    }
+
+    // 打开小窗：模型沿用这条记录，时刻回填成能直接改的完整写法。
+    h.app.quota_open_limit_editor(&id);
+    let draft=h.app.quota.limit_editor.clone().expect("应打开记录小窗");
+    assert_eq!(draft.model,"Hy4 flash");
+    assert!(draft.when.contains('-')&&draft.when.contains(':'),"回填完整时刻：{}",draft.when);
+    assert_eq!(crate::quota_limit::parse_reset(&draft.when,now).unwrap(),reset_at,"回填的时刻要能原样解析回去");
+
+    // 到点前轮询不提醒；到点后只提醒一次，并且半小时后退场。
+    assert!(h.app.quota.limits.poll(now.timestamp()).0.is_empty(),"没到点不该提醒");
+    let (due,_)=h.app.quota.limits.poll(reset_at+1);
+    assert_eq!(due.len(),1);
+    assert!(h.app.quota.limits.poll(reset_at+1).0.is_empty(),"同一条只在到点时响一次");
+}
+
+#[test]
+fn workbuddy_limit_row_appears_in_settings(){
+    use crate::quota::{Event,Provider};
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+    let mut h=H::new();h.app.settings_open=true;
+    let id=h.app.quota.config.connect_workbuddy("preview-limit".into(),"WorkBuddy".into());
+    h.app.quota_event(Event{id:id.clone(),result:crate::quota::parse(Provider::WorkBuddy,&serde_json::json!({"code":0,"data":{"Packages":[{"CycleRemainCapacity":"2000"}],"CreditGroups":[{"Kind":"plan_base","CycleRemainCapacity":"2000"}],"SubscriptionPackageName":"体验版"}}))});
+    let now=chrono::Local::now();
+    h.app.quota.limits.upsert(crate::quota_limit::Limit{account:id.clone(),alias:"WorkBuddy".into(),model:"Hy4 flash".into(),reset_at:(now+chrono::Duration::minutes(20)).timestamp(),created_at:now.timestamp(),notified:false});
+    let mut raster=crate::preview_raster::Raster::new(760,560);
+    for _ in 0..3{
+        let out=h.ctx.run(egui::RawInput{screen_rect:Some(Rect::from_min_size(Pos2::ZERO,egui::vec2(760.0,560.0))),..Default::default()},|ctx|{
+            egui::CentralPanel::default().show(ctx,|ui|h.app.quota_settings(ui));
+        });
+        raster.update_textures(&out.textures_delta);h.shapes=out.shapes;
+    }
+    let texts=h.shapes.iter().filter_map(|s|if let egui::Shape::Text(t)=&s.shape{Some(t.galley.text())}else{None}).collect::<Vec<_>>();
+    assert!(texts.contains(&"修改限流记录"),"已有记录时设置页按钮应变成「修改限流记录」：{texts:?}");
+    assert!(texts.iter().any(|t|t.contains("Hy4 flash 限流中")&&t.contains("恢复")),"设置页应显示这条记录：{texts:?}");
+    assert!(texts.contains(&"清除"),"设置页要能清除记录");
+    if let Some(dest)=std::env::var_os("DAOZAI_WB_LIMIT_PREVIEW_DIR"){
+        let dest=std::path::PathBuf::from(dest);std::fs::create_dir_all(&dest).unwrap();
+        raster.buf.fill([0.08,0.09,0.12,1.0]);raster.draw(&h.ctx.tessellate(h.shapes.clone(),1.0),1.0);let mut rgba=Vec::new();raster.to_rgba8(&mut rgba);
+        image::save_buffer(dest.join("workbuddy-limit-settings.png"),&rgba,760,560,image::ColorType::Rgba8).unwrap();
+    }
+}
+
+#[test]
+fn workbuddy_limit_window_shows_the_resolved_moment(){
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+    let mut h=H::new();
+    h.app.quota.limit_editor=Some(crate::quota_limit::Draft::new("acc","WorkBuddy","Hy4 flash","23:43:31"));
+    let mut raster=crate::preview_raster::Raster::new(700,460);
+    for _ in 0..3{
+        let out=h.ctx.run(egui::RawInput{screen_rect:Some(Rect::from_min_size(Pos2::ZERO,egui::vec2(700.0,460.0))),..Default::default()},|ctx|{
+            egui::CentralPanel::default().frame(egui::Frame::NONE).show(ctx,|_ui|h.app.quota_limit_window(ctx));
+        });
+        raster.update_textures(&out.textures_delta);h.shapes=out.shapes;
+    }
+    let texts=h.shapes.iter().filter_map(|s|if let egui::Shape::Text(t)=&s.shape{Some(t.galley.text())}else{None}).collect::<Vec<_>>();
+    assert!(texts.contains(&"记录额度限流"),"小窗标题：{texts:?}");
+    assert!(texts.iter().any(|t|t.contains("到点提醒你恢复正常")),"应写明这个小窗的用途");
+    assert!(texts.contains(&"Hy4 flash"),"模型名应回填：{texts:?}");
+    // 填进来的时刻当场折算成完整时间，避免「今天/明天」的歧义。
+    assert!(texts.iter().any(|t|t.contains("恢复 · 还有")||t.contains("恢复 · 已到时间")),"应给出折算结果：{texts:?}");
+    if let Some(dest)=std::env::var_os("DAOZAI_WB_LIMIT_PREVIEW_DIR"){
+        let dest=std::path::PathBuf::from(dest);std::fs::create_dir_all(&dest).unwrap();
+        raster.buf.fill([0.08,0.09,0.12,1.0]);raster.draw(&h.ctx.tessellate(h.shapes.clone(),1.0),1.0);let mut rgba=Vec::new();raster.to_rgba8(&mut rgba);
+        image::save_buffer(dest.join("workbuddy-limit-window.png"),&rgba,700,460,image::ColorType::Rgba8).unwrap();
+    }
+    assert!(h.app.quota.limit_editor.is_some(),"窗口开着时草稿要留着");
+}
+
+#[test]
 fn quota_page_navigation_tracks_the_taller_panel(){
     let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());let mut h=H::new();h.quota_accounts(1);
     h.app.show_page(6);h.hover(H::local(300.0,60.0),0.8);

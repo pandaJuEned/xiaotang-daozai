@@ -23,6 +23,9 @@ pub(crate) struct State {
     /// 上次看到的「窗口重置时刻 + 剩余百分比」，键是 `账号|窗口`。
     /// 用来判断某个额度窗口是不是刚刚翻页（重置后提醒一次）。
     pub reset_seen:HashMap<String,(i64,f32)>,
+    /// 手动记下的「限流到点」记录；额度接口查不到限频时刻，只能靠用户看到提示时记一笔。
+    pub limits:crate::quota_limit::Limits,
+    pub limit_editor:Option<crate::quota_limit::Draft>,
     pub gemini_connecting:Option<quota::gemini::Connect>,pub gemini_email:String,pub gemini_cookie:String,
     pub doubao_connecting:Option<quota::doubao::Connect>,pub doubao_cookie:String,
 }
@@ -305,6 +308,10 @@ fn quota_reset_text(snapshot:&Snapshot,window:&quota::Window,now:&chrono::DateTi
     }
     reset_text(window.reset,now)
 }
+/// 卡片上那句话的开头：「Hy4 flash 限流中」；没填模型就只写「限流中」。
+fn limit_title(limit:&crate::quota_limit::Limit)->String{
+    if limit.model.is_empty(){"限流中".into()}else{format!("{} 限流中",limit.model)}
+}
 fn claude_disclaimer(ui:&mut egui::Ui){
     ui.separator();
     ui.label(egui::RichText::new("免责声明").size(12.0).strong());
@@ -405,7 +412,7 @@ impl App {
         self.quota.note.clear();self.quota.kiro_connecting=Some(quota::kiro::Connect::start(path,self.quota.alias.clone(),target));
     }
     pub fn quota_config(&self)->&Config{&self.quota.config}
-    pub fn quota_initialize(&mut self){if !crate::model::config_dir().join("ai-quota.json").exists(){self.quota.config.discover();self.quota.config.save();}}
+    pub fn quota_initialize(&mut self){if !crate::model::config_dir().join("ai-quota.json").exists(){self.quota.config.discover();self.quota.config.save();}self.quota.limits=crate::quota_limit::Limits::load();}
     pub fn quota_pending(&mut self,accounts:&[Account]){self.quota.busy.extend(accounts.iter().map(|a|a.id.clone()));}
     pub fn quota_event(&mut self,event:quota::Event){
         let id=event.id.clone();
@@ -539,12 +546,26 @@ impl App {
             }
         }
         if a.provider==Provider::WorkBuddy{
+            let now=chrono::Local::now().timestamp();
+            // 限频时刻只有 WorkBuddy 自己的提示里有，接口查不到，所以这里是「用户手动记下的那条」。
+            let active=self.quota.limits.active(&a.id,now).cloned();
             logo(c,a.provider,85.0,105.0,44.0);
             if let Some(credits)=snapshot.and_then(|s|s.credits.as_ref()){
                 c.text(125.0,81.0,"可用积分",10.5,W::Regular,theme::GRAY,H::Left);
                 c.text(125.0,107.0,&credits.full(),23.0,W::Semibold,theme::WHITE,H::Left);
-                let detail=if let Some(reason)=self.quota.stale.get(&a.id){reason.clone()}else{credits.packages_text()};c.text(125.0,131.0,&c.fit(&detail,10.0,W::Regular,225.0),10.0,W::Regular,theme::GRAY,H::Left);
+                let detail=if let Some(reason)=self.quota.stale.get(&a.id){reason.clone()}else{credits.packages_text()};
+                // 记了限流就把这一行让给它：这一刻用户更想知道「几点能再用」。
+                let(line,color)=match &active{
+                    Some(limit)=>(format!("{} · {} 恢复 · {}",limit_title(limit),crate::quota_limit::when_text(limit.reset_at),crate::quota_limit::remaining_text(limit.reset_at,now)),Color32::from_rgb(255,166,77)),
+                    None=>(detail,theme::GRAY),
+                };
+                c.text(125.0,131.0,&c.fit(&line,10.0,W::Regular,225.0),10.0,W::Regular,color,H::Left);
             }else{let text=result.and_then(|r|r.as_ref().err()).map(String::as_str).unwrap_or("正在查询积分…");for(i,line)in c.wrap(text,11.0,W::Regular,226.0,3).iter().enumerate(){c.text(125.0,92.0+i as f32*17.0,line,11.0,W::Regular,theme::GRAY,H::Left);}}
+            let(r,b)=crate::paint::capsule(c,262.0,86.0,95.0,20.0,&format!("quota-limit-{}",a.id),theme::BTN,theme::BTN_HOVER);
+            b.text(309.5,100.0,if active.is_some(){"改时间"}else{"记录限流"},9.5,W::Regular,theme::GRAY,H::Center);
+            if r.on_hover_text("遇到「免费额度超出频率限制」时记一笔，到点提醒你恢复").clicked(){
+                let id=a.id.clone();self.quota_open_limit_editor(&id);
+            }
             return;
         }
         if a.provider==Provider::DeepSeek{
@@ -672,6 +693,70 @@ impl App {
         self.quota.config.accounts.retain(|a|a.id!=id);self.quota.config.colors.remove(id);self.quota.rows.remove(id);self.quota.stale.remove(id);self.quota.busy.remove(id);self.quota.save_snapshots();
         if self.quota.config.selected==id{self.quota.config.selected=self.quota.config.accounts.first().map(|a|a.id.clone()).unwrap_or_default();}
     }
+    /// 打开「记录限流」小窗：账号名、上次用过的模型、剪贴板里那段时间先替用户填好。
+    pub(crate) fn quota_open_limit_editor(&mut self,id:&str){
+        let Some(account)=self.quota.config.accounts.iter().find(|a|a.id==id) else{return;};
+        let alias=account.alias.clone();
+        let now=chrono::Local::now();
+        let existing=self.quota.limits.active(id,now.timestamp()).cloned();
+        // 上次给这个账号记过的模型名，多半还是同一个。
+        let model=existing.as_ref().map(|l|l.model.clone()).unwrap_or_else(||self.quota.limits.items.iter().rev().find(|l|l.account==id).map(|l|l.model.clone()).unwrap_or_default());
+        // 优先沿用已有记录；否则去剪贴板里捞——看到提示顺手复制一下就能自动填上。
+        let when=match existing{
+            Some(limit)=>crate::quota_limit::full_text(limit.reset_at),
+            None=>self.clipboard.lock().items.first().and_then(|clip|crate::quota_limit::find_when(&clip.text,now)).unwrap_or_default(),
+        };
+        self.quota.limit_editor=Some(crate::quota_limit::Draft::new(id,&alias,&model,&when));
+        if !self.settings_open{self.settings_tab=11;self.open_settings();}
+    }
+    /// 「记录额度限流」原生小窗：跟着设置窗口出现，关掉设置就一起消失。
+    pub(crate) fn quota_limit_window(&mut self,ctx:&egui::Context){
+        let Some(mut draft)=self.quota.limit_editor.take() else{return;};
+        let dim=crate::settings_theme::color(ctx,Color32::from_gray(160),Color32::from_gray(105));
+        let now=chrono::Local::now();
+        let mut open=true;let mut save=false;let mut close=false;let mut clear=false;
+        egui::Window::new("记录额度限流")
+            .id(egui::Id::new("quota-limit-window"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER,egui::Vec2::ZERO)
+            .open(&mut open)
+            .show(ctx,|ui|{
+                ui.set_min_width(320.0);
+                ui.label(egui::RichText::new(format!("{} · 到点提醒你恢复正常",draft.alias)).size(13.0).strong());
+                ui.add_space(8.0);
+                ui.label(egui::RichText::new("模型（可留空）").size(11.5).color(dim));
+                ui.add_sized([ui.available_width(),26.0],egui::TextEdit::singleline(&mut draft.model).vertical_align(egui::Align::Center).hint_text("例如 Hy4 flash"));
+                ui.add_space(8.0);
+                ui.label(egui::RichText::new("恢复时刻").size(11.5).color(dim));
+                let edit=ui.add_sized([ui.available_width(),28.0],egui::TextEdit::singleline(&mut draft.when).vertical_align(egui::Align::Center).hint_text("23:43:31，或 2026-11-17 23:43:31"));
+                if !draft.focused{edit.request_focus();draft.focused=true;}
+                ui.add_space(6.0);
+                match crate::quota_limit::parse_reset(&draft.when,now){
+                    Ok(reset_at)if reset_at<now.timestamp()-60=>{ui.label(egui::RichText::new("这个时刻已经过了，确认一下日期").size(11.5).color(Color32::from_rgb(228,92,82)));},
+                    Ok(reset_at)=>{
+                        let left=crate::quota_limit::remaining_text(reset_at,now.timestamp());
+                        ui.label(egui::RichText::new(format!("{} 恢复 · {} · 只提醒一次",crate::quota_limit::full_text(reset_at),left)).size(11.0).color(dim));
+                    },
+                    Err(_)if draft.when.trim().is_empty()=>{ui.label(egui::RichText::new("只填时刻按今天算，今天过了就顺延到明天").size(11.0).color(dim));},
+                    Err(error)=>{ui.label(egui::RichText::new(error).size(11.5).color(Color32::from_rgb(228,92,82)));},
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui|{
+                    if ui.button("清除记录").clicked(){clear=true;}
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center),|ui|{
+                        if ui.button("保存").clicked(){save=true;}
+                        if ui.button("取消").clicked(){close=true;}
+                    });
+                });
+            });
+        if save{
+            // 时间写得不对时不关窗：上面那行红字已经说明原因，用户接着改就行。
+            if let Ok(limit)=draft.build(now){self.quota.limits.upsert(limit);self.quota.limits.save();close=true;self.say("记下了，到点叫你");}
+        }
+        if clear{self.quota.limits.clear(&draft.account);self.quota.limits.save();close=true;self.say("已清除限流记录");}
+        if close||!open{self.quota.limit_editor=None;}else{self.quota.limit_editor=Some(draft);}
+    }
     pub(crate) fn quota_settings(&mut self,ui:&mut egui::Ui){
         let before=self.quota.config.clone();
         settings_card(ui,|ui|{
@@ -687,7 +772,7 @@ impl App {
             if ui.button("识别本机账号").clicked(){self.quota.note=self.quota.config.discover().message();}
             if ui.add_enabled(self.quota.busy.is_empty(),egui::Button::new("刷新额度")).clicked(){self.pending.push(Cmd::QuotaRefresh);}
         });ui.add_space(8.0);
-        let accounts=self.quota.config.accounts.clone();let mut remove=None;let mut connect=None;let mut reorder=None;
+        let accounts=self.quota.config.accounts.clone();let mut remove=None;let mut connect=None;let mut reorder=None;let mut limit_edit=None;let mut limit_clear=None;
         for mut a in accounts{
             let fill=crate::settings_theme::color(ui.ctx(),Color32::from_rgb(35,35,38),Color32::WHITE);
             let row=egui::Frame::new().fill(fill).corner_radius(10).inner_margin(egui::Margin::symmetric(16,12)).show(ui,|ui|{
@@ -739,6 +824,19 @@ impl App {
                         if ui.button("重新连接").clicked(){connect=Some(a.id.clone());}
                         if let Some(s)=snapshot{let time=chrono::DateTime::from_timestamp(s.at,0).map(|at|at.with_timezone(&chrono::Local).format(if a.provider==Provider::Claude{"%m-%d %H:%M 本地记录"}else{"%H:%M 更新"}).to_string()).unwrap_or_default();ui.label(egui::RichText::new(time).size(10.0).color(ui.visuals().weak_text_color()));}
                     });
+                    // 限流到点提醒：限频时刻只在服务端提示里出现过，接口查不到，只能看到就记一笔。
+                    {
+                        let now=chrono::Local::now().timestamp();
+                        let active=self.quota.limits.active(&a.id,now).cloned();
+                        ui.horizontal_wrapped(|ui|{
+                            let label=if active.is_some(){"修改限流记录"}else{"记录限流"};
+                            if ui.button(label).on_hover_text("遇到「免费额度超出频率限制」时记下恢复时刻，到点提醒你恢复正常").clicked(){limit_edit=Some(a.id.clone());}
+                            if let Some(limit)=&active{
+                                ui.label(egui::RichText::new(format!("{} · {} 恢复 · {}",limit_title(limit),crate::quota_limit::when_text(limit.reset_at),crate::quota_limit::remaining_text(limit.reset_at,now))).size(11.0).color(crate::settings_theme::color(ui.ctx(),Color32::from_rgb(231,175,108),Color32::from_rgb(151,94,28))));
+                                if ui.small_button("清除").clicked(){limit_clear=Some(a.id.clone());}
+                            }
+                        });
+                    }
                     if !a.provider.balance(){
                         let mut color=self.quota.config.colors.get(&a.id).copied().unwrap_or_default();color_picker(ui,a.provider,&mut color);
                         if color==Accent::Brand{self.quota.config.colors.remove(&a.id);}else{self.quota.config.colors.insert(a.id.clone(),color);}
@@ -761,6 +859,8 @@ impl App {
         if let Some((from,to))=reorder{self.quota.config.move_account(&from,&to);}
         if let Some(id)=remove{self.quota_remove_account(&id);}
         if let Some(id)=connect{self.quota_open_connection(Some(id));}
+        if let Some(id)=limit_clear{if self.quota.limits.clear(&id){self.quota.limits.save();}}
+        if let Some(id)=limit_edit{self.quota_open_limit_editor(&id);}
         if !self.quota.connect_open&&!self.quota.note.is_empty(){ui.add_space(8.0);ui.label(egui::RichText::new(&self.quota.note).size(12.0).color(ui.visuals().weak_text_color()));}
         self.quota_connect_window(ui.ctx());
         if before!=self.quota.config{self.quota.config.save();}

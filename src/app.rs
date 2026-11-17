@@ -3100,6 +3100,13 @@ impl App {
         let todo_on=self.module_on(TODO_PAGE);
         let due: Vec<_> = self.todos.items.iter().enumerate().filter(|(_, item)| todo_on && item.reminder_due(&now)).map(|(i,item)| (i,item.text.clone())).collect();
         for (i,text) in due { self.todos.items[i].mark_reminded(&now); self.todos.save(); self.alert("待办到时间了", text, 4, true); }
+        // 手动记下的「限流到点」：到点叫一次，半小时后记录自己退场。
+        let (due_limits,changed)=self.quota.limits.poll(chrono::Local::now().timestamp());
+        for limit in &due_limits{
+            let model=if limit.model.is_empty(){String::new()}else{format!(" · {}",limit.model)};
+            self.alert("额度限流已到时间",format!("{}{} · 现在可以正常使用了",limit.alias,model),6,true);
+        }
+        if changed{self.quota.limits.save();}
         // v0.5.5 会议提醒：.ics 里的开始时间，默认提前 15 分钟（可设 5/15/30）。
         // v0.5.6 起日历（CalDAV）事件走同一套：同一场会（UID + DTSTART）只提醒一次，
         // 邮件和日历两条来源撞上了也只弹一次。
