@@ -857,6 +857,10 @@ pub struct App {
     pub nos_server_status: crate::nos_server::Status,
     /// 本地服务的操作结果；设置页直接显示，避免只弹气泡让用户以为没反应。
     pub nos_server_note: Option<String>,
+    /// 课表设置页「连接」输入框的草稿。egui 输入框必须跨帧持有同一个可变缓冲；
+    /// 每帧从设置/凭据管理器重建会让刚输入的文字立刻消失。
+    pub(crate) nos_url_draft: Option<String>,
+    pub(crate) nos_token_draft: Option<String>,
     pub(crate) quota: crate::quota_ui::State,
     /// 天气页的当前数据与后台拉取状态。
     pub(crate) weather: crate::weather::State,
@@ -992,6 +996,8 @@ impl App {
             nos_error: None,
             nos_server_status: crate::nos_server::Status::default(),
             nos_server_note: None,
+            nos_url_draft: None,
+            nos_token_draft: None,
             quota: crate::quota_ui::State::load(),
             weather,
             updates: Default::default(),
@@ -1227,6 +1233,11 @@ impl App {
     pub fn calendar_configs_match(&self, known: &[calendar::Config]) -> bool {
         if self.calendar.feeds.is_empty() {known==self.calendar.config.as_slice()}
         else {known.len()==self.calendar.feeds.len() && known.iter().zip(&self.calendar.feeds).all(|(known,feed)|*known==feed.config)}
+    }
+
+    /// 本地服务自动改写了课表地址后调用：设置页下次绘制时重新载入地址草稿。
+    pub fn reset_nos_url_draft(&mut self) {
+        self.nos_url_draft = None;
     }
 
     /// 课表配置：地址来自设置，令牌来自 Windows 凭据管理器。

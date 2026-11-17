@@ -100,32 +100,34 @@ impl App {
         });
 
         // ------------------------------------------------ 连接信息
-        // 地址存设置文件，令牌只进凭据管理器。
-        let mut url = self.settings.nos_base_url.clone();
-        let mut token = String::new();
-        let mut token_known = false;
-        let _ = crate::nos::secrets::load().map(|value| {
-            token_known = true;
-            token = value;
-        });
+        // 地址存设置文件，令牌只进凭据管理器。输入框缓冲必须留在 App 上跨帧复用，
+        // 每帧从设置/凭据管理器重建会让刚输入的字符下一帧立刻消失。
+        if self.nos_url_draft.is_none() {
+            self.nos_url_draft = Some(self.settings.nos_base_url.clone());
+        }
+        if self.nos_token_draft.is_none() {
+            self.nos_token_draft = Some(crate::nos::secrets::load().unwrap_or_default());
+        }
+        let token_known = crate::nos::secrets::load().is_ok();
+        let server_enabled = self.settings.nos_server_enabled;
 
         settings_label(ui, "连接");
         settings_card(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(RichText::new("服务器地址").size(13.0));
-                ui.text_edit_singleline(&mut url);
+                ui.text_edit_singleline(self.nos_url_draft.as_mut().expect("地址草稿已初始化"));
             });
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 ui.label(RichText::new("访问令牌").size(13.0));
-                ui.text_edit_singleline(&mut token);
-                if token_known && token.is_empty() {
+                ui.text_edit_singleline(self.nos_token_draft.as_mut().expect("令牌草稿已初始化"));
+                if token_known && self.nos_token_draft.as_deref().is_some_and(|value| value.is_empty()) {
                     ui.label(RichText::new("已保存（输入新值可替换）").size(11.5).color(egui::Color32::from_gray(150)));
                 }
             });
             ui.add_space(4.0);
             ui.small("令牌由服务端环境变量 NOS_API_TOKEN 提供；服务器未配置时接口一律拒绝访问。");
-            if self.settings.nos_server_enabled {
+            if server_enabled {
                 ui.small("本地服务模式：令牌留空时点「启动」会自动生成并保存，地址也会自动对齐；要指定令牌才点「保存令牌」。服务还没起来时「保存并测试连接」报连接失败是正常的。");
             } else {
                 ui.small("地址填到站点根即可，例如 http://192.168.1.10:8000 。");
@@ -133,6 +135,9 @@ impl App {
         });
 
         // 操作按钮：保存并测试 / 立即刷新 / 忘记令牌。
+        // 按钮读的是同一份草稿，避免「输入框显示 A、实际保存 B」。
+        let url = self.nos_url_draft.clone().unwrap_or_default();
+        let token = self.nos_token_draft.clone().unwrap_or_default();
         settings_card(ui, |ui| {
             ui.horizontal(|ui| {
                 // 本地服务还没启动时，「测试连接」必然失败；给一个只落盘令牌的入口，
@@ -143,25 +148,31 @@ impl App {
                         self.say("请先在「访问令牌」里填一个长随机串");
                     } else {
                         match crate::nos::secrets::save(&value) {
-                            Ok(())=>self.say("访问令牌已保存到 Windows 凭据管理器，可以启动本地服务了"),
+                            Ok(()) => {
+                                self.nos_token_draft = Some(value);
+                                self.say("访问令牌已保存到 Windows 凭据管理器，可以启动本地服务了");
+                            }
                             Err(error)=>self.say(format!("保存令牌失败：{error}")),
                         }
                     }
                 }
                 if ui.button("保存并测试连接").clicked() {
                     let token = token.trim().to_string();
+                    let url = url.trim().to_string();
+                    self.nos_url_draft = Some(url.clone());
+                    self.nos_token_draft = Some(token.clone());
                     if !token.is_empty() {
                         let _ = crate::nos::secrets::save(&token);
                     }
-                    if !self.settings.nos_server_enabled {
-                        self.settings.nos_base_url = url.trim().to_string();
+                    if !server_enabled {
+                        self.settings.nos_base_url = url.clone();
                     }
                     self.settings.nos_enabled = true;
                     self.settings.save();
-                    let target=if self.settings.nos_server_enabled {
+                    let target = if server_enabled {
                         self.nos_server_config().base_url()
                     } else {
-                        url.trim().to_string()
+                        url
                     };
                     pending.push(Cmd::NosTest(target, token));
                     pending.push(Cmd::NosReconfigure);
@@ -173,6 +184,7 @@ impl App {
                 }
                 if ui.button("忘记令牌").clicked() {
                     crate::nos::secrets::delete();
+                    self.nos_token_draft = Some(String::new());
                 }
             });
             ui.add_space(3.0);
