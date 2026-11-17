@@ -42,7 +42,8 @@ const BACKOFF_BASE: f64 = 120.0;
 pub struct Event {
     /// 稳定标识；同一条课在多次拉取间保持不变。
     pub uid: String,
-    /// `course`（课程）/ `meeting`（会议）/ `exam`（期末考试）/ `todo`（待办）。
+    /// `course`（课程）/ `meeting`（会议）/ `exam`（期末考试）/ `todo`（待办）/
+    /// `meal`（餐单）/ `workout`（运动预约）。
     pub kind: String,
     pub title: String,
     /// `YYYY-MM-DD`。

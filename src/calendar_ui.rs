@@ -41,6 +41,8 @@ fn occurs_on(event:&mail::Meeting,day:NaiveDate)->bool {
 
 /// 课表事件 → 统一事件模型。节次已由服务端展开成绝对时刻，这里只做类型转换。
 ///
+/// 餐单与运动预约走同一条链路：服务端已经算好日期与时刻（没有时刻的按全天），
+/// 本层不再区分 `kind`，避免为每种新事件各写一份转换。
 /// 全天事件没有时刻，`start` 取当天零点；结束时间缺失时不推测时长。
 pub(crate) fn nos_meeting(event:&crate::nos::Event)->Option<mail::Meeting> {
     let start=if event.all_day||event.start_time.is_empty(){
@@ -59,14 +61,14 @@ pub(crate) fn nos_meeting(event:&crate::nos::Event)->Option<mail::Meeting> {
 }
 
 #[derive(Clone,Copy,PartialEq,Eq)]
-pub(crate) enum Source<'a> { Calendar(Option<calendar::Provider>), Mail(&'a str), Local, /// 课表（NOS）。
+pub(crate) enum Source<'a> { Calendar(Option<calendar::Provider>), Mail(&'a str), Local, /// NOS：课表 / 餐单 / 运动预约。
     Nos }
 impl Source<'_> {
     fn icon_key(self)->&'static str {
         match self {Self::Calendar(Some(provider))=>provider.key(),Self::Calendar(None)=>"calendar",Self::Mail(_)=>"mail",Self::Local=>"local",Self::Nos=>"nos"}
     }
     fn label(self)->String {
-        match self {Self::Calendar(provider)=>provider.map(|p|p.label()).unwrap_or("工作日历").to_string(),Self::Mail(account)=>format!("邮件 · {account}"),Self::Local=>"本机日程".into(),Self::Nos=>"课表".into()}
+        match self {Self::Calendar(provider)=>provider.map(|p|p.label()).unwrap_or("工作日历").to_string(),Self::Mail(account)=>format!("邮件 · {account}"),Self::Local=>"本机日程".into(),Self::Nos=>"NOS".into()}
     }
     fn color(self)->Color32 {
         match self {

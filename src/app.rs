@@ -1253,7 +1253,8 @@ impl App {
 
     /// 收到一份课表：转成统一事件模型，供日程页与常驻栏使用。
     pub fn set_nos_agenda(&mut self, agenda: crate::nos::Agenda) {
-        // 课程 / 会议 / 考试才进日程；待办只进待办页，否则同一条会在岛上出现两遍。
+        // 课程 / 会议 / 考试 / 餐单 / 运动预约才进日程；待办只进待办页，
+        // 否则同一条会在岛上出现两遍。
         self.nos_events = agenda.events.iter().filter(|event| !event.is_todo())
             .filter_map(crate::calendar_ui::nos_meeting).collect();
         // NOS 待办 → 岛仔待办模型：只读展示，due 用「日期 + 时刻」，已完成的标记完成。

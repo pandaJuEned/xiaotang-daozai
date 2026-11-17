@@ -147,6 +147,41 @@ fn nos_remote_mode_keeps_the_manually_entered_server_address() {
 }
 
 #[test]
+fn nos_meals_and_workouts_join_the_calendar_without_taking_the_next_course_slot(){
+    use super::{ENV_LOCK,H};
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+    let mut h=H::new();
+    // 同样用「明天」：早餐 08:40 早于 09:00 的课，若餐单被当成课，下一节课就会算错。
+    let tomorrow=(chrono::Local::now().date_naive()+chrono::Duration::days(1)).format("%Y-%m-%d").to_string();
+    let event=|uid:&str,kind:&str,title:&str,start:&str,end:&str,all_day:bool|crate::nos::Event{
+        uid:uid.into(),kind:kind.into(),title:title.into(),date:tomorrow.clone(),
+        start_time:start.into(),end_time:end.into(),all_day,
+        location:"思源餐厅".into(),color:String::new(),teacher:String::new(),
+        course_id:String::new(),semester_id:"s1".into(),week:Some(11),status:String::new()};
+    let agenda=crate::nos::Agenda{
+        semesters:vec![],
+        events:vec![
+            event("meal-1","meal","早餐 · 水煮蛋、豆浆","08:40","",false),
+            event("meal-2","meal","加餐 · 苹果","","",true),
+            event("workout-1","workout","运动 · 羽毛球","16:30","18:30",false),
+            event("c1","course","信号与系统","09:00","09:40",false),
+        ],at:0};
+    h.app.set_nos_agenda(agenda);
+    assert_eq!(h.app.nos_events.len(),4,"餐单与运动预约也要进日程，全天餐食不例外");
+    let date=chrono::NaiveDate::parse_from_str(&tomorrow,"%Y-%m-%d").unwrap();
+    let titles:Vec<&str>=h.app.calendar_entries(date).iter()
+        .filter(|entry|entry.sources.contains(&crate::calendar_ui::Source::Nos))
+        .map(|entry|entry.event.title.as_str()).collect();
+    assert!(titles.contains(&"早餐 · 水煮蛋、豆浆"),"{titles:?}");
+    assert!(titles.contains(&"运动 · 羽毛球"),"{titles:?}");
+    assert!(titles.contains(&"加餐 · 苹果"),"没填时刻的餐食按全天事件进日程：{titles:?}");
+    let all_day=h.app.nos_events.iter().find(|event|event.title=="加餐 · 苹果").expect("全天餐食");
+    assert!(all_day.all_day,"没有时刻就不能编一个时刻出来");
+    assert_eq!(h.app.nos_next_course(chrono::Local::now().timestamp()).map(|e|e.title.as_str()),
+        Some("信号与系统"),"下一节课只能是课程，不能被早餐或运动预约抢走");
+}
+
+#[test]
 fn nos_meetings_enter_the_calendar_but_todos_stay_on_the_todo_page(){
     use super::{ENV_LOCK,H};
     let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
@@ -172,4 +207,51 @@ fn nos_meetings_enter_the_calendar_but_todos_stay_on_the_todo_page(){
         .map(|entry|entry.event.title.as_str()).collect();
     assert!(titles.contains(&"组会"),"NOS 会议应出现在日程页：{titles:?}");
     assert!(!titles.contains(&"写周报"),"NOS 待办不该在日程页重复出现：{titles:?}");
+}
+
+#[test]
+#[ignore="按需导出日程页里 NOS 餐单与运动预约的实际画面"]
+fn nos_meal_calendar_preview(){
+    use super::{ENV_LOCK,H};
+    use eframe::egui;
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+    let dest=std::path::PathBuf::from(std::env::var_os("DAOZAI_NOS_PREVIEW_DIR").expect("需指定预览目录"));
+    std::fs::create_dir_all(&dest).unwrap();
+    let mut h=H::new();
+    let day=chrono::NaiveDate::from_ymd_opt(2026,11,17).unwrap();
+    h.app.calendar.view.day=day;
+    h.app.calendar.view.month=crate::calendar::month_start(day);
+    h.app.open_calendar(None);
+    h.app.calendar.view.loaded=Some(crate::calendar::month_start(day));
+    // 导出时展开「已结束」：白天的餐食到晚上都算结束，不展开只能看到「+ 已结束 N」。
+    h.app.calendar.view.show_ended=true;
+    let event=|uid:&str,kind:&str,title:&str,start:&str,end:&str,all_day:bool|crate::nos::Event{
+        uid:uid.into(),kind:kind.into(),title:title.into(),date:"2026-11-17".into(),
+        start_time:start.into(),end_time:end.into(),all_day,
+        location:"思源餐厅".into(),color:String::new(),teacher:String::new(),
+        course_id:String::new(),semester_id:"s1".into(),week:Some(11),status:String::new()};
+    h.app.set_nos_agenda(crate::nos::Agenda{semesters:vec![],events:vec![
+        event("meal-b","meal","早餐 · 水煮蛋、豆浆、菜包","08:40","",false),
+        event("meal-l","meal","午餐 · 丰廷餐厅","11:30","",false),
+        event("w1","workout","运动 · 羽毛球","16:30","18:30",false),
+        event("meal-d","meal","晚餐 · 竞丰餐厅","18:25","",false),
+        event("c1","course","微纳器件","19:10","21:45",false),
+    ],at:0});
+    let mut raster=crate::preview_raster::Raster::new(1280,600);
+    for f in 0..90 {
+        let t=f as f64/60.0;
+        let raw=egui::RawInput{screen_rect:Some(egui::Rect::from_min_size(egui::Pos2::ZERO,egui::vec2(super::WIN_W,super::WIN_H))),time:Some(t),
+            viewports:std::iter::once((egui::ViewportId::ROOT,egui::ViewportInfo{native_pixels_per_point:Some(2.0),..Default::default()})).collect(),..Default::default()};
+        let env=super::Env{t,today:"2026-11-17".into(),date:"11月17日 周二".into(),clock:"20:50:00".into(),battery:Some(76),charging:false,..Default::default()};
+        let out=h.ctx.run(raw,|ctx|{egui::CentralPanel::default().frame(egui::Frame::NONE).show(ctx,|ui|{let win=ui.max_rect();h.app.frame(ui,win,&env);});});
+        raster.update_textures(&out.textures_delta);
+        if f==89 {
+            raster.buf.fill([0.035,0.055,0.09,1.0]);
+            raster.draw(&h.ctx.tessellate(out.shapes,out.pixels_per_point),out.pixels_per_point);
+            let mut rgba=Vec::new();raster.to_rgba8(&mut rgba);
+            let image=image::RgbaImage::from_raw(1280,600,rgba).unwrap();
+            image::imageops::crop_imm(&image,180,0,920,510).to_image().save(dest.join("calendar-nos-meals.png")).unwrap();
+        }
+        raster.free_textures(&out.textures_delta);
+    }
 }
