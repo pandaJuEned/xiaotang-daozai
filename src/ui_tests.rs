@@ -8550,18 +8550,18 @@ fn resident_toggles_independently_control_quota_and_ongoing_calendar_slot() {
 }
 #[test]
 fn hardware_status_components_line_up_with_the_resident_bar_and_preview(){
-    use crate::bar_layout::{CPU_INFO,DISK_INFO,GPU_INFO,MEMORY_INFO,STATUS_TAIL_ORDER};
+    use crate::bar_layout::{CPU_INFO,DISK_INFO,GPU_INFO,MEMORY_INFO,STATUS_TAIL_ORDER,TEMPERATURE};
     let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
-    let monitor=crate::monitor::MonitorSnapshot{cpu_percent:Some(42.0),gpu_percent:Some(31.0),mem_used_bytes:68,mem_total_bytes:100,disk_percent:Some(55.0),..Default::default()};
+    let monitor=crate::monitor::MonitorSnapshot{cpu_percent:Some(42.0),gpu_percent:Some(31.0),mem_used_bytes:68,mem_total_bytes:100,disk_percent:Some(55.0),temperature_c:Some(71.0),..Default::default()};
     let mut h=H::new();
     h.app.settings.show_cpu=true;h.app.settings.show_gpu=true;h.app.settings.show_memory=true;h.app.settings.show_disk=true;h.app.settings.save();
     let loaded=crate::model::Settings::load();
-    assert!(loaded.show_cpu&&loaded.show_gpu&&loaded.show_memory&&loaded.show_disk,"四个状态组件开关应各自落盘");
+    assert!(loaded.show_cpu&&loaded.show_gpu&&loaded.show_memory&&loaded.show_disk&&loaded.show_temperature,"状态组件开关应各自落盘");
     h.monitor=Some(monitor);
     h.frame(vec![]);
-    let tail=STATUS_TAIL_ORDER.iter().filter(|&&slot|matches!(slot,CPU_INFO|GPU_INFO|MEMORY_INFO|DISK_INFO)).map(|&slot|h.app.resident.current().x[slot].expect("硬件状态槽应就位")).collect::<Vec<_>>();
+    let tail=STATUS_TAIL_ORDER.iter().filter(|&&slot|matches!(slot,CPU_INFO|GPU_INFO|MEMORY_INFO|DISK_INFO|TEMPERATURE)).map(|&slot|h.app.resident.current().x[slot].expect("硬件状态槽应就位")).collect::<Vec<_>>();
     assert!(tail.windows(2).all(|pair|pair[0]<pair[1]),"常驻栏末尾顺序应与设置列表一致：{tail:?}");
-    for label in ["CPU 42%","GPU 31%","内存 68%","硬盘 55%"] {
+    for label in ["CPU 42%","GPU 31%","内存 68%","硬盘 55%","71°C"] {
         assert!(h.shapes.iter().any(|s|matches!(&s.shape,egui::Shape::Text(t)if t.galley.text()==label)),"常驻栏应显示 {label}");
     }
     // 页面管理里的常驻排列预览也使用同一组开关与文案。
@@ -8570,9 +8570,18 @@ fn hardware_status_components_line_up_with_the_resident_bar_and_preview(){
     preview.app.monitor_last=Some(monitor);
     let raw=egui::RawInput{screen_rect:Some(Rect::from_min_size(Pos2::ZERO,Vec2::new(600.0,300.0))),time:Some(1.0),..Default::default()};
     let out=preview.ctx.run(raw,|ctx|{egui::CentralPanel::default().show(ctx,|ui|preview.app.resident_order_settings(ui));});
-    for label in ["CPU 42%","GPU 31%","内存 68%","硬盘 55%"] {
+    for label in ["CPU 42%","GPU 31%","内存 68%","硬盘 55%","71°C"] {
         assert!(out.shapes.iter().any(|s|matches!(&s.shape,egui::Shape::Text(t)if t.galley.text()==label)),"常驻排列预览应显示 {label}");
     }
+}
+#[test]
+fn system_monitor_page_shows_machine_temperature(){
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+    let mut h=H::new();
+    h.monitor=Some(crate::monitor::MonitorSnapshot{cpu_percent:Some(42.0),temperature_c:Some(71.0),..Default::default()});
+    h.app.show_page(crate::app::MONITOR_PAGE);
+    for _ in 0..60 {h.frame(vec![]);}
+    assert!(h.shapes.iter().any(|s|matches!(&s.shape,egui::Shape::Text(t)if t.galley.text().contains("71°C"))),"系统监控页应显示机身温度");
 }
 #[test]
 fn resident_bar_shows_the_refill_time_only_when_quota_is_low(){

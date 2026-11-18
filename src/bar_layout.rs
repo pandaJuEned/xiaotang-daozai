@@ -27,6 +27,8 @@ pub(crate) const CPU_INFO: usize = 13;
 pub(crate) const GPU_INFO: usize = 14;
 pub(crate) const MEMORY_INFO: usize = 15;
 pub(crate) const DISK_INFO: usize = 16;
+/// 机身温度槽：显示 ACPI 热区读数（如 71°C），同样固定排在末尾。
+pub(crate) const TEMPERATURE: usize = 17;
 /// 天气徽标的基础槽宽；温度文字更长时由 `widen` 补足。
 pub(crate) const WEATHER_WIDTH: f32 = 38.0;
 /// 网速用简洁格式绘制（↓1.2M ↑300K），固定宽度足够，不撑宽岛体。
@@ -40,10 +42,12 @@ pub(crate) const CPU_INFO_WIDTH: f32 = 52.0;
 pub(crate) const GPU_INFO_WIDTH: f32 = 52.0;
 pub(crate) const MEMORY_INFO_WIDTH: f32 = 60.0;
 pub(crate) const DISK_INFO_WIDTH: f32 = 60.0;
-const WIDTHS: [f32; 17] = [44.0,20.0,27.0,27.0,27.0,WEATHER_WIDTH,14.0,crate::focus_bar::WIDTH,20.0,32.0,NETSPEED_WIDTH,COURSE_WIDTH,CALENDAR_WIDTH,CPU_INFO_WIDTH,GPU_INFO_WIDTH,MEMORY_INFO_WIDTH,DISK_INFO_WIDTH];
+/// 温度槽显示「71°C」，固定宽度避免读数变化牵动布局。
+pub(crate) const TEMPERATURE_WIDTH: f32 = 52.0;
+const WIDTHS: [f32; 18] = [44.0,20.0,27.0,27.0,27.0,WEATHER_WIDTH,14.0,crate::focus_bar::WIDTH,20.0,32.0,NETSPEED_WIDTH,COURSE_WIDTH,CALENDAR_WIDTH,CPU_INFO_WIDTH,GPU_INFO_WIDTH,MEMORY_INFO_WIDTH,DISK_INFO_WIDTH,TEMPERATURE_WIDTH];
 
 /// 状态组件中固定排在末尾的槽位，顺序与设置页列表保持一致。
-pub(crate) const STATUS_TAIL_ORDER: [usize; 7] = [NETSPEED,COURSE,CALENDAR,CPU_INFO,GPU_INFO,MEMORY_INFO,DISK_INFO];
+pub(crate) const STATUS_TAIL_ORDER: [usize; 8] = [NETSPEED,COURSE,CALENDAR,CPU_INFO,GPU_INFO,MEMORY_INFO,DISK_INFO,TEMPERATURE];
 
 /// 由设置开关换算出的末尾状态槽；单独成组，避免继续给 `Layout` 追加位置参数。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -55,6 +59,7 @@ pub(crate) struct StatusSlots {
     pub gpu: bool,
     pub memory: bool,
     pub disk: bool,
+    pub temperature: bool,
 }
 impl StatusSlots {
     pub(crate) fn on(self, slot: usize) -> bool {
@@ -66,6 +71,7 @@ impl StatusSlots {
             GPU_INFO => self.gpu,
             MEMORY_INFO => self.memory,
             DISK_INFO => self.disk,
+            TEMPERATURE => self.temperature,
             _ => false,
         }
     }
@@ -280,7 +286,7 @@ mod tests {
         }
         let all = Layout::with_status_slots(
             true, 3, true, true, false, true, false,
-            StatusSlots { net: true, course: true, calendar: true, cpu: true, gpu: true, memory: true, disk: true },
+            StatusSlots { net: true, course: true, calendar: true, cpu: true, gpu: true, memory: true, disk: true, temperature: true },
         );
         for slot in STATUS_TAIL_ORDER {
             assert!(all.x[slot].is_some(), "启用后状态槽须就位：{slot}");

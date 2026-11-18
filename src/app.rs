@@ -2855,7 +2855,7 @@ impl App {
                 let Some(x)=layout.x[slot] else {continue;};
                 let text=self.resident_status_text(slot,env.monitor.as_ref(),now,false);
                 if text.is_empty(){continue;}
-                let size=if matches!(slot,bar::CPU_INFO|bar::GPU_INFO|bar::MEMORY_INFO|bar::DISK_INFO){11.0}else{12.0};
+                let size=if matches!(slot,bar::CPU_INFO|bar::GPU_INFO|bar::MEMORY_INFO|bar::DISK_INFO|bar::TEMPERATURE){11.0}else{12.0};
                 base.faded(compact_alpha).text(local_cx+x,21.0,&text,size,W::Bold,theme::WHITE,H::Center);
             }
         }

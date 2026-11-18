@@ -1382,6 +1382,8 @@ impl App {
                             setting_row(ui,"内存信息","收起时显示实时内存占用率；无监控数据时自动隐藏",&mut self.settings.show_memory);
                             ui.separator();
                             setting_row(ui,"硬盘信息","收起时显示实时硬盘占用率；无监控数据时自动隐藏",&mut self.settings.show_disk);
+                            ui.separator();
+                            setting_row(ui,"机身温度","收起时显示 ACPI 热区温度；无热区读数时自动隐藏",&mut self.settings.show_temperature);
                         });
                         settings_label(ui,"功能页面");
                         settings_card(ui,|ui|{

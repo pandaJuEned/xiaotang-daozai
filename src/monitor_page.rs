@@ -149,13 +149,15 @@ impl App {
             .map(|v| format!(" · {:.2} GHz", v as f32 / 1000.0))
             .unwrap_or_default();
         c.text(LEFT, 90.0, &format!("{state}{freq}"), 9.5, W::Semibold, theme::GRAY, H::Left);
-        // 与机器名同一行放温度；机器名过长时自动收缩，避免挤进右侧指标格。
+        // 温度单独 emphasized，机器名过长时收缩，避免挤进右侧指标格。
         let temperature = m
             .temperature_c
             .map(|v| format!("{v:.0}°C"))
             .unwrap_or_else(|| "温度 --".into());
-        let machine = c.fit(&crate::monitor::machine_name(), 8.5, W::Regular, 88.0);
-        c.text(LEFT, 104.0, &format!("{temperature} · {machine}"), 8.5, W::Regular, theme::DIM, H::Left);
+        let color = m.temperature_c.map(load_color).unwrap_or(theme::DIM);
+        let tw = c.text(LEFT, 104.0, &temperature, 10.5, W::Bold, color, H::Left);
+        let machine = c.fit(&crate::monitor::machine_name(), 8.5, W::Regular, 72.0);
+        c.text(LEFT + tw + 6.0, 104.0, &machine, 8.5, W::Regular, theme::DIM, H::Left);
 
         /* ---------- 右侧 2×2 指标格 ---------- */
         let mem_sub = format!(

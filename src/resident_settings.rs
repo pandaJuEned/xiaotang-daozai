@@ -17,6 +17,7 @@ fn status_enabled(settings:&crate::model::Settings,slot:usize)->bool {
         GPU_INFO=>settings.show_gpu,
         MEMORY_INFO=>settings.show_memory,
         DISK_INFO=>settings.show_disk,
+        TEMPERATURE=>settings.show_temperature,
         _=>false,
     }
 }
@@ -40,10 +41,11 @@ impl crate::app::App {
             GPU_INFO=>monitor.is_some_and(|m|m.gpu_percent.is_some()),
             MEMORY_INFO=>monitor.is_some_and(|m|m.mem_percent().is_some()),
             DISK_INFO=>monitor.is_some_and(|m|m.disk_percent.is_some()),
+            TEMPERATURE=>monitor.is_some_and(|m|m.temperature_c.is_some()),
             _=>false,
         };
         let enabled=|slot:usize|status_enabled(&self.settings,slot)&&(placeholder||available(slot));
-        StatusSlots {net:enabled(NETSPEED),course:enabled(COURSE),calendar:enabled(CALENDAR),cpu:enabled(CPU_INFO),gpu:enabled(GPU_INFO),memory:enabled(MEMORY_INFO),disk:enabled(DISK_INFO)}
+        StatusSlots {net:enabled(NETSPEED),course:enabled(COURSE),calendar:enabled(CALENDAR),cpu:enabled(CPU_INFO),gpu:enabled(GPU_INFO),memory:enabled(MEMORY_INFO),disk:enabled(DISK_INFO),temperature:enabled(TEMPERATURE)}
     }
 
     /// 末尾状态组件的紧凑文案；`placeholder=true` 时即使没有数据也给出占位文字。
@@ -75,6 +77,11 @@ impl crate::app::App {
             GPU_INFO=>{let value=percent_label(monitor.and_then(|m|m.gpu_percent),placeholder);if value.is_empty(){value}else{format!("GPU {value}")}},
             MEMORY_INFO=>{let value=percent_label(monitor.and_then(|m|m.mem_percent()),placeholder);if value.is_empty(){value}else{format!("内存 {value}")}},
             DISK_INFO=>{let value=percent_label(monitor.and_then(|m|m.disk_percent),placeholder);if value.is_empty(){value}else{format!("硬盘 {value}")}},
+            TEMPERATURE=>match monitor.and_then(|m|m.temperature_c) {
+                Some(value)=>format!("{value:.0}°C"),
+                None if placeholder=>"--°C".into(),
+                None=>String::new(),
+            },
             _=>String::new(),
         }
     }
@@ -88,6 +95,7 @@ impl crate::app::App {
             GPU_INFO=>monitor.is_some_and(|m|m.gpu_percent.is_some()),
             MEMORY_INFO=>monitor.is_some_and(|m|m.mem_percent().is_some()),
             DISK_INFO=>monitor.is_some_and(|m|m.disk_percent.is_some()),
+            TEMPERATURE=>monitor.is_some_and(|m|m.temperature_c.is_some()),
             _=>false,
         }
     }
@@ -179,7 +187,7 @@ impl crate::app::App {
             response.on_hover_text(label(slot));
         }
         // 末尾状态槽与设置页「状态组件」一一对应，按列表顺序展示；无数据时用灰色占位。
-        let tail_label=|slot|match slot{NETSPEED=>"网速",COURSE=>"下一节课",CALENDAR=>"进行中日程",CPU_INFO=>"CPU 信息",GPU_INFO=>"GPU 信息",MEMORY_INFO=>"内存信息",DISK_INFO=>"硬盘信息",_=>"状态组件"};
+        let tail_label=|slot|match slot{NETSPEED=>"网速",COURSE=>"下一节课",CALENDAR=>"进行中日程",CPU_INFO=>"CPU 信息",GPU_INFO=>"GPU 信息",MEMORY_INFO=>"内存信息",DISK_INFO=>"硬盘信息",TEMPERATURE=>"机身温度",_=>"状态组件"};
         for &slot in STATUS_TAIL_ORDER.iter() {
             let Some(x)=layout.x[slot] else {continue;};
             let width=layout.widths[slot];
@@ -187,7 +195,7 @@ impl crate::app::App {
             let active=self.resident_status_data_available(slot,self.monitor_last.as_ref(),now);
             let c=card.faded(if active{1.0}else{0.38}).ghost();
             let text=self.resident_status_text(slot,self.monitor_last.as_ref(),now,true);
-            let size=if matches!(slot,CPU_INFO|GPU_INFO|MEMORY_INFO|DISK_INFO){11.0}else{12.0};
+            let size=if matches!(slot,CPU_INFO|GPU_INFO|MEMORY_INFO|DISK_INFO|TEMPERATURE){11.0}else{12.0};
             c.text(cx+x,21.0,&text,size,W::Bold,theme::WHITE,H::Center);
             ui.interact(rect,ui.id().with(("resident-status",slot)),egui::Sense::hover()).on_hover_text(tail_label(slot));
         }

@@ -118,6 +118,7 @@ impl Shell {
             // 页面被关掉、又没开常驻栏网速与监控窗口时停采样，符合「关闭的功能不在后台运行」。
             let wanted = self.app.module_on(app::MONITOR_PAGE)
                 || self.app.settings.show_net_speed
+                || self.app.settings.show_temperature
                 || self.app.monitor_open;
             let on=self.app.monitor_cfg.enabled && wanted && !daozai::resources::GUARD.tripped();
             if on!=self.monitor.is_some() {
