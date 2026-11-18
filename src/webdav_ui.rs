@@ -242,7 +242,7 @@ impl App {
         let user = cfg.user.clone();
         let probe = base.clone();
         self.webdav.spawn(move |tx| {
-            let result = webdav::list(&probe, &user, &password).map(|entries| entries.len());
+            let result = webdav::list(&probe, &user, &password).map(|(_, entries)| entries.len());
             let _ = tx.send(Msg::Tested(result));
             paint.request_repaint();
         });
@@ -263,7 +263,7 @@ impl App {
         self.webdav.error = None;
         let paint = ctx.clone();
         self.webdav.spawn(move |tx| {
-            let result = webdav::list(&target, &user, &password).map(|entries| (target, entries));
+            let result = webdav::list(&target, &user, &password);
             let _ = tx.send(Msg::Listed(result));
             paint.request_repaint();
         });

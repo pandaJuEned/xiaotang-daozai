@@ -95,7 +95,11 @@ pub fn delete_password(cfg: &Config) {
 
 /* ---------------- 地址 ---------------- */
 
-/// 补全 scheme、去掉尾部斜杠。只接受 http/https。
+/// 补全 scheme，并把路径规范成「集合」形式：末尾一定带斜杠。
+///
+/// 尾斜杠不是装饰：Apache 的 mod_dav 遇到 `/music` 会 301 跳到 `/music/`，
+/// 而跳转会丢掉 Authorization（见 `send`），于是连接被误报成密码错误；
+/// 相对 href（`b.mp3`）也只有按 `/music/` 解析才会落到同一目录。
 pub fn normalize_base(raw: &str) -> Option<String> {
     let raw = raw.trim();
     if raw.is_empty() {
@@ -110,11 +114,12 @@ pub fn normalize_base(raw: &str) -> Option<String> {
     if !url.username().is_empty() || url.password().is_some() {
         return None;
     }
-    let path = url.path().trim_end_matches('/').to_string();
-    url.set_path(if path.is_empty() { "/" } else { &path });
+    let path = url.path().to_string();
+    let path = if path.ends_with('/') { path } else { format!("{path}/") };
+    url.set_path(&path);
     url.set_query(None);
     url.set_fragment(None);
-    Some(url.to_string().trim_end_matches('/').to_string())
+    Some(url.to_string())
 }
 
 /// 明文 http 只允许访问本机回环地址。
@@ -263,7 +268,8 @@ fn agent() -> ureq::Agent {
         .timeout_read(std::time::Duration::from_secs(25))
         .timeout_write(std::time::Duration::from_secs(25))
         .timeout(std::time::Duration::from_secs(40))
-        .redirects(4)
+        // 自己跟随跳转：ureq 的默认实现会把 301 改成 GET 并丢掉 Authorization。
+        .redirects(0)
         .user_agent(concat!("Daozai/", env!("CARGO_PKG_VERSION")))
         .build()
 }
@@ -279,35 +285,117 @@ fn auth(user: &str, password: &str) -> String {
 const PROPFIND_BODY: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 <d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/><d:getcontentlength/><d:displayname/></d:prop></d:propfind>"#;
 
-/// 列出一个集合下的直接子项。`collection` 必须是绝对地址。
-pub fn list(collection: &str, user: &str, password: &str) -> Result<Vec<Entry>, String> {
-    let parsed = url::Url::parse(collection).map_err(|_| "目录地址无效".to_string())?;
-    if !transport_ok(&parsed) {
-        return Err("只支持 https 地址（本机可用 http）".into());
-    }
-    let response = agent()
-        .request("PROPFIND", collection)
-        .set("Authorization", &auth(user, password))
-        .set("Depth", "1")
-        .set("Content-Type", "application/xml; charset=utf-8")
-        .send_string(PROPFIND_BODY);
-    match response {
-        Ok(response) => {
-            let status = response.status();
-            if status >= 300 {
-                return Err(format!("服务器返回 {status}"));
-            }
-            let xml = response.into_string().map_err(|e| format!("读取目录失败：{e}"))?;
-            Ok(parse_entries(&xml, collection))
+/// 一次请求最多跟几跳。
+const MAX_REDIRECTS: usize = 3;
+
+/// 请求失败的三类来源：状态码、网络错误、被拒绝的跳转。
+#[derive(Debug)]
+enum Failure {
+    Status(u16),
+    Network(String),
+    Redirect(String),
+}
+
+impl Failure {
+    fn for_list(self) -> String {
+        match self {
+            Failure::Status(401) => "用户名或密码不正确（401）".to_string(),
+            Failure::Status(403) => "该账号没有读取权限（403）".to_string(),
+            Failure::Status(404) => "目录不存在，请检查地址与路径".to_string(),
+            Failure::Status(405) => "该地址不支持 WebDAV（服务器未开启 PROPFIND）".to_string(),
+            Failure::Status(code) => format!("服务器返回 {code}"),
+            Failure::Network(error) => error,
+            Failure::Redirect(reason) => reason,
         }
-        Err(ureq::Error::Status(code, _)) => Err(match code {
-            401 | 403 => "用户名或密码不正确，或该账号没有读取权限".to_string(),
-            404 => "目录不存在，请检查地址与路径".to_string(),
-            405 => "该地址不支持 WebDAV（服务器未开启 PROPFIND）".to_string(),
-            _ => format!("服务器返回 {code}"),
-        }),
-        Err(error) => Err(format!("连接失败：{error}")),
     }
+
+    fn for_download(self) -> String {
+        match self {
+            Failure::Status(401) => "用户名或密码不正确（401）".to_string(),
+            Failure::Status(403) => "没有下载权限".to_string(),
+            Failure::Status(404) => "文件已不存在".to_string(),
+            Failure::Status(code) => format!("服务器返回 {code}"),
+            Failure::Network(error) => error,
+            Failure::Redirect(reason) => reason,
+        }
+    }
+}
+
+/// 手动跟随跳转，保持方法与凭据。
+///
+/// ureq 自带的跟随在这里是错的：301 会把 PROPFIND 变成 GET，且默认丢掉
+/// Authorization。服务器把 `/music` 跳到 `/music/` 时，第二次请求就成了匿名
+/// GET，返回 401 —— 界面上看着像密码错了，实际是跳转把凭据弄丢了。
+/// 这里只跟同源、且不会降级成明文 http 的跳转，其余直接报错说明原因。
+fn send(
+    method: &str,
+    url: &str,
+    body: Option<&str>,
+    user: &str,
+    password: &str,
+) -> Result<(ureq::Response, String), Failure> {
+    let mut current = url.to_string();
+    for _ in 0..=MAX_REDIRECTS {
+        let parsed = url::Url::parse(&current).map_err(|_| Failure::Redirect("地址无效".to_string()))?;
+        if !transport_ok(&parsed) {
+            return Err(Failure::Redirect("只支持 https 地址（本机可用 http）".to_string()));
+        }
+        let mut request = agent().request(method, &current).set("Authorization", &auth(user, password));
+        if body.is_some() {
+            request = request.set("Depth", "1").set("Content-Type", "application/xml; charset=utf-8");
+        }
+        let result = match body {
+            Some(body) => request.send_string(body),
+            None => request.call(),
+        };
+        match result {
+            Ok(response) => {
+                if !(300..400).contains(&response.status()) {
+                    return Ok((response, current));
+                }
+                // 3xx 但没有 Location：交给调用方按状态码报错。
+                let Some(location) = response.header("location") else {
+                    return Ok((response, current));
+                };
+                current = next_hop(&current, location)?;
+            }
+            Err(ureq::Error::Status(code, _)) => return Err(Failure::Status(code)),
+            Err(error) => return Err(Failure::Network(format!("连接失败：{error}"))),
+        }
+    }
+    Err(Failure::Redirect("重定向次数过多，请检查服务器地址".to_string()))
+}
+
+/// 校验下一跳：必须是同源、且仍然是 https（或本机回环）。
+fn next_hop(current: &str, location: &str) -> Result<String, Failure> {
+    let base = url::Url::parse(current).map_err(|_| Failure::Redirect("地址无效".to_string()))?;
+    let mut target = base
+        .join(location)
+        .map_err(|_| Failure::Redirect(format!("服务器给出的跳转地址无效：{location}")))?;
+    target.set_fragment(None);
+    if !transport_ok(&target) {
+        return Err(Failure::Redirect(
+            "服务器要求跳转到 http 地址，已拒绝（凭据会明文传输）".to_string(),
+        ));
+    }
+    if !same_origin(current, target.as_str()) {
+        return Err(Failure::Redirect("服务器跳转到了其他站点，已拒绝".to_string()));
+    }
+    Ok(target.to_string())
+}
+
+/// 列出一个集合下的直接子项，返回实际生效的集合地址（跟过跳转后可能补上尾斜杠）。
+/// `collection` 必须是绝对地址。
+pub fn list(collection: &str, user: &str, password: &str) -> Result<(String, Vec<Entry>), String> {
+    let (response, collection) = send("PROPFIND", collection, Some(PROPFIND_BODY), user, password)
+        .map_err(Failure::for_list)?;
+    let status = response.status();
+    if status >= 300 {
+        return Err(format!("服务器返回 {status}，但没有给出跳转地址"));
+    }
+    let xml = response.into_string().map_err(|e| format!("读取目录失败：{e}"))?;
+    let entries = parse_entries(&xml, &collection);
+    Ok((collection, entries))
 }
 
 /// 下载到 `dest`，边下边回报进度（0..1，拿不到总长度时一直是 0）。
@@ -326,16 +414,7 @@ pub fn download(
     if !same_origin(base, url) {
         return Err("文件地址与服务器不同源，已拒绝下载".into());
     }
-    let response = agent()
-        .request("GET", url)
-        .set("Authorization", &auth(user, password))
-        .call()
-        .map_err(|error| match error {
-            ureq::Error::Status(401 | 403, _) => "没有下载权限".to_string(),
-            ureq::Error::Status(404, _) => "文件已不存在".to_string(),
-            ureq::Error::Status(code, _) => format!("服务器返回 {code}"),
-            other => format!("下载失败：{other}"),
-        })?;
+    let (response, _) = send("GET", url, None, user, password).map_err(Failure::for_download)?;
     let total: u64 = response
         .header("Content-Length")
         .and_then(|value| value.parse().ok())
@@ -375,8 +454,14 @@ mod tests {
 
     #[test]
     fn base_url_is_normalized_and_credentials_are_rejected() {
-        assert_eq!(normalize_base("nas.local/music/"), Some("https://nas.local/music".into()));
-        assert_eq!(normalize_base(" http://127.0.0.1:5005/dav "), Some("http://127.0.0.1:5005/dav".into()));
+        // 集合地址一律带尾斜杠：少了会被服务器 301 到带斜杠的地址，跳转会丢凭据。
+        assert_eq!(normalize_base("nas.local/music/"), Some("https://nas.local/music/".into()));
+        assert_eq!(normalize_base("nas.local/music"), Some("https://nas.local/music/".into()));
+        assert_eq!(normalize_base(" https://nas.local "), Some("https://nas.local/".into()));
+        assert_eq!(
+            normalize_base(" http://127.0.0.1:5005/dav "),
+            Some("http://127.0.0.1:5005/dav/".into())
+        );
         // 带账号密码的地址直接拒收，避免凭据留在配置文件里。
         assert_eq!(normalize_base("https://user:pw@nas.local/music"), None);
         assert_eq!(normalize_base("ftp://nas.local"), None);
@@ -384,10 +469,28 @@ mod tests {
     }
 
     #[test]
+    fn redirects_stay_on_the_same_https_origin() {
+        // 服务器补尾斜杠：跟。
+        assert_eq!(
+            next_hop("https://nas.local/music", "/music/").unwrap(),
+            "https://nas.local/music/"
+        );
+        assert_eq!(
+            next_hop("https://nas.local/music/", "sub/").unwrap(),
+            "https://nas.local/music/sub/"
+        );
+        // 反代写错成明文 http：拒绝，别把 Basic 凭据送出去。
+        let downgrade = next_hop("https://nas.local/music", "http://nas.local/music/").unwrap_err();
+        assert!(matches!(downgrade, Failure::Redirect(reason) if reason.contains("http")));
+        // 跨站跳转也拒绝。
+        assert!(next_hop("https://nas.local/music", "https://evil.example/music/").is_err());
+    }
+
+    #[test]
     fn plain_http_is_only_allowed_on_loopback() {
-        assert!(resolve("https://nas.local/music", "https://nas.local/music/a.mp3").is_some());
-        assert!(resolve("http://127.0.0.1:5005/dav", "/dav/a.mp3").is_some());
-        assert!(resolve("http://192.168.1.9/dav", "/dav/a.mp3").is_none(), "明文 http 不能走局域网");
+        assert!(resolve("https://nas.local/music/", "https://nas.local/music/a.mp3").is_some());
+        assert!(resolve("http://127.0.0.1:5005/dav/", "/dav/a.mp3").is_some());
+        assert!(resolve("http://192.168.1.9/dav/", "/dav/a.mp3").is_none(), "明文 http 不能走局域网");
     }
 
     #[test]
