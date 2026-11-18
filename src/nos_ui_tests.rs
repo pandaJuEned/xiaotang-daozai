@@ -210,6 +210,41 @@ fn nos_meetings_enter_the_calendar_but_todos_stay_on_the_todo_page(){
 }
 
 #[test]
+fn nos_breaks_join_the_calendar_in_grey_without_taking_the_featured_slot(){
+    use super::{ENV_LOCK,H};
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+    let mut h=H::new();
+    // 用「今天 + 固定时刻」：日期跟着本机走，判断课间是否进行中时把 now 传进去，
+    // 不受跑测试的时刻影响（跨零点也不会翻车）。
+    let today=chrono::Local::now().date_naive().format("%Y-%m-%d").to_string();
+    let event=|uid:&str,kind:&str,title:&str,start:&str,end:&str|crate::nos::Event{
+        uid:uid.into(),kind:kind.into(),title:title.into(),date:today.clone(),
+        start_time:start.into(),end_time:end.into(),all_day:false,
+        location:String::new(),color:String::new(),teacher:String::new(),
+        course_id:String::new(),semester_id:"s1".into(),week:Some(11),status:String::new()};
+    let agenda=crate::nos::Agenda{
+        semesters:vec![],
+        events:vec![
+            event("br1","break","课间休息","09:55","10:05"),
+            event("c1","course","信号与系统","11:00","11:40"),
+        ],at:0};
+    h.app.set_nos_agenda(agenda);
+    assert_eq!(h.app.nos_events.len(),1,"课间不能混进课程事件");
+    assert_eq!(h.app.nos_breaks.len(),1,"课间单独存一份，便于标灰");
+    let date=chrono::NaiveDate::parse_from_str(&today,"%Y-%m-%d").unwrap();
+    let entries=h.app.calendar_entries(date);
+    let brk=entries.iter().find(|entry|entry.event.title=="课间休息").expect("课间要进日程页");
+    assert!(brk.sources.contains(&crate::calendar_ui::Source::NosBreak),"课间要有独立来源（灰色）");
+    let now=crate::nos::wall_clock(&today,"10:00").expect("今天 10:00");
+    assert!(h.app.current_calendar_event(now).is_none(),"课间不算「进行中日程」");
+    assert_eq!(h.app.nos_current_break(now).map(|(left,_)|left),Some(5),"课间剩余 5 分钟");
+    let text=h.app.resident_status_text(crate::bar_layout::COURSE,None,now,false);
+    assert_eq!(text,"课间 5′","常驻栏课间显示倒计时：{text}");
+    assert_eq!(h.app.resident_status_text(crate::bar_layout::COURSE,None,now+600,false),"11:00 信号与系统",
+        "课间结束后回到「下一节课」");
+}
+
+#[test]
 #[ignore="按需导出日程页里 NOS 餐单与运动预约的实际画面"]
 fn nos_meal_calendar_preview(){
     use super::{ENV_LOCK,H};

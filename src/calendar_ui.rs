@@ -62,13 +62,14 @@ pub(crate) fn nos_meeting(event:&crate::nos::Event)->Option<mail::Meeting> {
 
 #[derive(Clone,Copy,PartialEq,Eq)]
 pub(crate) enum Source<'a> { Calendar(Option<calendar::Provider>), Mail(&'a str), Local, /// NOS：课表 / 餐单 / 运动预约。
-    Nos }
+    Nos, /// NOS 的课间休息：入日程但不抢主卡片，图标与标题都压成灰色。
+    NosBreak }
 impl Source<'_> {
     fn icon_key(self)->&'static str {
-        match self {Self::Calendar(Some(provider))=>provider.key(),Self::Calendar(None)=>"calendar",Self::Mail(_)=>"mail",Self::Local=>"local",Self::Nos=>"nos"}
+        match self {Self::Calendar(Some(provider))=>provider.key(),Self::Calendar(None)=>"calendar",Self::Mail(_)=>"mail",Self::Local=>"local",Self::Nos|Self::NosBreak=>"nos"}
     }
     fn label(self)->String {
-        match self {Self::Calendar(provider)=>provider.map(|p|p.label()).unwrap_or("工作日历").to_string(),Self::Mail(account)=>format!("邮件 · {account}"),Self::Local=>"本机日程".into(),Self::Nos=>"NOS".into()}
+        match self {Self::Calendar(provider)=>provider.map(|p|p.label()).unwrap_or("工作日历").to_string(),Self::Mail(account)=>format!("邮件 · {account}"),Self::Local=>"本机日程".into(),Self::Nos=>"NOS".into(),Self::NosBreak=>"NOS · 课间".into()}
     }
     fn color(self)->Color32 {
         match self {
@@ -79,6 +80,7 @@ impl Source<'_> {
             Self::Mail(_)=>Color32::from_rgb(199,168,255),
             Self::Local=>Color32::from_rgb(105,208,157),
             Self::Nos=>Color32::from_rgb(236,168,88),
+            Self::NosBreak=>Color32::from_rgb(138,138,146),
         }
     }
 }
@@ -108,9 +110,11 @@ fn calendar_now(env:&Env)->i64{
 }
 
 fn featured_index(events:&[Entry<'_>],focus:Option<&str>,now:i64)->Option<usize> {
-    let eligible=|event:&mail::Meeting|!event.all_day && !has_ended(event,now);
-    events.iter().position(|entry|eligible(entry.event) && focus==Some(entry_key(entry.event).as_str()))
-        .or_else(||events.iter().enumerate().filter(|(_,entry)|eligible(entry.event)).min_by_key(|(_,entry)|(entry.event.start>now,entry.event.start)).map(|(i,_)|i))
+    // 课间休息只作为列表条目：让它占主卡片，下午的长空档会把下一节课挤到小字里。
+    let eligible=|entry:&Entry<'_>|!entry.event.all_day && !has_ended(entry.event,now)
+        && !entry.sources.iter().any(|source|matches!(source,Source::NosBreak));
+    events.iter().position(|entry|eligible(entry) && focus==Some(entry_key(entry.event).as_str()))
+        .or_else(||events.iter().enumerate().filter(|(_,entry)|eligible(entry)).min_by_key(|(_,entry)|(entry.event.start>now,entry.event.start)).map(|(i,_)|i))
 }
 
 fn event_status(event:&mail::Meeting,now:i64,today:NaiveDate)->String {
@@ -274,9 +278,10 @@ impl App {
         let mut events:Vec<Entry<'_>>=vec![];
         let mut seen=std::collections::HashMap::<String,usize>::new();
         let local=self.calendar.local.iter().map(|entry|(&entry.event,Source::Local));
-        // 课表（NOS）：与服务端返回的课表事件合并进同一份日程。
+        // 课表（NOS）：与服务端返回的课表事件合并进同一份日程；课间休息单独来源（灰）。
         let nos=self.nos_events.iter().map(|event|(event,Source::Nos));
-        for (event,source) in work.chain(mail).chain(local).chain(nos).filter(|(event,_)|occurs_on(event,day)) {
+        let breaks=self.nos_breaks.iter().map(|event|(event,Source::NosBreak));
+        for (event,source) in work.chain(mail).chain(local).chain(nos).chain(breaks).filter(|(event,_)|occurs_on(event,day)) {
             let key=entry_key(event);
             if let Some(&index)=seen.get(&key) {
                 let entry=&mut events[index];
@@ -320,7 +325,8 @@ impl App {
         let grid=calendar::month_grid(self.calendar.view.month);
         let mut dots:std::collections::HashMap<NaiveDate,Vec<Source<'_>>>=std::collections::HashMap::new();
         let local=self.calendar.local.iter().map(|entry|(&entry.event,Source::Local));
-        // 课表（NOS）也要在月历上打点，与其它来源一致。
+        // 课表（NOS）也要在月历上打点，与其它来源一致。课间休息不打点：
+        // 它由课程推导、每个上课日都有，打上去只会把真正的事件挤成灰点。
         let nos=self.nos_events.iter().map(|event|(event,Source::Nos));
         for (event,source) in work.chain(mail).chain(local).chain(nos) {
             let Some((start,last))=event_days(event) else{continue;};
@@ -413,8 +419,10 @@ impl App {
             }
             let can_ignore=entry.sources.iter().any(|source|matches!(source,Source::Mail(_)));
             let is_local=entry.sources.contains(&Source::Local);
+            let is_break=entry.sources.iter().any(|source|matches!(source,Source::NosBreak));
             let title_right=if can_ignore || is_local{352.0}else{371.0};
-            c.centered_text(x+2.0,cy,&c.fit(&event.title,size,W::Semibold,title_right-x-2.0),size,W::Semibold,if has_ended(event,now){muted}else{theme::WHITE},H::Left);
+            let title_color=if is_break{muted}else if has_ended(event,now){muted}else{theme::WHITE};
+            c.centered_text(x+2.0,cy,&c.fit(&event.title,size,W::Semibold,title_right-x-2.0),size,W::Semibold,title_color,H::Left);
             if is_local {
                 c.centered_text(365.0,cy,"编辑",7.5,W::Regular,accent,H::Center);
                 if c.hit(354.0,cy-8.0,23.0,16.0,("calendar-edit-local",event.uid.as_str())).clicked(){edit_local=Some(event.uid.clone());}

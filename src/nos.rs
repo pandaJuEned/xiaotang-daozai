@@ -90,6 +90,11 @@ impl Event {
         self.kind == "todo"
     }
 
+    /// 是否是课间休息（`kind = "break"`，由 NOS 侧按相邻两节课的空档推导）。
+    pub fn is_break(&self) -> bool {
+        self.kind == "break"
+    }
+
     /// 待办是否已完成（`status` 非 `pending` 都算完成）。
     pub fn todo_done(&self) -> bool {
         !self.status.is_empty() && self.status != "pending"
@@ -174,6 +179,23 @@ impl Agenda {
                 _ => false,
             })
             .min_by_key(|e| e.start_time.clone())
+    }
+
+    /// 此刻正在进行的课间休息：返回「还剩几分钟」（向上取整）与那条事件。
+    ///
+    /// 课间只由 NOS 下发（`kind = "break"`），这里不自己算节次间隔 —— 与「下一节课」
+    /// 同一个原则：排课算法只有 NOS 一份。
+    pub fn current_break(&self, now: i64) -> Option<(i64, &Event)> {
+        self.events
+            .iter()
+            .filter(|e| e.is_break())
+            .filter_map(|e| match (e.start_at(), e.end_at()) {
+                (Some(start), Some(end)) if now >= start && now < end => {
+                    Some((((end - now) + 59) / 60, e))
+                }
+                _ => None,
+            })
+            .min_by_key(|(_, e)| e.start_time.clone())
     }
 }
 
@@ -697,6 +719,27 @@ mod tests {
         let current = agenda.current_course(start + 10).expect("课中应能识别当前课程");
         assert_eq!(current.title, "信号与系统");
         assert!(agenda.current_course(end + 10).is_none(), "课后不应还算在上课");
+    }
+
+    #[test]
+    fn current_break_reports_remaining_minutes_without_masquerading_as_a_course() {
+        let body = r#"{"events":[
+            {"uid":"nos-course-c-2026-11-17-1","kind":"course","title":"信号与系统","date":"2026-11-17","start_time":"08:00","end_time":"09:40"},
+            {"uid":"nos-break-2026-11-17-0940","kind":"break","title":"课间休息","date":"2026-11-17","start_time":"09:40","end_time":"09:50"},
+            {"uid":"nos-course-c-2026-11-17-3","kind":"course","title":"数字电路","date":"2026-11-17","start_time":"09:50","end_time":"10:35"}
+        ]}"#;
+        let agenda = parse(body, 0).unwrap();
+        let br = agenda.events.iter().find(|e| e.is_break()).expect("应解析出课间");
+        assert_eq!(br.title, "课间休息");
+        let start = br.start_at().unwrap();
+        let (left, event) = agenda.current_break(start + 60).expect("课间进行中");
+        assert_eq!(event.title, "课间休息");
+        assert_eq!(left, 9, "剩余 9 分钟应向上取整");
+        assert!(agenda.current_break(start - 1).is_none(), "上课时不算课间");
+        assert!(agenda.current_break(br.end_at().unwrap()).is_none(), "课间结束即不再进行");
+        // 课间不能被当成课程：下一节课仍是 09:50 的数字电路。
+        let next = agenda.next_course(start + 60).expect("应有下一节课");
+        assert_eq!(next.title, "数字电路");
     }
 
     #[test]

@@ -209,9 +209,9 @@ impl App {
         settings_card(ui, |ui| {
             setting_row(ui, "启用课表", "从「不止课表」读取课表并并入日程页", &mut self.settings.nos_enabled);
             ui.separator();
-            setting_row(ui, "常驻栏显示下一节课", "收起时在岛上显示下一节课的开始时刻与课名", &mut self.settings.show_course);
+            setting_row(ui, "常驻栏显示下一节课", "收起时显示下一节课的开始时刻与课名；课间改显示还剩几分钟", &mut self.settings.show_course);
             ui.add_space(3.0);
-            ui.small("常驻栏只显示「下一节课」；完整课表在日程页里与其它日历一起显示。");
+            ui.small("常驻栏平时显示「下一节课」，课间显示「课间 8′」；完整课表在日程页里与其它日历一起显示。");
         });
 
         // 今日课程一览：让用户在设置里就能确认拉到的数据对不对。

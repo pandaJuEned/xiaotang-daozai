@@ -845,6 +845,8 @@ pub struct App {
     pub(crate) calendar: CalendarState,
     /// 课表（NOS）事件，已转成统一事件模型；与其它来源一起进日程页。
     pub nos_events: Vec<mail::Meeting>,
+    /// 课间休息：同样进日程页，但单独存一份，便于来源标灰、且不占「进行中/主卡片」。
+    pub nos_breaks: Vec<mail::Meeting>,
     /// 课表原始数据；常驻栏的「下一节课」直接用它。
     pub nos_agenda: Option<crate::nos::Agenda>,
     /// NOS 待办：只读混排进待办页，不写回本机 todo.txt。
@@ -990,6 +992,7 @@ impl App {
             mail_lines_cache: Vec::new(),
             calendar: CalendarState::load(),
             nos_events: Vec::new(),
+            nos_breaks: Vec::new(),
             nos_agenda: None,
             nos_todos: Vec::new(),
             nos_semester: String::new(),
@@ -1266,7 +1269,10 @@ impl App {
     pub fn set_nos_agenda(&mut self, agenda: crate::nos::Agenda) {
         // 课程 / 会议 / 考试 / 餐单 / 运动预约才进日程；待办只进待办页，
         // 否则同一条会在岛上出现两遍。
-        self.nos_events = agenda.events.iter().filter(|event| !event.is_todo())
+        // 课间休息（kind=break）单独存：日程页仍要显示，但来源标灰、且不抢「进行中」与主卡片。
+        self.nos_events = agenda.events.iter().filter(|event| !event.is_todo() && !event.is_break())
+            .filter_map(crate::calendar_ui::nos_meeting).collect();
+        self.nos_breaks = agenda.events.iter().filter(|event| event.is_break())
             .filter_map(crate::calendar_ui::nos_meeting).collect();
         // NOS 待办 → 岛仔待办模型：只读展示，due 用「日期 + 时刻」，已完成的标记完成。
         self.nos_todos = agenda.events.iter().filter(|event|event.is_todo()).map(|event|{
@@ -1288,11 +1294,18 @@ impl App {
         self.nos_agenda.as_ref().and_then(|agenda|agenda.next_course(now))
     }
 
+    /// 此刻正在上的课间休息；返回值是「还剩几分钟」与对应事件。
+    pub fn nos_current_break(&self, now: i64) -> Option<(i64, &crate::nos::Event)> {
+        self.nos_agenda.as_ref().and_then(|agenda|agenda.current_break(now))
+    }
+
     /// 此刻正在进行的日程：日历 / 邮件 / 本机 / 课表四类来源混排后取第一个进行中的。
     /// 全天事件与没有结束时间的事件不算「进行中」，避免整天挂着。
+    /// 课间休息不算「进行中日程」——它是课表槽的事，否则下午的长空档会在岛上挂一整天。
     pub fn current_calendar_event(&self, now: i64) -> Option<mail::Meeting> {
         let today = chrono::Local::now().date_naive();
         self.calendar_entries(today).into_iter()
+            .filter(|entry|!entry.sources.iter().any(|source|matches!(source,crate::calendar_ui::Source::NosBreak)))
             .find(|entry|!entry.event.all_day && entry.event.start<=now && entry.event.end.is_some_and(|end|end>now))
             .map(|entry|entry.event.clone())
     }

@@ -138,7 +138,7 @@ impl Shell {
         let nos_on=self.app.settings.nos_enabled && nos_cfg.ready();
         if nos_on!=self.nos.is_some() {
             self.nos=if nos_on {Some(daozai::nos::Service::start(ctx.clone(),nos_cfg))} else {None};
-            if !nos_on {self.app.nos_error=None;self.app.nos_events.clear();self.app.nos_todos.clear();self.app.nos_agenda=None;}
+            if !nos_on {self.app.nos_error=None;self.app.nos_events.clear();self.app.nos_breaks.clear();self.app.nos_todos.clear();self.app.nos_agenda=None;}
         }
         let clipboard_on=self.app.clipboard_active();
         if clipboard_on!=self.clipboard_watch.is_some() {
@@ -737,7 +737,7 @@ impl eframe::App for Shell {
                         // 等价于 Cmd::NosReconfigure：下一帧用对齐后的本地地址重建拉取线程。
                         self.nos=None;
                         self.app.nos_error=None;
-                        self.app.nos_events.clear();
+                        self.app.nos_events.clear();self.app.nos_breaks.clear();
                         self.app.nos_todos.clear();
                         self.app.nos_agenda=None;
                     }
@@ -986,7 +986,7 @@ impl eframe::App for Shell {
                     // 配置已由设置页写盘；这里只让旧服务退出，下一帧 reconcile_modules 用新配置重建。
                     self.nos=None;
                     self.app.nos_error=None;
-                    self.app.nos_events.clear();
+                    self.app.nos_events.clear();self.app.nos_breaks.clear();
                     self.app.nos_todos.clear();
                     self.app.nos_agenda=None;
                 },
@@ -994,7 +994,7 @@ impl eframe::App for Shell {
                     // 立即重拉：重启服务并清掉旧数据。
                     self.nos=None;
                     self.app.nos_error=None;
-                    self.app.nos_events.clear();
+                    self.app.nos_events.clear();self.app.nos_breaks.clear();
                     self.app.nos_todos.clear();
                     self.app.nos_agenda=None;
                 },

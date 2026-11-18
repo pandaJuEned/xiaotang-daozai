@@ -35,7 +35,7 @@ impl crate::app::App {
     pub(crate) fn resident_status_slots(&self,monitor:Option<&MonitorSnapshot>,now:i64,placeholder:bool)->StatusSlots {
         let available=|slot:usize|match slot {
             NETSPEED=>monitor.is_some(),
-            COURSE=>self.nos_next_course(now).is_some(),
+            COURSE=>self.nos_current_break(now).is_some()||self.nos_next_course(now).is_some(),
             CALENDAR=>self.current_calendar_event(now).is_some(),
             CPU_INFO=>monitor.is_some_and(|m|m.cpu_percent.is_some()),
             GPU_INFO=>monitor.is_some_and(|m|m.gpu_percent.is_some()),
@@ -60,13 +60,17 @@ impl crate::app::App {
                 None if placeholder=>"↓-- ↑--".into(),
                 None=>String::new(),
             },
-            COURSE=>match self.nos_next_course(now) {
-                Some(event)=>{
-                    let clock=crate::nos::clock_label(&event.start_time);
-                    if clock.is_empty(){event.title.clone()}else{format!("{clock} {}",event.title)}
+            COURSE=>match self.nos_current_break(now) {
+                // 课间优先：正在休息时显示剩余分钟，下一节课的信息等打铃再回来。
+                Some((left,_))=>format!("课间 {left}′"),
+                None=>match self.nos_next_course(now) {
+                    Some(event)=>{
+                        let clock=crate::nos::clock_label(&event.start_time);
+                        if clock.is_empty(){event.title.clone()}else{format!("{clock} {}",event.title)}
+                    },
+                    None if placeholder=>"--:-- --".into(),
+                    None=>String::new(),
                 },
-                None if placeholder=>"--:-- --".into(),
-                None=>String::new(),
             },
             CALENDAR=>match self.current_calendar_event(now) {
                 Some(event)=>format!("进行中 · {}",event.title),
@@ -89,7 +93,7 @@ impl crate::app::App {
     fn resident_status_data_available(&self,slot:usize,monitor:Option<&MonitorSnapshot>,now:i64)->bool {
         match slot {
             NETSPEED=>monitor.is_some(),
-            COURSE=>self.nos_next_course(now).is_some(),
+            COURSE=>self.nos_current_break(now).is_some()||self.nos_next_course(now).is_some(),
             CALENDAR=>self.current_calendar_event(now).is_some(),
             CPU_INFO=>monitor.is_some_and(|m|m.cpu_percent.is_some()),
             GPU_INFO=>monitor.is_some_and(|m|m.gpu_percent.is_some()),
