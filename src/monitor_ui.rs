@@ -94,7 +94,8 @@ impl App {
         };
         c.text(label_x, 70.0, state, 14.0, W::Semibold, theme::WHITE, H::Left);
         let freq = m.cpu_mhz.map(|v| format!("{:.2} GHz", v as f32 / 1000.0)).unwrap_or_else(|| "频率 --".into());
-        c.text(label_x, 89.0, &freq, 11.5, W::Regular, soft, H::Left);
+        let temperature = m.temperature_c.map(|v| format!("{v:.0}°C")).unwrap_or_else(|| "温度 --".into());
+        c.text(label_x, 89.0, &format!("{freq} · {temperature}"), 11.5, W::Regular, soft, H::Left);
 
         // 底部一行：网速 / 内存 / GPU / 磁盘，半透明底衬上以细线分隔。
         let mut x = 24.0;

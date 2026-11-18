@@ -197,6 +197,8 @@ pub struct Hardware {
     pub gpu_percent: Option<f32>,
     pub disk_percent: Option<f32>,
     pub cpu_mhz: Option<u32>,
+    /// ACPI 热区温度（摄氏度）；常见平台无需额外驱动或管理员权限。
+    pub temperature_c: Option<f32>,
     /// 全盘读写吞吐，MB/s（PDH 计数器给的是字节/秒）。
     pub disk_read_mbps: Option<f32>,
     pub disk_write_mbps: Option<f32>,
@@ -260,9 +262,9 @@ fn pdh_single(counter: isize) -> Option<f64> {
     }
 }
 
-/// GPU Engine 是多实例计数器：取所有实例中的最大值，而不是求和
-/// （同一块显卡的多个引擎会同时计数，相加会虚高到几百 %）。
-fn pdh_array_max(counter: isize) -> Option<f32> {
+/// 读取 wildcard 计数器的有效实例并取最大值。没有有效实例时返回 None。
+/// GPU 引擎与热区都适用：前者要避免多引擎求和虚高，后者要取最热的热区。
+fn pdh_array_peak(counter: isize) -> Option<f64> {
     unsafe {
         let mut size: u32 = 0;
         let mut count: u32 = 0;
@@ -288,14 +290,23 @@ fn pdh_array_max(counter: isize) -> Option<f32> {
         {
             return None;
         }
-        let max = buffer[..(count as usize).min(buffer.len())]
+        buffer[..(count as usize).min(buffer.len())]
             .iter()
             .filter(|item| item.FmtValue.CStatus == 0)
             .map(|item| item.FmtValue.Anonymous.doubleValue)
             .filter(|v| v.is_finite())
-            .fold(0.0f64, f64::max);
-        Some(max.clamp(0.0, 100.0) as f32)
+            .fold(None, |max, v| Some(max.map_or(v, |m| m.max(v))))
     }
+}
+
+/// GPU Engine 占用率：百分比范围固定，异常值收敛到 0..100。
+fn pdh_array_max(counter: isize) -> Option<f32> {
+    pdh_array_peak(counter).map(|v| v.clamp(0.0, 100.0) as f32)
+}
+
+/// 热区计数器给的是十分之一 Kelvin，换算成摄氏度并过滤异常读数。
+fn pdh_temperature(counter: isize) -> Option<f32> {
+    pdh_array_peak(counter).and_then(crate::monitor::temperature_from_kelvin_tenths)
 }
 
 /// 英文计数器名（`PdhAddEnglishCounterW`）避开非英文 Windows 的本地化路径。
@@ -305,6 +316,7 @@ pub struct PdhCounters {
     disk: Option<isize>,
     read: Option<isize>,
     write: Option<isize>,
+    temperature: Option<isize>,
 }
 
 impl PdhCounters {
@@ -312,7 +324,7 @@ impl PdhCounters {
         unsafe {
             let mut query: isize = 0;
             if PdhOpenQueryW(PCWSTR::null(), 0, &mut query) != 0 {
-                return Self { query: 0, gpu: None, disk: None, read: None, write: None };
+                return Self { query: 0, gpu: None, disk: None, read: None, write: None, temperature: None };
             }
             let add = |path: PCWSTR| -> Option<isize> {
                 let mut handle: isize = 0;
@@ -326,9 +338,10 @@ impl PdhCounters {
             let disk = add(w!("\\PhysicalDisk(_Total)\\% Idle Time"));
             let read = add(w!("\\PhysicalDisk(_Total)\\Disk Read Bytes/sec"));
             let write = add(w!("\\PhysicalDisk(_Total)\\Disk Write Bytes/sec"));
+            let temperature = add(w!("\\Thermal Zone Information(*)\\High Precision Temperature"));
             // 比率型计数器至少需要一次 collect 才能产出有效值。
             let _ = PdhCollectQueryData(query);
-            Self { query, gpu, disk, read, write }
+            Self { query, gpu, disk, read, write, temperature }
         }
     }
 
@@ -344,6 +357,7 @@ impl PdhCounters {
                     .and_then(pdh_single)
                     .map(|idle| (100.0 - idle as f32).clamp(0.0, 100.0));
                 out.gpu_percent = self.gpu.and_then(pdh_array_max);
+                out.temperature_c = self.temperature.and_then(pdh_temperature);
                 out.disk_read_mbps = self.read.and_then(pdh_single).map(to_mbps);
                 out.disk_write_mbps = self.write.and_then(pdh_single).map(to_mbps);
             }
@@ -399,10 +413,11 @@ pub fn probe_text(
             .unwrap_or_else(|| "--".into())
     ));
     s.push_str(&format!(
-        "GPU：{}   磁盘：{}   CPU 频率：{}   磁盘读写：{}/s · {}/s\n",
+        "GPU：{}   磁盘：{}   CPU 频率：{}   温度：{}   磁盘读写：{}/s · {}/s\n",
         snap.gpu_percent.map(|v| format!("{v:.1}%")).unwrap_or_else(|| "--".into()),
         snap.disk_percent.map(|v| format!("{v:.1}%")).unwrap_or_else(|| "--".into()),
         snap.cpu_mhz.map(|v| format!("{v} MHz")).unwrap_or_else(|| "--".into()),
+        snap.temperature_c.map(|v| format!("{v:.1}°C")).unwrap_or_else(|| "--".into()),
         snap.disk_read_mbps.map(|v| format!("{v:.1} MB")).unwrap_or_else(|| "--".into()),
         snap.disk_write_mbps.map(|v| format!("{v:.1} MB")).unwrap_or_else(|| "--".into())
     ));
@@ -441,9 +456,16 @@ pub fn probe() -> String {
     let counters = read_counters().unwrap_or_default();
     let cpu = read_cpu_times();
     let (used, total) = read_memory().unwrap_or((0, 0));
+    let hardware = PdhCounters::new().sample();
     let snap = MonitorSnapshot {
         mem_used_bytes: used,
         mem_total_bytes: total,
+        gpu_percent: hardware.gpu_percent,
+        disk_percent: hardware.disk_percent,
+        cpu_mhz: hardware.cpu_mhz,
+        temperature_c: hardware.temperature_c,
+        disk_read_mbps: hardware.disk_read_mbps,
+        disk_write_mbps: hardware.disk_write_mbps,
         ..Default::default()
     };
     let mut text = probe_text(&snap, &cfg, &[], 0);
@@ -542,6 +564,7 @@ fn run(ctx: Context, cfg: MonitorConfig, tx: SyncSender<MonitorSnapshot>, alert_
             gpu_percent: hardware.gpu_percent,
             disk_percent: hardware.disk_percent,
             cpu_mhz: hardware.cpu_mhz,
+            temperature_c: hardware.temperature_c,
             disk_read_mbps: hardware.disk_read_mbps,
             disk_write_mbps: hardware.disk_write_mbps,
         };
@@ -649,6 +672,9 @@ mod tests {
         }
         if let Some(mhz) = h.cpu_mhz {
             assert!(mhz > 0);
+        }
+        if let Some(celsius) = h.temperature_c {
+            assert!((-40.0..=125.0).contains(&celsius), "热区温度异常：{celsius}");
         }
         let _ = read_cpu_mhz();
     }

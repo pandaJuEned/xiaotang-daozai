@@ -532,7 +532,6 @@ impl App {
         let nw = c.text_w(num, 62.0, W::Bold);
         c.text(136.0 + nw + 3.0, y0 + 88.0, "%", 28.0, W::Bold, SUB, Align2::LEFT_BOTTOM);
 
-        // 原型这里放温度；本机没有可靠温度源，改显示实时频率。
         let state = load_state(if has { m.cpu_percent } else { None });
         c.text(52.0, y0 + 110.0, state, 17.0, W::Bold, INK, Align2::LEFT_CENTER);
         let sw = c.text_w(state, 17.0, W::Bold);
@@ -541,8 +540,21 @@ impl App {
             .cpu_mhz
             .filter(|_| has)
             .map(|v| format!("{:.2} GHz", v as f32 / 1000.0))
-            .unwrap_or_else(|| "--".into());
-        c.text(52.0 + sw + 22.0, y0 + 110.0, &freq, 17.0, W::Semibold, Color32::from_rgb(201, 206, 214), Align2::LEFT_CENTER);
+            .unwrap_or_else(|| "频率 --".into());
+        let temperature = m
+            .temperature_c
+            .filter(|_| has)
+            .map(|v| format!("{v:.0}°C"))
+            .unwrap_or_else(|| "温度 --".into());
+        c.text(
+            52.0 + sw + 22.0,
+            y0 + 110.0,
+            &format!("{freq} · {temperature}"),
+            15.0,
+            W::Semibold,
+            Color32::from_rgb(201, 206, 214),
+            Align2::LEFT_CENTER,
+        );
 
         glyph(c, Glyph::Pc, 60.0, y0 + 136.0, 15.0, SUB);
         c.text(

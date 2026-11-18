@@ -621,6 +621,8 @@ pub struct MonitorSnapshot {
     pub gpu_percent: Option<f32>,
     pub disk_percent: Option<f32>,
     pub cpu_mhz: Option<u32>,
+    /// ACPI 热区温度（摄氏度）；系统未提供读数时为 None。
+    pub temperature_c: Option<f32>,
     /// 全盘读写吞吐（MB/s），仪表盘「硬盘」卡片用。
     pub disk_read_mbps: Option<f32>,
     pub disk_write_mbps: Option<f32>,
@@ -786,10 +788,29 @@ pub fn machine_name() -> String {
         .unwrap_or_else(|| "本机".to_string())
 }
 
+/// Windows 热区计数器给的是十分之一 Kelvin；0 表示未知。
+/// 过滤明显超出机身传感器范围的读数，避免把计数器异常值显示成温度。
+pub fn temperature_from_kelvin_tenths(raw: f64) -> Option<f32> {
+    if !raw.is_finite() || raw <= 0.0 {
+        return None;
+    }
+    let celsius = (raw / 10.0 - 273.15) as f32;
+    ((-40.0..=125.0).contains(&celsius)).then(|| (celsius * 10.0).round() / 10.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn thermal_zone_tenths_kelvin_convert_to_celsius_and_drop_bad_readings() {
+        assert!((temperature_from_kelvin_tenths(3131.0).unwrap() - 40.0).abs() < 0.11);
+        assert!((temperature_from_kelvin_tenths(3442.0).unwrap() - 71.0).abs() < 0.11);
+        for raw in [0.0, -1.0, f64::NAN, f64::INFINITY, 2000.0, 9999.0] {
+            assert_eq!(temperature_from_kelvin_tenths(raw), None, "异常读数 {raw} 不应显示");
+        }
+    }
 
     fn tmp(tag: &str) -> PathBuf {
         static N: AtomicU64 = AtomicU64::new(0);
