@@ -607,6 +607,39 @@ impl MonitorConfig {
     }
 }
 
+/// 单个热区读数。名称保存为 UTF-16 以便跨线程复制时仍保持 `MonitorSnapshot: Copy`。
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct TemperatureSensor {
+    pub name: [u16; 24],
+    pub celsius: Option<f32>,
+}
+
+impl TemperatureSensor {
+    pub fn name(&self) -> String {
+        let len = self.name.iter().position(|c| *c == 0).unwrap_or(self.name.len());
+        String::from_utf16_lossy(&self.name[..len])
+    }
+}
+
+/// 最多保留的热区数量；界面按温度从高到低展示。
+pub const MAX_TEMPERATURE_SENSORS: usize = 4;
+
+/// 电源与电池读数。功率单位统一为瓦，容量单位为 Wh。
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PowerSnapshot {
+    pub ac_online: Option<bool>,
+    pub battery_percent: Option<f32>,
+    pub charging: Option<bool>,
+    pub discharging: Option<bool>,
+    pub charge_w: Option<f32>,
+    pub discharge_w: Option<f32>,
+    pub remaining_wh: Option<f32>,
+    pub runtime_secs: Option<u32>,
+    /// Windows Power Meter 计数器给出的整机/交流输入功率；不支持时为 None。
+    pub ac_power_w: Option<f32>,
+    pub battery_temp_c: Option<f32>,
+}
+
 /// P2 采集层与 P3 `app::Env` 之间的公共 DTO。先定好字段，避免后面改两遍。
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct MonitorSnapshot {
@@ -621,6 +654,12 @@ pub struct MonitorSnapshot {
     pub gpu_percent: Option<f32>,
     pub disk_percent: Option<f32>,
     pub cpu_mhz: Option<u32>,
+    /// 最热热区温度（摄氏度）；系统未提供读数时为 None。
+    pub temperature_c: Option<f32>,
+    /// 全部可读取的热区，按温度从高到低排列；空位为 None。
+    pub temperature_sensors: [Option<TemperatureSensor>; MAX_TEMPERATURE_SENSORS],
+    /// 电源与电池读数。
+    pub power: PowerSnapshot,
     /// 全盘读写吞吐（MB/s），仪表盘「硬盘」卡片用。
     pub disk_read_mbps: Option<f32>,
     pub disk_write_mbps: Option<f32>,
@@ -777,6 +816,15 @@ impl Trend {
     }
 }
 
+/// 把 PDH 热区实例名（如 `\_tz.tz02`）转成简短的「热区 2」。
+pub fn thermal_zone_label(name: &str) -> String {
+    let digits: String = name.chars().rev().take_while(|c| c.is_ascii_digit()).collect::<Vec<_>>().into_iter().rev().collect();
+    match digits.parse::<u32>() {
+        Ok(index) if name.to_ascii_lowercase().contains("tz") => format!("热区 {index}"),
+        _ => "热区".to_string(),
+    }
+}
+
 /// 计算机名，用于仪表盘上的「本机 · xxx」。取不到时退回「本机」。
 pub fn machine_name() -> String {
     std::env::var("COMPUTERNAME")
@@ -786,10 +834,29 @@ pub fn machine_name() -> String {
         .unwrap_or_else(|| "本机".to_string())
 }
 
+/// Windows 热区计数器给的是十分之一 Kelvin；0 表示未知。
+/// 过滤明显超出机身传感器范围的读数，避免把计数器异常值显示成温度。
+pub fn temperature_from_kelvin_tenths(raw: f64) -> Option<f32> {
+    if !raw.is_finite() || raw <= 0.0 {
+        return None;
+    }
+    let celsius = (raw / 10.0 - 273.15) as f32;
+    ((-40.0..=125.0).contains(&celsius)).then(|| (celsius * 10.0).round() / 10.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn thermal_zone_tenths_kelvin_convert_to_celsius_and_drop_bad_readings() {
+        assert!((temperature_from_kelvin_tenths(3131.0).unwrap() - 40.0).abs() < 0.11);
+        assert!((temperature_from_kelvin_tenths(3442.0).unwrap() - 71.0).abs() < 0.11);
+        for raw in [0.0, -1.0, f64::NAN, f64::INFINITY, 2000.0, 9999.0] {
+            assert_eq!(temperature_from_kelvin_tenths(raw), None, "异常读数 {raw} 不应显示");
+        }
+    }
 
     fn tmp(tag: &str) -> PathBuf {
         static N: AtomicU64 = AtomicU64::new(0);

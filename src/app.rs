@@ -1870,7 +1870,8 @@ impl App {
         let bell=self.t<self.notification_bell_until&&!self.compact_notices();
         self.resident_power=(env.battery,env.charging);
         let now_secs=chrono::Local::now().timestamp();
-        let mut layout=Layout::with_status(self.settings.show_battery&&env.battery.is_some(),self.quota_bar_indices().len(),self.media.is_music()&&!bell,self.pomo.running,bell,self.pet_enabled(),self.weather_pill().is_some(),self.settings.show_net_speed&&env.monitor.is_some(),self.settings.show_course&&self.nos_next_course(now_secs).is_some(),self.settings.show_calendar_status&&self.current_calendar_event(now_secs).is_some());
+        let status=self.resident_status_slots(env.monitor.as_ref(),now_secs,false);
+        let mut layout=Layout::with_status_slots(self.settings.show_battery&&env.battery.is_some(),self.quota_bar_indices().len(),self.media.is_music()&&!bell,self.pomo.running,bell,self.pet_enabled(),self.weather_pill().is_some(),status);
         layout.reorder(&self.settings.resident_order);
         for (position,extra) in self.quota_balance_layout(&ctx){layout.balance_tail(position,extra);}
         if self.settings.clock_period!=0 { layout.widen_clock(40.0); }
@@ -2848,34 +2849,15 @@ impl App {
         if self.pomo.running && compact_alpha>0.004 {
             crate::focus_bar::draw(&base.faded(compact_alpha),local_cx+layout.x[bar::FOCUS].unwrap(),15.0,self.t,&self.pomo,self.phase_secs(self.pomo.phase),false);
         }
-        // 常驻栏网速：强制简洁格式固定宽度，避免文字变长撑宽岛体导致 region/命中区抖动。
-        if self.settings.show_net_speed && compact_alpha>0.004 {
-            if let (Some(m),Some(x))=(env.monitor,layout.x[bar::NETSPEED]) {
-                let mut style=self.monitor_cfg.display;
-                style.short_mode=true;style.space=false;
-                let down=crate::monitor::format_speed(m.down_bps,&style);
-                let up=crate::monitor::format_speed(m.up_bps,&style);
-                let text=format!("↓{down} ↑{up}");
-                base.faded(compact_alpha).text(local_cx+x,21.0,&text,12.0,W::Bold,theme::WHITE,H::Center);
-            }
-        }
-        // 常驻栏课表：显示下一节课（开始时刻 + 课名）。简洁格式固定宽度，不撑宽岛体。
-        if self.settings.show_course && compact_alpha>0.004 {
-            if let Some(x)=layout.x[bar::COURSE] {
-                if let Some(event)=self.nos_next_course(chrono::Local::now().timestamp()) {
-                    let clock=crate::nos::clock_label(&event.start_time);
-                    let text=if clock.is_empty(){event.title.clone()}else{format!("{clock} {}",event.title)};
-                    base.faded(compact_alpha).text(local_cx+x,21.0,&text,12.0,W::Bold,theme::WHITE,H::Center);
-                }
-            }
-        }
-        // 常驻栏日程进行中：显示当前正在进行的日程标题；没有进行中的日程时槽位自动消失。
-        if self.settings.show_calendar_status && compact_alpha>0.004 {
-            if let Some(x)=layout.x[bar::CALENDAR] {
-                if let Some(event)=self.current_calendar_event(chrono::Local::now().timestamp()) {
-                    let text=format!("进行中 · {}",event.title);
-                    base.faded(compact_alpha).text(local_cx+x,21.0,&text,12.0,W::Bold,theme::WHITE,H::Center);
-                }
+        // 常驻栏状态组件：顺序、文案与设置页状态组件列表共用同一套末尾槽定义。
+        if compact_alpha>0.004 {
+            let now=chrono::Local::now().timestamp();
+            for slot in bar::STATUS_TAIL_ORDER {
+                let Some(x)=layout.x[slot] else {continue;};
+                let text=self.resident_status_text(slot,env.monitor.as_ref(),now,false);
+                if text.is_empty(){continue;}
+                let size=if matches!(slot,bar::CPU_INFO|bar::GPU_INFO|bar::MEMORY_INFO|bar::DISK_INFO|bar::TEMPERATURE){11.0}else{12.0};
+                base.faded(compact_alpha).text(local_cx+x,21.0,&text,size,W::Bold,theme::WHITE,H::Center);
             }
         }
     }

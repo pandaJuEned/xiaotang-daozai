@@ -21,6 +21,14 @@ pub(crate) const NETSPEED: usize = 10;
 pub(crate) const COURSE: usize = 11;
 /// 日程进行中槽：收起时显示正在进行的日程标题，固定排在末尾，不参与拖动排序。
 pub(crate) const CALENDAR: usize = 12;
+/// 以下四个硬件占用槽与网速/课表/日程一样固定排在末尾；顺序与「页面管理 → 状态组件」一致。
+/// 必须追加在 WIDTHS 末尾——`quota_slot()` 用 `WIDTHS.len()` 作动态额度环起点，会自动顺延。
+pub(crate) const CPU_INFO: usize = 13;
+pub(crate) const GPU_INFO: usize = 14;
+pub(crate) const MEMORY_INFO: usize = 15;
+pub(crate) const DISK_INFO: usize = 16;
+/// 机身温度槽：显示 ACPI 热区读数（如 71°C），同样固定排在末尾。
+pub(crate) const TEMPERATURE: usize = 17;
 /// 天气徽标的基础槽宽；温度文字更长时由 `widen` 补足。
 pub(crate) const WEATHER_WIDTH: f32 = 38.0;
 /// 网速用简洁格式绘制（↓1.2M ↑300K），固定宽度足够，不撑宽岛体。
@@ -29,7 +37,45 @@ pub(crate) const NETSPEED_WIDTH: f32 = 92.0;
 pub(crate) const COURSE_WIDTH: f32 = 92.0;
 /// 日程进行中槽用简洁格式（进行中 · 周会），固定宽度足够。
 pub(crate) const CALENDAR_WIDTH: f32 = 112.0;
-const WIDTHS: [f32; 13] = [44.0,20.0,27.0,27.0,27.0,WEATHER_WIDTH,14.0,crate::focus_bar::WIDTH,20.0,32.0,NETSPEED_WIDTH,COURSE_WIDTH,CALENDAR_WIDTH];
+/// 硬件占用槽只显示简称与百分号（CPU 42%），固定宽度避免读数变化牵动布局。
+pub(crate) const CPU_INFO_WIDTH: f32 = 52.0;
+pub(crate) const GPU_INFO_WIDTH: f32 = 52.0;
+pub(crate) const MEMORY_INFO_WIDTH: f32 = 60.0;
+pub(crate) const DISK_INFO_WIDTH: f32 = 60.0;
+/// 温度槽显示「71°C」，固定宽度避免读数变化牵动布局。
+pub(crate) const TEMPERATURE_WIDTH: f32 = 52.0;
+const WIDTHS: [f32; 18] = [44.0,20.0,27.0,27.0,27.0,WEATHER_WIDTH,14.0,crate::focus_bar::WIDTH,20.0,32.0,NETSPEED_WIDTH,COURSE_WIDTH,CALENDAR_WIDTH,CPU_INFO_WIDTH,GPU_INFO_WIDTH,MEMORY_INFO_WIDTH,DISK_INFO_WIDTH,TEMPERATURE_WIDTH];
+
+/// 状态组件中固定排在末尾的槽位，顺序与设置页列表保持一致。
+pub(crate) const STATUS_TAIL_ORDER: [usize; 8] = [NETSPEED,COURSE,CALENDAR,CPU_INFO,GPU_INFO,MEMORY_INFO,DISK_INFO,TEMPERATURE];
+
+/// 由设置开关换算出的末尾状态槽；单独成组，避免继续给 `Layout` 追加位置参数。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct StatusSlots {
+    pub net: bool,
+    pub course: bool,
+    pub calendar: bool,
+    pub cpu: bool,
+    pub gpu: bool,
+    pub memory: bool,
+    pub disk: bool,
+    pub temperature: bool,
+}
+impl StatusSlots {
+    pub(crate) fn on(self, slot: usize) -> bool {
+        match slot {
+            NETSPEED => self.net,
+            COURSE => self.course,
+            CALENDAR => self.calendar,
+            CPU_INFO => self.cpu,
+            GPU_INFO => self.gpu,
+            MEMORY_INFO => self.memory,
+            DISK_INFO => self.disk,
+            TEMPERATURE => self.temperature,
+            _ => false,
+        }
+    }
+}
 
 pub(crate) const DEFAULT_ORDER: [usize;6]=[BATTERY,PET,CLOCK,QUOTA,MUSIC,FOCUS];
 pub(crate) fn valid_order(order:&[usize])->bool {
@@ -60,14 +106,18 @@ pub(crate) struct Layout {
 impl Layout {
     /// 保持原有 7 参数签名，避免改动全部现有调用点（含 UI 回归测试）。
     pub fn new(battery:bool,quotas:usize,music:bool,focus:bool,bell:bool,pet:bool,weather:bool)->Self {
-        Self::with_net(battery,quotas,music,focus,bell,pet,weather,false,false)
+        Self::with_status_slots(battery,quotas,music,focus,bell,pet,weather,StatusSlots::default())
     }
     /// 带网速槽与课表槽的排布；`net=false`、`course=false` 时与 `new` 完全一致。
     pub fn with_net(battery:bool,quotas:usize,music:bool,focus:bool,bell:bool,pet:bool,weather:bool,net:bool,course:bool)->Self {
-        Self::with_status(battery,quotas,music,focus,bell,pet,weather,net,course,false)
+        Self::with_status_slots(battery,quotas,music,focus,bell,pet,weather,StatusSlots{net,course,..Default::default()})
     }
     /// 在 `with_net` 基础上追加「进行中日程」槽；`calendar=false` 时与 `with_net` 完全一致。
     pub fn with_status(battery:bool,quotas:usize,music:bool,focus:bool,bell:bool,pet:bool,weather:bool,net:bool,course:bool,calendar:bool)->Self {
+        Self::with_status_slots(battery,quotas,music,focus,bell,pet,weather,StatusSlots{net,course,calendar,..Default::default()})
+    }
+    /// 所有由状态组件开关控制的末尾槽；`status` 全关时与 `new` 完全一致。
+    pub fn with_status_slots(battery:bool,quotas:usize,music:bool,focus:bool,bell:bool,pet:bool,weather:bool,status:StatusSlots)->Self {
         fn place(cursor:&mut f32,width:f32)->f32 {let x=*cursor+width/2.0;*cursor+=width+12.0;x}
         let mut widths=WIDTHS.to_vec(); widths.resize(WIDTHS.len()+quotas.saturating_sub(3),27.0);
         let mut x=vec![None;widths.len()];let mut cursor=16.0;
@@ -90,7 +140,10 @@ impl Layout {
                 _=>{},
             }
         }
-        for (slot,on) in [(MUSIC,music&&!bell),(FOCUS,focus),(BELL,bell),(NETSPEED,net),(COURSE,course),(CALENDAR,calendar)] {
+        let tail=[(MUSIC,music&&!bell),(FOCUS,focus),(BELL,bell)]
+            .into_iter()
+            .chain(STATUS_TAIL_ORDER.into_iter().map(|slot|(slot,status.on(slot))));
+        for (slot,on) in tail {
             if on {x[slot]=Some(place(&mut cursor,WIDTHS[slot]));}
         }
         let width=cursor-12.0+16.0;
@@ -110,9 +163,9 @@ impl Layout {
     pub fn reorder(&mut self,order:&[usize]) {
         if !valid_order(order){return;}
         let original=self.x.clone();let mut cursor=-self.width/2.0+16.0;
-        // 网速与铃铛一样固定排在末尾：不参与用户排序，但必须随重排重新落位，避免与前面的槽重叠。
-        // 课表槽同理，永远排在网速之后。
-        for slot in order.iter().copied().chain(std::iter::once(BELL)).chain(std::iter::once(NETSPEED)).chain(std::iter::once(COURSE)).chain(std::iter::once(CALENDAR)) {
+        // 铃铛与状态组件末尾槽不参与用户排序，但必须随重排重新落位，避免与前面的槽重叠。
+        // 末尾槽顺序取 STATUS_TAIL_ORDER，始终与设置页状态组件列表一致。
+        for slot in order.iter().copied().chain(std::iter::once(BELL)).chain(STATUS_TAIL_ORDER) {
             let slots:Vec<usize>=if slot==QUOTA{self.quota_slots().collect()}
                 else if slot==CLOCK&&self.x[WEATHER].is_some(){vec![CLOCK,WEATHER]}
                 else{vec![slot]};
@@ -222,6 +275,29 @@ mod tests {
         reordered.reorder(&DEFAULT_ORDER);
         let last = [NETSPEED, COURSE, CALENDAR].map(|slot| reordered.x[slot].expect("末尾槽"));
         assert!(last[0] < last[1] && last[1] < last[2], "三个末尾槽须依网速→课表→日程排序：{last:?}");
+    }
+
+    #[test]
+    fn hardware_status_slots_follow_the_settings_order_and_survive_reorder() {
+        use super::*;
+        let base = Layout::new(true, 3, true, true, false, true, false);
+        for slot in [CPU_INFO, GPU_INFO, MEMORY_INFO, DISK_INFO] {
+            assert!(base.x[slot].is_none(), "默认不显示硬件状态槽：{slot}");
+        }
+        let all = Layout::with_status_slots(
+            true, 3, true, true, false, true, false,
+            StatusSlots { net: true, course: true, calendar: true, cpu: true, gpu: true, memory: true, disk: true, temperature: true },
+        );
+        for slot in STATUS_TAIL_ORDER {
+            assert!(all.x[slot].is_some(), "启用后状态槽须就位：{slot}");
+        }
+        let mut reordered = all.clone();
+        reordered.reorder(&DEFAULT_ORDER);
+        let positions: Vec<_> = STATUS_TAIL_ORDER.map(|slot| reordered.x[slot].expect("末尾槽")).to_vec();
+        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]), "末尾槽须按设置列表顺序排列：{positions:?}");
+        let mut boxes: Vec<_> = reordered.x.iter().enumerate().filter_map(|(i, x)| x.map(|x| (x - reordered.widths[i] / 2.0, x + reordered.widths[i] / 2.0))).collect();
+        boxes.sort_by(|a, b| a.0.total_cmp(&b.0));
+        assert!(boxes.windows(2).all(|pair| pair[1].0 - pair[0].1 >= 6.9), "状态组件不能重叠：{reordered:?}");
     }
 
     use super::*;

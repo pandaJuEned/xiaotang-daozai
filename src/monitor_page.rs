@@ -29,10 +29,12 @@ const HAIR: Color32 = Color32::from_rgb(46, 46, 50);
 const LEFT: f32 = 42.0;
 const RIGHT: f32 = 376.0;
 
-/// 2×2 指标格的几何。
+/// 指标格与下方电源条的几何。
 const CELL_W: f32 = 104.0;
+const CELL_H: f32 = 24.0;
 const CELL_X: [f32; 2] = [160.0, 272.0];
-const CELL_Y: [f32; 2] = [36.0, 74.0];
+const CELL_Y: [f32; 2] = [28.0, 56.0];
+const POWER_Y: f32 = 86.0;
 
 fn load_color(v: f32) -> Color32 {
     if v < 40.0 {
@@ -149,11 +151,17 @@ impl App {
             .map(|v| format!(" · {:.2} GHz", v as f32 / 1000.0))
             .unwrap_or_default();
         c.text(LEFT, 90.0, &format!("{state}{freq}"), 9.5, W::Semibold, theme::GRAY, H::Left);
-        // 只写机器名：前缀「本机 ·」会挤掉主机名后半段。
-        let machine = c.fit(&crate::monitor::machine_name(), 8.5, W::Regular, 114.0);
-        c.text(LEFT, 104.0, &machine, 8.5, W::Regular, theme::DIM, H::Left);
+        // 温度单独 emphasized，机器名过长时收缩，避免挤进右侧指标格。
+        let temperature = m
+            .temperature_c
+            .map(|v| format!("{v:.0}°C"))
+            .unwrap_or_else(|| "温度 --".into());
+        let color = m.temperature_c.map(load_color).unwrap_or(theme::DIM);
+        let tw = c.text(LEFT, 104.0, &temperature, 10.5, W::Bold, color, H::Left);
+        let machine = c.fit(&crate::monitor::machine_name(), 8.5, W::Regular, 72.0);
+        c.text(LEFT + tw + 6.0, 104.0, &machine, 8.5, W::Regular, theme::DIM, H::Left);
 
-        /* ---------- 右侧 2×2 指标格 ---------- */
+        /* ---------- 右侧 2×2 指标格 + 电源条 ---------- */
         let mem_sub = format!(
             "{:.1}/{:.1}G",
             m.mem_used_bytes as f64 / 1_073_741_824.0,
@@ -163,27 +171,51 @@ impl App {
             (Some(r), Some(w)) => format!("读{r:.0}·写{w:.0}"),
             _ => "读写 --".to_string(),
         };
-        let cells: [(&str, String, String, Color32); 4] = [
-            ("内存", pct(m.mem_percent()), mem_sub, BLUE),
-            ("GPU", pct(m.gpu_percent), String::new(), GREEN),
-            ("硬盘", pct(m.disk_percent), disk_sub, PURPLE),
+        let cells: [(String, String, String, Color32, Color32); 4] = [
+            ("内存".into(), pct(m.mem_percent()), mem_sub, BLUE, theme::WHITE),
+            ("GPU".into(), pct(m.gpu_percent), String::new(), GREEN, theme::WHITE),
+            ("硬盘".into(), pct(m.disk_percent), disk_sub, PURPLE, theme::WHITE),
             (
-                "网速",
+                "网速".into(),
                 format!("↓{}", brief(m.down_bps)),
                 format!("↑{}", brief(m.up_bps)),
                 CYAN,
+                theme::WHITE,
             ),
         ];
-        for (i, (label, value, sub, tint)) in cells.into_iter().enumerate() {
+        for (i, (label, value, sub, tint, value_color)) in cells.into_iter().enumerate() {
             let (x, y) = (CELL_X[i % 2], CELL_Y[i / 2]);
             c.painter
-                .rect_filled(c.rect(x, y, CELL_W, 34.0), 9.0, Color32::from_white_alpha(10));
-            c.text(x + 8.0, y + 13.0, label, 8.5, W::Regular, theme::DIM, H::Left);
-            c.text(x + 8.0, y + 30.0, &value, 13.0, W::Bold, theme::WHITE, H::Left);
+                .rect_filled(c.rect(x, y, CELL_W, CELL_H), 8.0, Color32::from_white_alpha(10));
+            c.text(x + 8.0, y + 8.0, &label, 8.0, W::Regular, theme::DIM, H::Left);
+            c.text(x + 8.0, y + 20.0, &value, 12.0, W::Bold, value_color, H::Left);
             if !sub.is_empty() {
-                c.text(x + CELL_W - 8.0, y + 30.0, &sub, 7.5, W::Regular, tint, H::Right);
+                let sub = c.fit(&sub, 7.0, W::Regular, 44.0);
+                c.text(x + CELL_W - 8.0, y + 20.0, &sub, 7.0, W::Regular, tint, H::Right);
             }
         }
+        let p = &m.power;
+        let ac = p.ac_online.map(|v| if v { "已接入" } else { "未接入" }).unwrap_or("--");
+        let battery = p.battery_percent.map(|v| format!("{v:.0}%")).unwrap_or_else(|| "--".into());
+        let remaining = p.remaining_wh.map(|v| format!("{v:.1}Wh")).unwrap_or_else(|| "--".into());
+        let flow = p
+            .charge_w
+            .map(|v| format!("充 {v:.1}W"))
+            .or_else(|| p.discharge_w.map(|v| format!("放 {v:.1}W")))
+            .unwrap_or_else(|| "充/放 --".into());
+        let input = p.ac_power_w.map(|v| format!("入 {v:.0}W")).unwrap_or_else(|| "入 --".into());
+        let power_text = c.fit(
+            &format!("电源 · 交流{ac} · 电池{battery} · 余{remaining} · {flow} · {input}"),
+            9.0,
+            W::Regular,
+            CELL_W * 2.0 + 4.0,
+        );
+        c.painter.rect_filled(
+            c.rect(CELL_X[0], POWER_Y, CELL_W * 2.0 + 12.0, 22.0),
+            8.0,
+            Color32::from_white_alpha(10),
+        );
+        c.text(CELL_X[0] + 8.0, POWER_Y + 12.0, &power_text, 9.0, W::Regular, theme::GRAY, H::Left);
 
         /* ---------- 分隔线 ---------- */
         c.painter

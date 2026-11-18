@@ -994,6 +994,7 @@ struct H {
     media: crate::smtc::NowPlaying,
     power: (Option<u8>, bool),
     network: Option<bool>,
+    monitor: Option<crate::monitor::MonitorSnapshot>,
     system_idle: Option<f64>,
     screen_locked: bool,
     browser_at_top: Option<bool>,
@@ -1008,7 +1009,7 @@ impl H {
         std::env::set_var("DAOZAI_DATA_DIR", &dir);
         let ctx = egui::Context::default();
         let app = App::new(&ctx, Options { fetch_lyrics: false, pet_idle: 1e9 });
-        Self { ctx, app, t: 0.0, cursor: None,cmds:vec![],region:Rect::NOTHING,hit:Rect::NOTHING,animating:false,shapes:Vec::new(), bt:Vec::new(),media:Default::default(),power:(None,false),network:None,system_idle:None,screen_locked:false,browser_at_top:None,file_drop_zone:None,hovered_files:vec![],dropped_files:vec![] }
+        Self { ctx, app, t: 0.0, cursor: None,cmds:vec![],region:Rect::NOTHING,hit:Rect::NOTHING,animating:false,shapes:Vec::new(), bt:Vec::new(),media:Default::default(),power:(None,false),network:None,monitor:None,system_idle:None,screen_locked:false,browser_at_top:None,file_drop_zone:None,hovered_files:vec![],dropped_files:vec![] }
     }
     fn frame(&mut self, events: Vec<egui::Event>) {
         self.t += 1.0 / 60.0;
@@ -1034,6 +1035,7 @@ impl H {
             battery:self.power.0,
             charging:self.power.1,
             network:self.network,
+            monitor:self.monitor,
             idle_seconds:self.system_idle,
             screen_locked:self.screen_locked,
             browser_at_top:self.browser_at_top,
@@ -5834,7 +5836,7 @@ fn page_order_drag_applies_on_release_and_saves() {
         h.t+=0.02;let time=h.t;
         egui::Context::set_immediate_viewport_renderer(move|ctx,mut viewport|{
             let id=viewport.ids.this;
-            let raw=egui::RawInput{viewport_id:id,screen_rect:Some(Rect::from_min_size(Pos2::ZERO,egui::vec2(690.0,1000.0))),time:Some(time),events:events.clone(),viewports:std::iter::once((id,egui::ViewportInfo::default())).collect(),..Default::default()};
+            let raw=egui::RawInput{viewport_id:id,screen_rect:Some(Rect::from_min_size(Pos2::ZERO,egui::vec2(690.0,1500.0))),time:Some(time),events:events.clone(),viewports:std::iter::once((id,egui::ViewportInfo::default())).collect(),..Default::default()};
             *capture.lock().unwrap()=Some(ctx.run(raw,|ctx|(viewport.viewport_ui_cb)(ctx)));
         });
         let _=h.ctx.run(egui::RawInput::default(),|ctx|h.app.settings_ui(ctx,false));
@@ -8545,6 +8547,48 @@ fn resident_toggles_independently_control_quota_and_ongoing_calendar_slot() {
     assert!(h.app.resident.current().x[crate::bar_layout::CALENDAR].is_some(),"开启后日程槽应就位");
     h.app.settings.show_calendar_status=false;h.frame(vec![]);
     assert!(h.app.resident.current().x[crate::bar_layout::CALENDAR].is_none(),"关闭后日程槽应消失");
+}
+#[test]
+fn hardware_status_components_line_up_with_the_resident_bar_and_preview(){
+    use crate::bar_layout::{CPU_INFO,DISK_INFO,GPU_INFO,MEMORY_INFO,STATUS_TAIL_ORDER,TEMPERATURE};
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+    let monitor=crate::monitor::MonitorSnapshot{cpu_percent:Some(42.0),gpu_percent:Some(31.0),mem_used_bytes:68,mem_total_bytes:100,disk_percent:Some(55.0),temperature_c:Some(71.0),..Default::default()};
+    let mut h=H::new();
+    h.app.settings.show_cpu=true;h.app.settings.show_gpu=true;h.app.settings.show_memory=true;h.app.settings.show_disk=true;h.app.settings.save();
+    let loaded=crate::model::Settings::load();
+    assert!(loaded.show_cpu&&loaded.show_gpu&&loaded.show_memory&&loaded.show_disk&&loaded.show_temperature,"状态组件开关应各自落盘");
+    h.monitor=Some(monitor);
+    h.frame(vec![]);
+    let tail=STATUS_TAIL_ORDER.iter().filter(|&&slot|matches!(slot,CPU_INFO|GPU_INFO|MEMORY_INFO|DISK_INFO|TEMPERATURE)).map(|&slot|h.app.resident.current().x[slot].expect("硬件状态槽应就位")).collect::<Vec<_>>();
+    assert!(tail.windows(2).all(|pair|pair[0]<pair[1]),"常驻栏末尾顺序应与设置列表一致：{tail:?}");
+    for label in ["CPU 42%","GPU 31%","内存 68%","硬盘 55%","71°C"] {
+        assert!(h.shapes.iter().any(|s|matches!(&s.shape,egui::Shape::Text(t)if t.galley.text()==label)),"常驻栏应显示 {label}");
+    }
+    // 页面管理里的常驻排列预览也使用同一组开关与文案。
+    let mut preview=H::new();
+    preview.app.settings.show_cpu=true;preview.app.settings.show_gpu=true;preview.app.settings.show_memory=true;preview.app.settings.show_disk=true;
+    preview.app.monitor_last=Some(monitor);
+    let raw=egui::RawInput{screen_rect:Some(Rect::from_min_size(Pos2::ZERO,Vec2::new(600.0,300.0))),time:Some(1.0),..Default::default()};
+    let out=preview.ctx.run(raw,|ctx|{egui::CentralPanel::default().show(ctx,|ui|preview.app.resident_order_settings(ui));});
+    for label in ["CPU 42%","GPU 31%","内存 68%","硬盘 55%","71°C"] {
+        assert!(out.shapes.iter().any(|s|matches!(&s.shape,egui::Shape::Text(t)if t.galley.text()==label)),"常驻排列预览应显示 {label}");
+    }
+}
+#[test]
+fn system_monitor_page_shows_machine_temperature(){
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+    let mut h=H::new();
+    h.monitor=Some(crate::monitor::MonitorSnapshot{
+        cpu_percent:Some(42.0),temperature_c:Some(71.0),
+        power:crate::monitor::PowerSnapshot{ac_online:Some(true),battery_percent:Some(96.0),charging:Some(true),charge_w:Some(25.0),ac_power_w:Some(31.0),..Default::default()},
+        ..Default::default()
+    });
+    h.app.show_page(crate::app::MONITOR_PAGE);
+    for _ in 0..60 {h.frame(vec![]);}
+    for label in ["71°C","电源 · 交流"] {
+        assert!(h.shapes.iter().any(|s|matches!(&s.shape,egui::Shape::Text(t)if t.galley.text().contains(label))),"系统监控页应显示 {label}");
+    }
+    assert!(!h.shapes.iter().any(|s|matches!(&s.shape,egui::Shape::Text(t)if t.galley.text().contains("热区 2"))),"不应新增热区格");
 }
 #[test]
 fn resident_bar_shows_the_refill_time_only_when_quota_is_low(){
