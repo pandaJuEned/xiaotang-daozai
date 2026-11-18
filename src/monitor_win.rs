@@ -41,7 +41,7 @@ use windows::Win32::System::Threading::GetSystemTimes;
 
 use crate::monitor::{
     format_size, format_speed, Alert, Counters, HistoryStore, MonitorConfig, MonitorSnapshot,
-    RateCalculator, SavePolicy, ThresholdWatcher,
+    RateCalculator, SavePolicy, TemperatureSensor, ThresholdWatcher, MAX_TEMPERATURE_SENSORS,
 };
 use crate::poll_clock::PollClock;
 
@@ -199,6 +199,8 @@ pub struct Hardware {
     pub cpu_mhz: Option<u32>,
     /// ACPI 热区温度（摄氏度）；常见平台无需额外驱动或管理员权限。
     pub temperature_c: Option<f32>,
+    /// 全部热区读数，按温度从高到低排列。
+    pub temperature_sensors: [Option<TemperatureSensor>; MAX_TEMPERATURE_SENSORS],
     /// 全盘读写吞吐，MB/s（PDH 计数器给的是字节/秒）。
     pub disk_read_mbps: Option<f32>,
     pub disk_write_mbps: Option<f32>,
@@ -304,9 +306,66 @@ fn pdh_array_max(counter: isize) -> Option<f32> {
     pdh_array_peak(counter).map(|v| v.clamp(0.0, 100.0) as f32)
 }
 
-/// 热区计数器给的是十分之一 Kelvin，换算成摄氏度并过滤异常读数。
-fn pdh_temperature(counter: isize) -> Option<f32> {
-    pdh_array_peak(counter).and_then(crate::monitor::temperature_from_kelvin_tenths)
+unsafe fn copy_pdh_name(name: windows::core::PWSTR) -> [u16; 24] {
+    let mut out = [0u16; 24];
+    if name.0.is_null() {
+        return out;
+    }
+    for (i, slot) in out[..23].iter_mut().enumerate() {
+        let c = *name.0.add(i);
+        if c == 0 {
+            break;
+        }
+        *slot = c;
+    }
+    out
+}
+
+/// 读取所有热区实例，保留名称与读数并按温度降序排列；系统只暴露一路时其余为空。
+fn pdh_temperatures(counter: isize) -> [Option<TemperatureSensor>; MAX_TEMPERATURE_SENSORS] {
+    let mut out = [None; MAX_TEMPERATURE_SENSORS];
+    unsafe {
+        let mut size: u32 = 0;
+        let mut count: u32 = 0;
+        if PdhGetFormattedCounterArrayW(counter, PDH_FMT_DOUBLE, &mut size, &mut count, None)
+            != PDH_MORE_DATA
+            || size == 0
+        {
+            return out;
+        }
+        let unit = std::mem::size_of::<PDH_FMT_COUNTERVALUE_ITEM_W>();
+        let mut buffer: Vec<PDH_FMT_COUNTERVALUE_ITEM_W> = vec![
+            PDH_FMT_COUNTERVALUE_ITEM_W::default();
+            (size as usize + unit - 1) / unit + 1
+        ];
+        if PdhGetFormattedCounterArrayW(
+            counter,
+            PDH_FMT_DOUBLE,
+            &mut size,
+            &mut count,
+            Some(buffer.as_mut_ptr()),
+        ) != 0
+        {
+            return out;
+        }
+        let mut found: Vec<TemperatureSensor> = buffer[..(count as usize).min(buffer.len())]
+            .iter()
+            .filter(|item| item.FmtValue.CStatus == 0)
+            .filter_map(|item| {
+                let value = item.FmtValue.Anonymous.doubleValue;
+                crate::monitor::temperature_from_kelvin_tenths(value).map(|celsius| {
+                    TemperatureSensor { name: copy_pdh_name(item.szName), celsius: Some(celsius) }
+                })
+            })
+            .collect();
+        found.sort_by(|a, b| {
+            b.celsius.unwrap_or(f32::NEG_INFINITY).total_cmp(&a.celsius.unwrap_or(f32::NEG_INFINITY))
+        });
+        for (slot, sensor) in out.iter_mut().zip(found.into_iter().take(MAX_TEMPERATURE_SENSORS)) {
+            *slot = Some(sensor);
+        }
+    }
+    out
 }
 
 /// 英文计数器名（`PdhAddEnglishCounterW`）避开非英文 Windows 的本地化路径。
@@ -357,7 +416,10 @@ impl PdhCounters {
                     .and_then(pdh_single)
                     .map(|idle| (100.0 - idle as f32).clamp(0.0, 100.0));
                 out.gpu_percent = self.gpu.and_then(pdh_array_max);
-                out.temperature_c = self.temperature.and_then(pdh_temperature);
+                if let Some(counter) = self.temperature {
+                    out.temperature_sensors = pdh_temperatures(counter);
+                    out.temperature_c = out.temperature_sensors.iter().flatten().next().and_then(|s| s.celsius);
+                }
                 out.disk_read_mbps = self.read.and_then(pdh_single).map(to_mbps);
                 out.disk_write_mbps = self.write.and_then(pdh_single).map(to_mbps);
             }
@@ -412,12 +474,22 @@ pub fn probe_text(
             .map(|v| format!("{v:.1}%"))
             .unwrap_or_else(|| "--".into())
     ));
+    let temps = snap
+        .temperature_sensors
+        .iter()
+        .flatten()
+        .map(|s| {
+            let label = crate::monitor::thermal_zone_label(&s.name());
+            format!("{label} {:.1}°C", s.celsius.unwrap_or(0.0))
+        })
+        .collect::<Vec<_>>();
+    let temp_text = if temps.is_empty() { "--".to_string() } else { temps.join(" · ") };
     s.push_str(&format!(
         "GPU：{}   磁盘：{}   CPU 频率：{}   温度：{}   磁盘读写：{}/s · {}/s\n",
         snap.gpu_percent.map(|v| format!("{v:.1}%")).unwrap_or_else(|| "--".into()),
         snap.disk_percent.map(|v| format!("{v:.1}%")).unwrap_or_else(|| "--".into()),
         snap.cpu_mhz.map(|v| format!("{v} MHz")).unwrap_or_else(|| "--".into()),
-        snap.temperature_c.map(|v| format!("{v:.1}°C")).unwrap_or_else(|| "--".into()),
+        temp_text,
         snap.disk_read_mbps.map(|v| format!("{v:.1} MB")).unwrap_or_else(|| "--".into()),
         snap.disk_write_mbps.map(|v| format!("{v:.1} MB")).unwrap_or_else(|| "--".into())
     ));
@@ -464,6 +536,7 @@ pub fn probe() -> String {
         disk_percent: hardware.disk_percent,
         cpu_mhz: hardware.cpu_mhz,
         temperature_c: hardware.temperature_c,
+        temperature_sensors: hardware.temperature_sensors,
         disk_read_mbps: hardware.disk_read_mbps,
         disk_write_mbps: hardware.disk_write_mbps,
         ..Default::default()
@@ -565,6 +638,7 @@ fn run(ctx: Context, cfg: MonitorConfig, tx: SyncSender<MonitorSnapshot>, alert_
             disk_percent: hardware.disk_percent,
             cpu_mhz: hardware.cpu_mhz,
             temperature_c: hardware.temperature_c,
+            temperature_sensors: hardware.temperature_sensors,
             disk_read_mbps: hardware.disk_read_mbps,
             disk_write_mbps: hardware.disk_write_mbps,
         };

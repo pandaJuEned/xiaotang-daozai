@@ -607,6 +607,23 @@ impl MonitorConfig {
     }
 }
 
+/// 单个热区读数。名称保存为 UTF-16 以便跨线程复制时仍保持 `MonitorSnapshot: Copy`。
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct TemperatureSensor {
+    pub name: [u16; 24],
+    pub celsius: Option<f32>,
+}
+
+impl TemperatureSensor {
+    pub fn name(&self) -> String {
+        let len = self.name.iter().position(|c| *c == 0).unwrap_or(self.name.len());
+        String::from_utf16_lossy(&self.name[..len])
+    }
+}
+
+/// 最多保留的热区数量；界面按温度从高到低展示。
+pub const MAX_TEMPERATURE_SENSORS: usize = 4;
+
 /// P2 采集层与 P3 `app::Env` 之间的公共 DTO。先定好字段，避免后面改两遍。
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct MonitorSnapshot {
@@ -621,8 +638,10 @@ pub struct MonitorSnapshot {
     pub gpu_percent: Option<f32>,
     pub disk_percent: Option<f32>,
     pub cpu_mhz: Option<u32>,
-    /// ACPI 热区温度（摄氏度）；系统未提供读数时为 None。
+    /// 最热热区温度（摄氏度）；系统未提供读数时为 None。
     pub temperature_c: Option<f32>,
+    /// 全部可读取的热区，按温度从高到低排列；空位为 None。
+    pub temperature_sensors: [Option<TemperatureSensor>; MAX_TEMPERATURE_SENSORS],
     /// 全盘读写吞吐（MB/s），仪表盘「硬盘」卡片用。
     pub disk_read_mbps: Option<f32>,
     pub disk_write_mbps: Option<f32>,
@@ -776,6 +795,15 @@ impl Trend {
 
     pub fn clear(&mut self) {
         self.samples.clear();
+    }
+}
+
+/// 把 PDH 热区实例名（如 `\_tz.tz02`）转成简短的「热区 2」。
+pub fn thermal_zone_label(name: &str) -> String {
+    let digits: String = name.chars().rev().take_while(|c| c.is_ascii_digit()).collect::<Vec<_>>().into_iter().rev().collect();
+    match digits.parse::<u32>() {
+        Ok(index) if name.to_ascii_lowercase().contains("tz") => format!("热区 {index}"),
+        _ => "热区".to_string(),
     }
 }
 

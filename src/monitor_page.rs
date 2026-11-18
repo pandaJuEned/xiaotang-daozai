@@ -11,6 +11,7 @@
 use eframe::egui::{self, Color32, Shape, Stroke};
 
 use crate::app::{App, Env};
+use crate::monitor::MonitorSnapshot;
 use crate::paint::{Card, H};
 use crate::theme::{self, W};
 
@@ -29,10 +30,11 @@ const HAIR: Color32 = Color32::from_rgb(46, 46, 50);
 const LEFT: f32 = 42.0;
 const RIGHT: f32 = 376.0;
 
-/// 2×2 指标格的几何。
+/// 紧凑指标格的几何：三行两列，最后一行留给多路热区温度。
 const CELL_W: f32 = 104.0;
+const CELL_H: f32 = 24.0;
 const CELL_X: [f32; 2] = [160.0, 272.0];
-const CELL_Y: [f32; 2] = [36.0, 74.0];
+const CELL_Y: [f32; 3] = [30.0, 58.0, 86.0];
 
 fn load_color(v: f32) -> Color32 {
     if v < 40.0 {
@@ -68,6 +70,23 @@ fn brief(bps: u64) -> String {
 
 fn pct(v: Option<f32>) -> String {
     v.map(|x| format!("{x:.0}%")).unwrap_or_else(|| "--".into())
+}
+
+/// 两格温度：按热区温度降序取前两路，其余热区数在悬停提示里不展开。
+fn temperature_cells(m: &MonitorSnapshot) -> [(String, String, String, Color32); 2] {
+    let mut cells = [
+        ("温度 1".to_string(), "--".to_string(), String::new(), theme::DIM),
+        ("温度 2".to_string(), "--".to_string(), String::new(), theme::DIM),
+    ];
+    for (index, cell) in cells.iter_mut().enumerate() {
+        if let Some(sensor) = m.temperature_sensors.get(index).copied().flatten() {
+            let value = sensor.celsius.unwrap_or(0.0);
+            cell.1 = format!("{value:.0}°C");
+            cell.2 = crate::monitor::thermal_zone_label(&sensor.name());
+            cell.3 = load_color(value);
+        }
+    }
+    cells
 }
 
 fn state_text(cpu: Option<f32>) -> &'static str {
@@ -159,7 +178,7 @@ impl App {
         let machine = c.fit(&crate::monitor::machine_name(), 8.5, W::Regular, 72.0);
         c.text(LEFT + tw + 6.0, 104.0, &machine, 8.5, W::Regular, theme::DIM, H::Left);
 
-        /* ---------- 右侧 2×2 指标格 ---------- */
+        /* ---------- 右侧 3×2 指标格：常规四项 + 两路热区 ---------- */
         let mem_sub = format!(
             "{:.1}/{:.1}G",
             m.mem_used_bytes as f64 / 1_073_741_824.0,
@@ -169,25 +188,30 @@ impl App {
             (Some(r), Some(w)) => format!("读{r:.0}·写{w:.0}"),
             _ => "读写 --".to_string(),
         };
-        let cells: [(&str, String, String, Color32); 4] = [
-            ("内存", pct(m.mem_percent()), mem_sub, BLUE),
-            ("GPU", pct(m.gpu_percent), String::new(), GREEN),
-            ("硬盘", pct(m.disk_percent), disk_sub, PURPLE),
+        let mut cells: Vec<(String, String, String, Color32, Color32)> = vec![
+            ("内存".into(), pct(m.mem_percent()), mem_sub, BLUE, theme::WHITE),
+            ("GPU".into(), pct(m.gpu_percent), String::new(), GREEN, theme::WHITE),
+            ("硬盘".into(), pct(m.disk_percent), disk_sub, PURPLE, theme::WHITE),
             (
-                "网速",
+                "网速".into(),
                 format!("↓{}", brief(m.down_bps)),
                 format!("↑{}", brief(m.up_bps)),
                 CYAN,
+                theme::WHITE,
             ),
         ];
-        for (i, (label, value, sub, tint)) in cells.into_iter().enumerate() {
+        for (label, value, sub, tint) in temperature_cells(&m) {
+            cells.push((label, value, sub, tint, tint));
+        }
+        for (i, (label, value, sub, tint, value_color)) in cells.into_iter().enumerate() {
             let (x, y) = (CELL_X[i % 2], CELL_Y[i / 2]);
             c.painter
-                .rect_filled(c.rect(x, y, CELL_W, 34.0), 9.0, Color32::from_white_alpha(10));
-            c.text(x + 8.0, y + 13.0, label, 8.5, W::Regular, theme::DIM, H::Left);
-            c.text(x + 8.0, y + 30.0, &value, 13.0, W::Bold, theme::WHITE, H::Left);
+                .rect_filled(c.rect(x, y, CELL_W, CELL_H), 8.0, Color32::from_white_alpha(10));
+            c.text(x + 8.0, y + 8.0, &label, 8.0, W::Regular, theme::DIM, H::Left);
+            c.text(x + 8.0, y + 20.0, &value, 12.0, W::Bold, value_color, H::Left);
             if !sub.is_empty() {
-                c.text(x + CELL_W - 8.0, y + 30.0, &sub, 7.5, W::Regular, tint, H::Right);
+                let sub = c.fit(&sub, 7.0, W::Regular, 44.0);
+                c.text(x + CELL_W - 8.0, y + 20.0, &sub, 7.0, W::Regular, tint, H::Right);
             }
         }
 
