@@ -1,9 +1,96 @@
-use crate::{bar_layout::*,paint::{self,Card,H},theme::{self,W}};
+use crate::{bar_layout::*,monitor::MonitorSnapshot,paint::{self,Card,H},theme::{self,W}};
 use eframe::egui::{self,Color32,RichText,Rect,Pos2,Vec2};
 
-pub(crate) fn preview_layout(order:&[usize],quotas:usize,weather:bool)->Layout {
-    let mut layout=Layout::new(true,quotas.max(1),true,true,false,true,weather);
+pub(crate) fn preview_layout(order:&[usize],quotas:usize,weather:bool,status:StatusSlots)->Layout {
+    let mut layout=Layout::with_status_slots(true,quotas.max(1),true,true,false,true,weather,status);
     layout.reorder(order);layout
+}
+
+/// 状态组件是否已有可显示的数据。`placeholder=true` 时只按开关决定是否预览占位，
+/// 这样设置页能直接看到每个已开启组件排在什么位置。
+fn status_enabled(settings:&crate::model::Settings,slot:usize)->bool {
+    match slot {
+        NETSPEED=>settings.show_net_speed,
+        COURSE=>settings.show_course,
+        CALENDAR=>settings.show_calendar_status,
+        CPU_INFO=>settings.show_cpu,
+        GPU_INFO=>settings.show_gpu,
+        MEMORY_INFO=>settings.show_memory,
+        DISK_INFO=>settings.show_disk,
+        _=>false,
+    }
+}
+
+fn percent_label(value:Option<f32>,placeholder:bool)->String {
+    match value {
+        Some(value)=>format!("{:.0}%",value.clamp(0.0,100.0)),
+        None if placeholder=>"--".into(),
+        None=>String::new(),
+    }
+}
+
+impl crate::app::App {
+    /// 把设置开关和实际数据合并成布局用的末尾槽；预览模式只先看开关。
+    pub(crate) fn resident_status_slots(&self,monitor:Option<&MonitorSnapshot>,now:i64,placeholder:bool)->StatusSlots {
+        let available=|slot:usize|match slot {
+            NETSPEED=>monitor.is_some(),
+            COURSE=>self.nos_next_course(now).is_some(),
+            CALENDAR=>self.current_calendar_event(now).is_some(),
+            CPU_INFO=>monitor.is_some_and(|m|m.cpu_percent.is_some()),
+            GPU_INFO=>monitor.is_some_and(|m|m.gpu_percent.is_some()),
+            MEMORY_INFO=>monitor.is_some_and(|m|m.mem_percent().is_some()),
+            DISK_INFO=>monitor.is_some_and(|m|m.disk_percent.is_some()),
+            _=>false,
+        };
+        let enabled=|slot:usize|status_enabled(&self.settings,slot)&&(placeholder||available(slot));
+        StatusSlots {net:enabled(NETSPEED),course:enabled(COURSE),calendar:enabled(CALENDAR),cpu:enabled(CPU_INFO),gpu:enabled(GPU_INFO),memory:enabled(MEMORY_INFO),disk:enabled(DISK_INFO)}
+    }
+
+    /// 末尾状态组件的紧凑文案；`placeholder=true` 时即使没有数据也给出占位文字。
+    pub(crate) fn resident_status_text(&self,slot:usize,monitor:Option<&MonitorSnapshot>,now:i64,placeholder:bool)->String {
+        match slot {
+            NETSPEED=>match monitor {
+                Some(m)=>{
+                    let mut style=self.monitor_cfg.display;
+                    style.short_mode=true;style.space=false;
+                    format!("↓{} ↑{}",crate::monitor::format_speed(m.down_bps,&style),crate::monitor::format_speed(m.up_bps,&style))
+                },
+                None if placeholder=>"↓-- ↑--".into(),
+                None=>String::new(),
+            },
+            COURSE=>match self.nos_next_course(now) {
+                Some(event)=>{
+                    let clock=crate::nos::clock_label(&event.start_time);
+                    if clock.is_empty(){event.title.clone()}else{format!("{clock} {}",event.title)}
+                },
+                None if placeholder=>"--:-- --".into(),
+                None=>String::new(),
+            },
+            CALENDAR=>match self.current_calendar_event(now) {
+                Some(event)=>format!("进行中 · {}",event.title),
+                None if placeholder=>"进行中 · --".into(),
+                None=>String::new(),
+            },
+            CPU_INFO=>{let value=percent_label(monitor.and_then(|m|m.cpu_percent),placeholder);if value.is_empty(){value}else{format!("CPU {value}")}},
+            GPU_INFO=>{let value=percent_label(monitor.and_then(|m|m.gpu_percent),placeholder);if value.is_empty(){value}else{format!("GPU {value}")}},
+            MEMORY_INFO=>{let value=percent_label(monitor.and_then(|m|m.mem_percent()),placeholder);if value.is_empty(){value}else{format!("内存 {value}")}},
+            DISK_INFO=>{let value=percent_label(monitor.and_then(|m|m.disk_percent),placeholder);if value.is_empty(){value}else{format!("硬盘 {value}")}},
+            _=>String::new(),
+        }
+    }
+
+    fn resident_status_data_available(&self,slot:usize,monitor:Option<&MonitorSnapshot>,now:i64)->bool {
+        match slot {
+            NETSPEED=>monitor.is_some(),
+            COURSE=>self.nos_next_course(now).is_some(),
+            CALENDAR=>self.current_calendar_event(now).is_some(),
+            CPU_INFO=>monitor.is_some_and(|m|m.cpu_percent.is_some()),
+            GPU_INFO=>monitor.is_some_and(|m|m.gpu_percent.is_some()),
+            MEMORY_INFO=>monitor.is_some_and(|m|m.mem_percent().is_some()),
+            DISK_INFO=>monitor.is_some_and(|m|m.disk_percent.is_some()),
+            _=>false,
+        }
+    }
 }
 
 impl crate::app::App {
@@ -19,7 +106,9 @@ impl crate::app::App {
         ui.add_space(12.0);
         let indices=self.quota_bar_indices();let count=indices.len();
         let weather_snapshot=self.weather_pill().cloned();
-        let mut layout=preview_layout(&order,count,weather_snapshot.is_some());
+        let now=chrono::Local::now().timestamp();
+        let status=self.resident_status_slots(self.monitor_last.as_ref(),now,true);
+        let mut layout=preview_layout(&order,count,weather_snapshot.is_some(),status);
         for (position,extra) in self.quota_balance_layout(ui.ctx()){layout.balance_tail(position,extra);}
         if self.settings.clock_period!=0 { layout.widen_clock(40.0); }
         if let Some(extra)=self.weather_pill_extra(ui.ctx()){layout.widen(WEATHER,extra);}
@@ -69,7 +158,7 @@ impl crate::app::App {
             let dx=if is_dragged{pointer.map(|p|((p.x-origin.x)/scale-(left+width/2.0)).clamp(-left,layout.width-left-width)).unwrap_or(0.0)}else{0.0};
             if is_dragged {ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);}
             else if response.hovered(){ui.painter().rect_filled(rect,6.0,Color32::from_white_alpha(18));}
-            let active=match slot{BATTERY=>self.settings.show_battery&&self.resident_power.0.is_some(),PET=>self.settings.pet,QUOTA=>count>0,MUSIC=>self.media.is_music(),FOCUS=>self.pomo.running,_=>true};
+            let active=match slot{BATTERY=>self.settings.show_battery&&self.resident_power.0.is_some(),PET=>self.settings.pet,QUOTA=>self.settings.show_quota&&count>0,MUSIC=>self.media.is_music(),FOCUS=>self.pomo.running,_=>true};
             let c=card.shifted(dx,0.0).faded(if active||is_dragged{1.0}else{0.38}).ghost();
             match slot{
                 BATTERY=>paint::battery(&c,x,15.0,self.resident_power.0,self.resident_power.1,1.0),
@@ -89,6 +178,19 @@ impl crate::app::App {
             if is_dragged {ui.painter().line_segment([Pos2::new(rect.center().x,body.bottom()+6.0),Pos2::new(rect.center().x,body.bottom()+12.0)],egui::Stroke::new(2.0,theme::BLUE));}
             response.on_hover_text(label(slot));
         }
+        // 末尾状态槽与设置页「状态组件」一一对应，按列表顺序展示；无数据时用灰色占位。
+        let tail_label=|slot|match slot{NETSPEED=>"网速",COURSE=>"下一节课",CALENDAR=>"进行中日程",CPU_INFO=>"CPU 信息",GPU_INFO=>"GPU 信息",MEMORY_INFO=>"内存信息",DISK_INFO=>"硬盘信息",_=>"状态组件"};
+        for &slot in STATUS_TAIL_ORDER.iter() {
+            let Some(x)=layout.x[slot] else {continue;};
+            let width=layout.widths[slot];
+            let rect=card.rect(cx+x-width/2.0-3.0,1.0,width+6.0,28.0);
+            let active=self.resident_status_data_available(slot,self.monitor_last.as_ref(),now);
+            let c=card.faded(if active{1.0}else{0.38}).ghost();
+            let text=self.resident_status_text(slot,self.monitor_last.as_ref(),now,true);
+            let size=if matches!(slot,CPU_INFO|GPU_INFO|MEMORY_INFO|DISK_INFO){11.0}else{12.0};
+            c.text(cx+x,21.0,&text,size,W::Bold,theme::WHITE,H::Center);
+            ui.interact(rect,ui.id().with(("resident-status",slot)),egui::Sense::hover()).on_hover_text(tail_label(slot));
+        }
         if let Some(palette)=self.skin_palette() {
             let end=crate::skin_paint::shape_count(ui.ctx(),ui.layer_id());
             crate::skin_paint::recolor_layer(ui.ctx(),ui.layer_id(),&[(content_from,end)],&palette);
@@ -98,6 +200,6 @@ impl crate::app::App {
         }
         ui.painter().text(Pos2::new(stage.center().x,stage.bottom()-22.0),egui::Align2::CENTER_CENTER,"按住图标左右拖动",theme::font(11.0,W::Regular),Color32::from_gray(160));
         ui.add_space(8.0);
-        ui.label(RichText::new("灰色图标为暂未显示的组件；位置会保留。").size(11.0).color(ui.visuals().weak_text_color()));
+        ui.label(RichText::new("灰色图标为暂未显示的组件；位置会保留。网速及之后的组件按下方列表顺序排在末尾。").size(11.0).color(ui.visuals().weak_text_color()));
     }
 }

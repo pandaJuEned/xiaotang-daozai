@@ -1374,6 +1374,14 @@ impl App {
                             setting_row(ui,"AI 余额","收起时显示已常驻账号的额度环；关闭后 AI 额度页仍正常",&mut self.settings.show_quota);
                             ui.separator();
                             setting_row(ui,"进行中日程","收起时显示当前正在进行的日程标题；无进行中日程时自动隐藏",&mut self.settings.show_calendar_status);
+                            ui.separator();
+                            setting_row(ui,"CPU 信息","收起时显示实时 CPU 占用；无监控数据时自动隐藏",&mut self.settings.show_cpu);
+                            ui.separator();
+                            setting_row(ui,"GPU 信息","收起时显示实时 GPU 占用；无监控数据时自动隐藏",&mut self.settings.show_gpu);
+                            ui.separator();
+                            setting_row(ui,"内存信息","收起时显示实时内存占用率；无监控数据时自动隐藏",&mut self.settings.show_memory);
+                            ui.separator();
+                            setting_row(ui,"硬盘信息","收起时显示实时硬盘占用率；无监控数据时自动隐藏",&mut self.settings.show_disk);
                         });
                         settings_label(ui,"功能页面");
                         settings_card(ui,|ui|{
