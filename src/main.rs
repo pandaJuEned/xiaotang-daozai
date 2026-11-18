@@ -846,6 +846,11 @@ impl eframe::App for Shell {
         for cmd in out.cmds {
             match cmd {
                 Cmd::Media(t) => {
+                    // WebDAV 曲库由岛仔自己出声，控制指令先交给它；没在放才走系统播放器。
+                    if self.app.local_transport(&t) {
+                        ctx.request_repaint();
+                        continue;
+                    }
                     self.media_fast_until=Some(Instant::now()+Duration::from_secs(3));self.media_enabled.set_interval(smtc::POLL_FAST);
                     let source=self.media.lock().map(|media|media.source.clone()).unwrap_or_default();
                     let message=if source.eq_ignore_ascii_case("cloudmusic.exe"){"网易云暂未适配进度跳转，请在客户端调整"}
@@ -858,6 +863,10 @@ impl eframe::App for Shell {
                     }
                 }
                 Cmd::MusicVolume(command,source)=>{
+                    if self.app.local_transport(&command) {
+                        ctx.request_repaint();
+                        continue;
+                    }
                     self.media_fast_until=Some(Instant::now()+Duration::from_secs(3));self.media_enabled.set_interval(smtc::POLL_FAST);
                     if self.media_control.is_none(){self.media_control=smtc::ControlWorker::start(ctx.clone());}
                     match self.media_control.as_ref().ok_or(()).and_then(|worker|worker.submit(command,source.clone())){

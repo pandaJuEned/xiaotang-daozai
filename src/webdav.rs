@@ -180,6 +180,46 @@ pub fn is_audio(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// 从文件名拆「作者 / 曲名」：`陈奕迅-十年 (Live).mp3` → `("陈奕迅", "十年 (Live)")`。
+///
+/// 拆分只为在岛上和播放条上显示得好看，拆不出来时作者留空，由调用方兜底；
+/// 曲名一定非空（最差就是去掉扩展名的原名）。
+pub fn split_name(name: &str) -> (String, String) {
+    let stem = Path::new(name)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or(name)
+        .trim();
+    let stem = strip_track_number(stem);
+    for separator in [" - ", " – ", " — ", "-", "–", "—", "_"] {
+        if let Some((left, right)) = stem.split_once(separator) {
+            let (left, right) = (left.trim(), right.trim());
+            if !left.is_empty() && !right.is_empty() {
+                return (left.to_string(), right.to_string());
+            }
+        }
+    }
+    (String::new(), stem.trim().to_string())
+}
+
+/// 去掉「01 - 」「03.」这类序号前缀；「1984」这种纯数字曲名要完整留下。
+fn strip_track_number(stem: &str) -> &str {
+    let digits = stem.chars().take_while(char::is_ascii_digit).count();
+    if digits == 0 || digits > 3 {
+        return stem;
+    }
+    let rest = stem[digits..].trim_start();
+    for prefix in ['-', '.', '_', '、'] {
+        if let Some(after) = rest.strip_prefix(prefix) {
+            let after = after.trim_start();
+            if !after.is_empty() {
+                return after;
+            }
+        }
+    }
+    stem
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Entry {
     /// 显示名（已做百分号解码）。
@@ -504,8 +544,23 @@ mod tests {
     }
 
     #[test]
-    fn audio_extensions_are_case_insensitive() {
-        for name in ["a.mp3", "b.FLAC", "c.wav", "d.Ogg", "e.m4a"] {
+    fn track_names_split_into_artist_and_title() {
+        assert_eq!(
+            split_name("陈奕迅-十年 (电影《摆渡人》插曲).mp3"),
+            ("陈奕迅".to_string(), "十年 (电影《摆渡人》插曲)".to_string())
+        );
+        assert_eq!(split_name("周深 - 化身孤岛的鲸.flac"), ("周深".into(), "化身孤岛的鲸".into()));
+        // 序号前缀要去掉，纯数字曲名要留下。
+        assert_eq!(split_name("01 - 菊花台.mp3"), (String::new(), "菊花台".into()));
+        assert_eq!(split_name("03.晴天.flac"), (String::new(), "晴天".into()));
+        assert_eq!(split_name("1984.mp3"), (String::new(), "1984".into()));
+        // 没有分隔符时整名当曲名。
+        assert_eq!(split_name("Kirsty刘瑾睿 - 若把你.mp3"), ("Kirsty刘瑾睿".into(), "若把你".into()));
+        assert_eq!(split_name("未知曲目.wav"), (String::new(), "未知曲目".into()));
+    }
+
+    #[test]
+    fn audio_extensions_are_case_insensitive() {        for name in ["a.mp3", "b.FLAC", "c.wav", "d.Ogg", "e.m4a"] {
             assert!(is_audio(name), "{name}");
         }
         for name in ["cover.jpg", "notes.txt", "noext", "x.mp3.part"] {

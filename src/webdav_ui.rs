@@ -9,6 +9,7 @@ use eframe::egui::{self, Color32, RichText};
 
 use crate::app::App;
 use crate::extras::{settings_card, settings_control_row, settings_hint, settings_label};
+use crate::settings_theme::color as settings_color;
 use crate::webdav::{self, Entry};
 
 enum Msg {
@@ -34,6 +35,8 @@ pub struct Ui {
     pub loaded: bool,
     /// 拖动进度条期间的临时值；松手才真正跳转。
     pub draft: Option<f64>,
+    /// 拖动音量条期间的临时值；松手后回到播放器的实际音量。
+    pub volume_draft: Option<u8>,
     tx: Option<mpsc::Sender<Msg>>,
     rx: Option<mpsc::Receiver<Msg>>,
     #[cfg(windows)]
@@ -58,6 +61,7 @@ impl Default for Ui {
             error: None,
             loaded: false,
             draft: None,
+            volume_draft: None,
             tx: None,
             rx: None,
             #[cfg(windows)]
@@ -364,56 +368,126 @@ impl App {
         }
         #[cfg(windows)]
         {
+            use crate::webdav_player::Status;
+
             let Some(engine) = &self.webdav.engine else { return };
             let state = engine.snapshot();
             let Some(track) = state.current().cloned() else { return };
+            let (artist, title) = crate::webdav::split_name(&track.name);
+            let title = if title.is_empty() { track.name.clone() } else { title };
+            let artist = if artist.is_empty() { "WebDAV 音乐".to_string() } else { artist };
+
+            // 控制指令攒到卡片画完再发：闭包里同时读写 self.webdav 的其他字段。
+            let mut toggle = false;
+            let mut previous = false;
+            let mut next = false;
+            let mut seek = None;
+            let mut volume = None;
+            let mut draft_volume = self.webdav.volume_draft.unwrap_or(state.volume);
+
             settings_label(ui, "正在播放");
             settings_card(ui, |ui| {
+                let ctx = ui.ctx().clone();
+                let dark = ctx.style().visuals.dark_mode;
+                let strong = settings_color(&ctx, Color32::from_gray(240), Color32::from_gray(28));
+                let weak = settings_color(&ctx, Color32::from_gray(158), Color32::from_gray(112));
+
                 ui.horizontal(|ui| {
-                    ui.add(egui::Label::new(RichText::new(&track.name).size(12.5).strong()).truncate());
+                    let (cover, _) = ui.allocate_exact_size(egui::vec2(44.0, 44.0), egui::Sense::hover());
+                    draw_cover(ui.painter(), cover, &title);
+                    ui.add_space(11.0);
+                    // 先量好右侧三个圆钮要占多宽，再让标题用剩下的宽度，
+                    // 否则长文件名会把按钮挤出卡片。
+                    let buttons = 30.0 + 36.0 + 30.0 + ui.spacing().item_spacing.x * 2.0;
+                    let text_width = (ui.available_width() - buttons - 10.0).max(70.0);
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(text_width, 44.0),
+                        egui::Layout::top_down(egui::Align::LEFT),
+                        |ui| {
+                            ui.spacing_mut().item_spacing.y = 3.0;
+                            ui.add(
+                                egui::Label::new(RichText::new(&title).size(13.5).strong().color(strong)).truncate(),
+                            );
+                            let (line, color) = match &state.status {
+                                Status::Downloading(progress) => {
+                                    (format!("正在下载 {:.0}% · {artist}", progress * 100.0), weak)
+                                }
+                                Status::Error(error) => (error.clone(), Color32::from_rgb(214, 92, 72)),
+                                _ => (artist.clone(), weak),
+                            };
+                            ui.add(egui::Label::new(RichText::new(line).size(11.0).color(color)).truncate());
+                        },
+                    );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("下一首").clicked() {
-                            engine.next();
+                        if transport_button(ui, 30.0, Glyph::Next, false, "下一首").clicked() {
+                            next = true;
                         }
-                        if ui.button(if state.playing() { "暂停" } else { "播放" }).clicked() {
-                            engine.toggle();
+                        let tip = if state.playing() { "暂停" } else { "播放" };
+                        let glyph = if state.playing() { Glyph::Pause } else { Glyph::Play };
+                        if transport_button(ui, 36.0, glyph, true, tip).clicked() {
+                            toggle = true;
                         }
-                        if ui.button("上一首").clicked() {
-                            engine.prev();
+                        if transport_button(ui, 30.0, Glyph::Prev, false, "上一首").clicked() {
+                            previous = true;
                         }
                     });
                 });
-                match &state.status {
-                    crate::webdav_player::Status::Downloading(progress) => {
-                        ui.add(egui::ProgressBar::new(*progress).text(format!("下载中 {:.0}%", progress * 100.0)));
-                    }
-                    crate::webdav_player::Status::Error(error) => {
-                        let error = error.clone();
-                        ui.add(egui::Label::new(RichText::new(error).size(12.0).color(Color32::from_rgb(196, 84, 62))).wrap());
-                    }
-                    _ => {}
-                }
+
+                ui.add_space(9.0);
                 let duration = state.duration.max(0.1);
-                let mut position = self.webdav.draft.unwrap_or(state.position).clamp(0.0, duration);
-                let response = ui.add(egui::Slider::new(&mut position, 0.0..=duration).show_value(false));
-                if response.dragged() {
-                    self.webdav.draft = Some(position);
+                let shown = self.webdav.draft.unwrap_or_else(|| state.live_position()).clamp(0.0, duration);
+                let width = ui.available_width();
+                let (bar, fraction) = slide_bar(ui, width, (shown / duration) as f32, 14.0, dark);
+                if bar.is_pointer_button_down_on() || bar.dragged() {
+                    self.webdav.draft = Some((fraction as f64 * duration).clamp(0.0, duration));
                 }
-                if response.drag_stopped() {
-                    let target = self.webdav.draft.take().unwrap_or(position);
-                    engine.seek(target);
+                if bar.clicked() || bar.drag_stopped() {
+                    seek = Some((fraction as f64 * duration).clamp(0.0, duration));
+                    self.webdav.draft = None;
                 }
+                let shown = self.webdav.draft.unwrap_or(shown);
+                ui.add_space(1.0);
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(format!("{} / {}", mmss(state.position), mmss(state.duration))).size(11.0));
+                    ui.label(RichText::new(mmss(shown)).size(11.0).color(weak));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let mut volume = state.volume;
-                        if ui.add(egui::Slider::new(&mut volume, 0..=100).show_value(false)).changed() {
-                            engine.volume(volume);
-                        }
-                        ui.label(RichText::new("音量").size(11.0));
+                        ui.label(RichText::new(mmss(duration)).size(11.0).color(weak));
                     });
+                });
+
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("音量").size(11.0).color(weak));
+                    let (bar, fraction) = slide_bar(ui, 96.0, draft_volume as f32 / 100.0, 12.0, dark);
+                    if bar.is_pointer_button_down_on() || bar.dragged() {
+                        draft_volume = (fraction * 100.0).round().clamp(0.0, 100.0) as u8;
+                        self.webdav.volume_draft = Some(draft_volume);
+                        volume = Some(draft_volume);
+                    }
+                    if bar.drag_stopped() {
+                        self.webdav.volume_draft = None;
+                    }
+                    ui.label(RichText::new(format!("{draft_volume}%")).size(11.0).color(weak));
                 });
             });
+
+            if previous {
+                engine.prev();
+            }
+            if toggle {
+                engine.toggle();
+            }
+            if next {
+                engine.next();
+            }
+            if let Some(position) = seek {
+                engine.seek(position);
+            }
+            if let Some(level) = volume {
+                engine.volume(level);
+            }
+            if seek.is_some() || volume.is_some() || toggle || previous || next {
+                ui.ctx().request_repaint();
+            }
         }
     }
 }
@@ -450,6 +524,131 @@ fn short_path(url: &str) -> String {
     let segments: Vec<_> = parsed.path().split('/').filter(|part| !part.is_empty()).collect();
     let tail = segments.iter().rev().take(2).rev().cloned().collect::<Vec<_>>().join("/");
     format!("{} / {}", parsed.host_str().unwrap_or(""), tail)
+}
+
+/* ---------------- 播放条绘制 ---------------- */
+
+#[derive(Clone, Copy, PartialEq)]
+enum Glyph {
+    Prev,
+    Play,
+    Pause,
+    Next,
+}
+
+/// 封面占位：用曲名生成稳定配色，和岛上没有封面时的色块是同一种颜色语言。
+fn draw_cover(painter: &egui::Painter, rect: egui::Rect, title: &str) {
+    let (top, _bottom) = crate::pages::cover_colors(title);
+    painter.rect_filled(rect, 10.0, top);
+    painter.rect_stroke(
+        rect,
+        10.0,
+        egui::Stroke::new(1.0, Color32::from_white_alpha(30)),
+        egui::StrokeKind::Inside,
+    );
+    painter.text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        "♪",
+        egui::FontId::proportional(20.0),
+        Color32::from_white_alpha(225),
+    );
+}
+
+/// 圆形按钮：播放键是实心主按钮，上一首/下一首悬停时才浮出圆底。
+fn transport_button(ui: &mut egui::Ui, size: f32, glyph: Glyph, primary: bool, tip: &str) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::click());
+    let dark = ui.ctx().style().visuals.dark_mode;
+    let hovered = response.hovered();
+    let painter = ui.painter();
+    if primary {
+        let fill = if dark { Color32::from_gray(238) } else { Color32::from_gray(32) };
+        let ink = if dark { Color32::from_gray(26) } else { Color32::WHITE };
+        painter.circle_filled(rect.center(), size * 0.5, fill);
+        // 三角形重心偏左，向右挪半像素看起来才居中。
+        let offset = if glyph == Glyph::Play { egui::vec2(0.7, 0.0) } else { egui::Vec2::ZERO };
+        draw_glyph(painter, rect.center() + offset, size * 0.42, glyph, ink);
+    } else {
+        if hovered {
+            let background = if dark { Color32::from_white_alpha(22) } else { Color32::from_black_alpha(14) };
+            painter.circle_filled(rect.center(), size * 0.5, background);
+        }
+        let ink = if dark { Color32::from_gray(228) } else { Color32::from_gray(48) };
+        draw_glyph(painter, rect.center(), size * 0.5, glyph, ink);
+    }
+    response.on_hover_text(tip)
+}
+
+fn draw_glyph(painter: &egui::Painter, center: egui::Pos2, size: f32, glyph: Glyph, color: Color32) {
+    let half = size * 0.5;
+    match glyph {
+        Glyph::Play => {
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    center + egui::vec2(-half * 0.52, -half),
+                    center + egui::vec2(-half * 0.52, half),
+                    center + egui::vec2(half * 0.74, 0.0),
+                ],
+                color,
+                egui::Stroke::NONE,
+            ));
+        }
+        Glyph::Pause => {
+            let bar = egui::vec2(half * 0.30, half * 1.05);
+            painter.rect_filled(egui::Rect::from_center_size(center + egui::vec2(-half * 0.26, 0.0), bar), 1.4, color);
+            painter.rect_filled(egui::Rect::from_center_size(center + egui::vec2(half * 0.26, 0.0), bar), 1.4, color);
+        }
+        Glyph::Prev | Glyph::Next => {
+            let direction = if glyph == Glyph::Prev { -1.0 } else { 1.0 };
+            let height = half * 0.78;
+            let width = half * 0.72;
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    center + egui::vec2(direction * width, 0.0),
+                    center + egui::vec2(-direction * width * 0.12, -height),
+                    center + egui::vec2(-direction * width * 0.12, height),
+                ],
+                color,
+                egui::Stroke::NONE,
+            ));
+            painter.rect_filled(
+                egui::Rect::from_center_size(
+                    center + egui::vec2(direction * (width + 1.5), 0.0),
+                    egui::vec2(2.2, height * 2.0),
+                ),
+                1.1,
+                color,
+            );
+        }
+    }
+}
+
+/// 细进度条：拖动时直接返回 0..1 的位置，松手由调用方决定是否跳转。
+fn slide_bar(ui: &mut egui::Ui, width: f32, fraction: f32, height: f32, dark: bool) -> (egui::Response, f32) {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click_and_drag());
+    let painter = ui.painter();
+    let thickness = 4.0;
+    let track = egui::Rect::from_center_size(rect.center(), egui::vec2(rect.width(), thickness));
+    let base = if dark { Color32::from_gray(64) } else { Color32::from_gray(205) };
+    let accent = if dark { Color32::from_gray(240) } else { Color32::from_gray(34) };
+    painter.rect_filled(track, thickness * 0.5, base);
+    let mut fraction = fraction.clamp(0.0, 1.0);
+    let active = response.is_pointer_button_down_on() || response.dragged();
+    if active {
+        if let Some(pointer) = response.interact_pointer_pos() {
+            fraction = ((pointer.x - track.left()) / track.width()).clamp(0.0, 1.0);
+        }
+    }
+    if fraction > 0.0 {
+        let filled_width = (track.width() * fraction).max(thickness);
+        let filled = egui::Rect::from_min_size(track.left_top(), egui::vec2(filled_width, thickness));
+        painter.rect_filled(filled, thickness * 0.5, accent);
+    }
+    if active || response.hovered() {
+        let head = egui::pos2(track.left() + track.width() * fraction, track.center().y);
+        painter.circle_filled(head, 5.5, accent);
+    }
+    (response, fraction)
 }
 
 #[cfg(test)]

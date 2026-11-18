@@ -46,6 +46,10 @@ pub struct State {
     pub position: f64,
     pub duration: f64,
     pub volume: u8,
+    /// 音量条上的静音开关：静音时音量值保留，恢复后回到原音量。
+    pub muted: bool,
+    /// `position` 的采样时刻：两次回写之间按它外推，进度条才不会一跳一跳。
+    pub sampled_at: Option<Instant>,
 }
 
 impl State {
@@ -56,6 +60,17 @@ impl State {
     pub fn playing(&self) -> bool {
         matches!(self.status, Status::Playing)
     }
+
+    /// 播放中按采样时刻外推的位置；暂停、下载或出错时就是采样值本身。
+    pub fn live_position(&self) -> f64 {
+        let elapsed = if self.playing() {
+            self.sampled_at.map_or(0.0, |at| at.elapsed().as_secs_f64())
+        } else {
+            0.0
+        };
+        let position = self.position + elapsed;
+        if self.duration > 0.0 { position.min(self.duration) } else { position }
+    }
 }
 
 enum Cmd {
@@ -65,6 +80,7 @@ enum Cmd {
     Prev,
     Seek(f64),
     Volume(u8),
+    Mute(bool),
     Stop,
 }
 
@@ -130,6 +146,10 @@ impl Engine {
 
     pub fn volume(&self, volume: u8) {
         let _ = self.tx.send(Cmd::Volume(volume));
+    }
+
+    pub fn mute(&self, muted: bool) {
+        let _ = self.tx.send(Cmd::Mute(muted));
     }
 }
 
@@ -225,6 +245,7 @@ fn run(
         if let Ok(mut current) = state.lock() {
             if matches!(current.status, Status::Playing | Status::Paused) {
                 current.position = player.get_pos().as_secs_f64();
+                current.sampled_at = Some(Instant::now());
                 let playing = !player.is_paused();
                 current.status = if playing { Status::Playing } else { Status::Paused };
             }
@@ -283,18 +304,31 @@ fn handle(
             if player.try_seek(Duration::from_secs_f64(position)).is_ok() {
                 if let Ok(mut current) = state.lock() {
                     current.position = position;
+                    current.sampled_at = Some(Instant::now());
                 }
             }
         }
         Cmd::Volume(volume) => {
-            let volume = volume.min(100);
-            player.set_volume(volume as f32 / 100.0);
             if let Ok(mut current) = state.lock() {
-                current.volume = volume;
+                current.volume = volume.min(100);
             }
+            apply_volume(player, state);
+        }
+        Cmd::Mute(muted) => {
+            if let Ok(mut current) = state.lock() {
+                current.muted = muted;
+            }
+            apply_volume(player, state);
         }
     }
     true
+}
+
+/// 把快照里的音量与静音状态应用到播放器。
+fn apply_volume(player: &rodio::Player, state: &Arc<Mutex<State>>) {
+    if let Ok(current) = state.lock() {
+        player.set_volume(if current.muted { 0.0 } else { current.volume as f32 / 100.0 });
+    }
 }
 
 /// 切到指定下标：下载 → 解码 → 播放。
@@ -314,6 +348,7 @@ fn move_to(
         current.current = Some(track.clone());
         current.position = 0.0;
         current.duration = 0.0;
+        current.sampled_at = Some(Instant::now());
     }
     session.loaded = None;
     player.stop();
@@ -355,6 +390,7 @@ fn move_to(
     if let Ok(mut current) = state.lock() {
         current.duration = duration;
         current.position = 0.0;
+        current.sampled_at = Some(Instant::now());
     }
     player.append(source);
     player.play();

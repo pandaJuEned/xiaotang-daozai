@@ -20,7 +20,7 @@ fn mmss(secs: f64) -> String {
 }
 
 /// 由标题生成稳定的封面渐变色。
-fn cover_colors(title: &str) -> (Color32, Color32) {
+pub(crate) fn cover_colors(title: &str) -> (Color32, Color32) {
     let mut h: u64 = 1469598103934665603;
     for b in title.bytes() {
         h = (h ^ b as u64).wrapping_mul(1099511628211);

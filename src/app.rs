@@ -3163,9 +3163,74 @@ impl App {
         }
     }
 
+    /// WebDAV 曲库是岛仔自己出声，系统媒体会话（SMTC）里没有它的条目。
+    /// 把它现有的状态映射成一条 `NowPlaying`，岛上的封面、歌词、进度和音量
+    /// 才能跟其他播放器一样显示；没在播放时返回 `None`，交回系统会话。
+    pub(crate) fn local_now_playing(&self) -> Option<NowPlaying> {
+        #[cfg(windows)]
+        {
+            use crate::webdav_player::Status;
+            let state = self.webdav.engine.as_ref()?.snapshot();
+            let track = state.current()?;
+            if matches!(state.status, Status::Idle | Status::Error(_)) {
+                return None;
+            }
+            let (artist, title) = crate::webdav::split_name(&track.name);
+            let title = if title.is_empty() { track.name.clone() } else { title };
+            let artist = if artist.is_empty() { "WebDAV 音乐".to_string() } else { artist };
+            Some(NowPlaying {
+                title,
+                artist,
+                album: String::new(),
+                // 用独立来源名：歌词查询与音量通道据此区分，不会当成系统播放器。
+                source: "Daozai.WebDav".into(),
+                song_id: None,
+                playing: matches!(state.status, Status::Playing),
+                position: state.live_position(),
+                sampled_at: None,
+                event_time_ms: None,
+                duration: state.duration,
+                artwork: None,
+                playback_type: crate::smtc::MediaKind::Music,
+                volume: Some((state.volume as u32, state.muted)),
+            })
+        }
+        #[cfg(not(windows))]
+        {
+            None
+        }
+    }
+
+    /// 岛上与音乐页的播放控制：WebDAV 出声时改为控制它自己，返回 true 表示已处理。
+    pub fn local_transport(&mut self, command: &Transport) -> bool {
+        #[cfg(windows)]
+        {
+            if self.local_now_playing().is_none() {
+                return false;
+            }
+            let Some(engine) = self.webdav.engine.as_ref() else { return false };
+            match command {
+                Transport::Toggle => engine.toggle(),
+                Transport::Next => engine.next(),
+                Transport::Prev => engine.prev(),
+                Transport::Seek(position) => engine.seek(*position),
+                Transport::SetVolume(volume) => engine.volume(*volume as u8),
+                Transport::SetMute(muted) => engine.mute(*muted),
+            }
+            self.webdav.draft = None;
+            true
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = command;
+            false
+        }
+    }
+
     /// 媒体进度在两次 SMTC 刷新之间按时间外推，进度条才会连续走动。
     fn update_media(&mut self, env: &Env, ctx: &egui::Context) {
-        let m = &env.media;
+        let local = self.local_now_playing();
+        let m = local.as_ref().unwrap_or(&env.media);
         if !m.is_music() {
             self.music_volume_ui=None;
             self.music_volume_quiet_until=0.0;
