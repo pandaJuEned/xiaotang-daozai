@@ -242,6 +242,19 @@ fn nos_breaks_join_the_calendar_in_grey_without_taking_the_featured_slot(){
     assert_eq!(text,"课间 5′","常驻栏课间显示倒计时：{text}");
     assert_eq!(h.app.resident_status_text(crate::bar_layout::COURSE,None,now+600,false),"11:00 信号与系统",
         "课间结束后回到「下一节课」");
+
+    // 长空档（超过 60 分钟）仍算课间事件，但常驻栏不倒计时 ——
+    // 否则午休那种几小时的空档会把「下一节课」从中午一直盖到晚上。
+    h.app.set_nos_agenda(crate::nos::Agenda{
+        semesters:vec![],
+        events:vec![
+            event("br2","break","课间休息","12:00","14:30"),
+            event("c2","course","数字电路","15:00","15:45"),
+        ],at:0});
+    let noon=crate::nos::wall_clock(&today,"13:00").expect("今天 13:00");
+    assert!(h.app.nos_current_break(noon).is_some(),"长空档仍是一条课间事件");
+    assert_eq!(h.app.resident_status_text(crate::bar_layout::COURSE,None,noon,false),"15:00 数字电路",
+        "长空档应显示下一节课，而不是几小时的课间倒计时");
 }
 
 #[test]

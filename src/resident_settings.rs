@@ -35,7 +35,7 @@ impl crate::app::App {
     pub(crate) fn resident_status_slots(&self,monitor:Option<&MonitorSnapshot>,now:i64,placeholder:bool)->StatusSlots {
         let available=|slot:usize|match slot {
             NETSPEED=>monitor.is_some(),
-            COURSE=>self.nos_current_break(now).is_some()||self.nos_next_course(now).is_some(),
+            COURSE=>self.nos_break_countdown(now).is_some()||self.nos_next_course(now).is_some(),
             CALENDAR=>self.current_calendar_event(now).is_some(),
             CPU_INFO=>monitor.is_some_and(|m|m.cpu_percent.is_some()),
             GPU_INFO=>monitor.is_some_and(|m|m.gpu_percent.is_some()),
@@ -46,6 +46,16 @@ impl crate::app::App {
         };
         let enabled=|slot:usize|status_enabled(&self.settings,slot)&&(placeholder||available(slot));
         StatusSlots {net:enabled(NETSPEED),course:enabled(COURSE),calendar:enabled(CALENDAR),cpu:enabled(CPU_INFO),gpu:enabled(GPU_INFO),memory:enabled(MEMORY_INFO),disk:enabled(DISK_INFO),temperature:enabled(TEMPERATURE)}
+    }
+
+    /// 课间倒计时文案（`课间 8′`），没有课间或课间太长时返回 None。
+    ///
+    /// 只认**短课间**（整段 ≤ 60 分钟）：NOS 把同一天相邻两段之间的任何空档都算课间，
+    /// 上午下课后到晚上上课前那种几小时的空档若也倒计时，会从中午一直盖住「下一节课」。
+    fn nos_break_countdown(&self,now:i64)->Option<String> {
+        let (left,event)=self.nos_current_break(now)?;
+        let span=event.end_at()? - event.start_at()?;
+        (span<=3600).then(||format!("课间 {left}′"))
     }
 
     /// 末尾状态组件的紧凑文案；`placeholder=true` 时即使没有数据也给出占位文字。
@@ -60,9 +70,9 @@ impl crate::app::App {
                 None if placeholder=>"↓-- ↑--".into(),
                 None=>String::new(),
             },
-            COURSE=>match self.nos_current_break(now) {
+            COURSE=>match self.nos_break_countdown(now) {
                 // 课间优先：正在休息时显示剩余分钟，下一节课的信息等打铃再回来。
-                Some((left,_))=>format!("课间 {left}′"),
+                Some(label)=>label,
                 None=>match self.nos_next_course(now) {
                     Some(event)=>{
                         let clock=crate::nos::clock_label(&event.start_time);
@@ -93,7 +103,7 @@ impl crate::app::App {
     fn resident_status_data_available(&self,slot:usize,monitor:Option<&MonitorSnapshot>,now:i64)->bool {
         match slot {
             NETSPEED=>monitor.is_some(),
-            COURSE=>self.nos_current_break(now).is_some()||self.nos_next_course(now).is_some(),
+            COURSE=>self.nos_break_countdown(now).is_some()||self.nos_next_course(now).is_some(),
             CALENDAR=>self.current_calendar_event(now).is_some(),
             CPU_INFO=>monitor.is_some_and(|m|m.cpu_percent.is_some()),
             GPU_INFO=>monitor.is_some_and(|m|m.gpu_percent.is_some()),
