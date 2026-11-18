@@ -54,6 +54,12 @@ mod extras;
 mod monitor_page;
 mod monitor_ui;
 mod monitor_widget;
+#[cfg(windows)]
+mod monitor_gpu;
+#[cfg(windows)]
+mod monitor_wmi;
+#[cfg(windows)]
+pub mod monitor_elevated;
 mod pet;
 mod pet_expressions;
 mod bar_layout;

@@ -541,10 +541,12 @@ impl App {
             .filter(|_| has)
             .map(|v| format!("{:.2} GHz", v as f32 / 1000.0))
             .unwrap_or_else(|| "频率 --".into());
+        // 没有 ACPI 热区时退回显卡温度，并标上 GPU，避免看起来像机身温度。
         let temperature = m
             .temperature_c
             .filter(|_| has)
             .map(|v| format!("{v:.0}°C"))
+            .or_else(|| m.gpu.temp_c.filter(|_| has).map(|v| format!("GPU {v:.0}°C")))
             .unwrap_or_else(|| "温度 --".into());
         c.text(
             52.0 + sw + 22.0,
@@ -591,6 +593,9 @@ impl App {
         // GPU
         self.card_shell(c, cy, r1, GREEN, Glyph::Gpu, "GPU");
         c.text(cx + 46.0, r1 + 45.0, &pct(m.gpu_percent.filter(|_| has)), 19.0, W::Bold, INK, Align2::LEFT_CENTER);
+        if let Some(brief) = m.gpu.brief().filter(|_| has) {
+            c.text(cx + 46.0, r1 + 62.0, &brief, 11.0, W::Regular, SUB2, Align2::LEFT_CENTER);
+        }
 
         // 硬盘
         self.card_shell(c, cx, r2, PURPLE, Glyph::Hdd, "硬盘");

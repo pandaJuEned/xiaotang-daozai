@@ -27,7 +27,7 @@ pub(crate) const CPU_INFO: usize = 13;
 pub(crate) const GPU_INFO: usize = 14;
 pub(crate) const MEMORY_INFO: usize = 15;
 pub(crate) const DISK_INFO: usize = 16;
-/// 机身温度槽：显示 ACPI 热区读数（如 71°C），同样固定排在末尾。
+/// 温度槽：显示 ACPI 热区读数（如 71°C），无热区时退回显卡温度，同样固定排在末尾。
 pub(crate) const TEMPERATURE: usize = 17;
 /// 天气徽标的基础槽宽；温度文字更长时由 `widen` 补足。
 pub(crate) const WEATHER_WIDTH: f32 = 38.0;

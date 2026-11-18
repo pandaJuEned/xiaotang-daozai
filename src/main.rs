@@ -123,7 +123,7 @@ impl Shell {
             let on=self.app.monitor_cfg.enabled && wanted && !daozai::resources::GUARD.tripped();
             if on!=self.monitor.is_some() {
                 self.monitor=if on {
-                    Some(daozai::monitor_win::Service::start(ctx.clone(),self.app.monitor_cfg.clone()))
+                    Some(daozai::monitor_win::Service::start(ctx.clone(),self.app.monitor_cfg.clone(),self.app.settings.elevated_sensors))
                 } else { None };
                 if !on {self.monitor_state=None;}
             }
@@ -1273,6 +1273,12 @@ mod open_path_tests {
 }
 
 fn main() -> std::process::ExitCode {
+    // 提权传感器助手：由「深度传感器」开关以 runas 拉起，只负责写 JSON，
+    // 不建窗口、不碰 UI，识别到标记就直接跑循环，绝不能落到正常启动路径。
+    #[cfg(windows)]
+    if daozai::monitor_elevated::is_helper_invocation() {
+        daozai::monitor_elevated::run_helper();
+    }
     diagnostics::install();
     match run() {
         Ok(()) => std::process::ExitCode::SUCCESS,

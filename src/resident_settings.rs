@@ -41,7 +41,7 @@ impl crate::app::App {
             GPU_INFO=>monitor.is_some_and(|m|m.gpu_percent.is_some()),
             MEMORY_INFO=>monitor.is_some_and(|m|m.mem_percent().is_some()),
             DISK_INFO=>monitor.is_some_and(|m|m.disk_percent.is_some()),
-            TEMPERATURE=>monitor.is_some_and(|m|m.temperature_c.is_some()),
+            TEMPERATURE=>monitor.is_some_and(|m|m.hottest_temp().is_some()),
             _=>false,
         };
         let enabled=|slot:usize|status_enabled(&self.settings,slot)&&(placeholder||available(slot));
@@ -77,7 +77,7 @@ impl crate::app::App {
             GPU_INFO=>{let value=percent_label(monitor.and_then(|m|m.gpu_percent),placeholder);if value.is_empty(){value}else{format!("GPU {value}")}},
             MEMORY_INFO=>{let value=percent_label(monitor.and_then(|m|m.mem_percent()),placeholder);if value.is_empty(){value}else{format!("内存 {value}")}},
             DISK_INFO=>{let value=percent_label(monitor.and_then(|m|m.disk_percent),placeholder);if value.is_empty(){value}else{format!("硬盘 {value}")}},
-            TEMPERATURE=>match monitor.and_then(|m|m.temperature_c) {
+            TEMPERATURE=>match monitor.and_then(|m|m.hottest_temp()) {
                 Some(value)=>format!("{value:.0}°C"),
                 None if placeholder=>"--°C".into(),
                 None=>String::new(),
@@ -95,7 +95,7 @@ impl crate::app::App {
             GPU_INFO=>monitor.is_some_and(|m|m.gpu_percent.is_some()),
             MEMORY_INFO=>monitor.is_some_and(|m|m.mem_percent().is_some()),
             DISK_INFO=>monitor.is_some_and(|m|m.disk_percent.is_some()),
-            TEMPERATURE=>monitor.is_some_and(|m|m.temperature_c.is_some()),
+            TEMPERATURE=>monitor.is_some_and(|m|m.hottest_temp().is_some()),
             _=>false,
         }
     }
@@ -187,7 +187,7 @@ impl crate::app::App {
             response.on_hover_text(label(slot));
         }
         // 末尾状态槽与设置页「状态组件」一一对应，按列表顺序展示；无数据时用灰色占位。
-        let tail_label=|slot|match slot{NETSPEED=>"网速",COURSE=>"下一节课",CALENDAR=>"进行中日程",CPU_INFO=>"CPU 信息",GPU_INFO=>"GPU 信息",MEMORY_INFO=>"内存信息",DISK_INFO=>"硬盘信息",TEMPERATURE=>"机身温度",_=>"状态组件"};
+        let tail_label=|slot|match slot{NETSPEED=>"网速",COURSE=>"下一节课",CALENDAR=>"进行中日程",CPU_INFO=>"CPU 信息",GPU_INFO=>"GPU 信息",MEMORY_INFO=>"内存信息",DISK_INFO=>"硬盘信息",TEMPERATURE=>"温度",_=>"状态组件"};
         for &slot in STATUS_TAIL_ORDER.iter() {
             let Some(x)=layout.x[slot] else {continue;};
             let width=layout.widths[slot];

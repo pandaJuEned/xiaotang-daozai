@@ -44,8 +44,8 @@ use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTAT
 use windows::Win32::System::Threading::GetSystemTimes;
 
 use crate::monitor::{
-    format_size, format_speed, Alert, Counters, HistoryStore, MonitorConfig, MonitorSnapshot,
-    PowerSnapshot, RateCalculator, SavePolicy, TemperatureSensor, ThresholdWatcher,
+    format_size, format_speed, Alert, Counters, GpuInfo, HistoryStore, MonitorConfig,
+    MonitorSnapshot, PowerSnapshot, RateCalculator, SavePolicy, TemperatureSensor, ThresholdWatcher,
     MAX_TEMPERATURE_SENSORS,
 };
 use crate::poll_clock::PollClock;
@@ -211,6 +211,8 @@ pub struct Hardware {
     /// 全盘读写吞吐，MB/s（PDH 计数器给的是字节/秒）。
     pub disk_read_mbps: Option<f32>,
     pub disk_write_mbps: Option<f32>,
+    /// 显卡温度/功耗/显存（NVML，零提权）。
+    pub gpu: GpuInfo,
 }
 
 /// 注册表里的 CPU 型号，例如 `13th Gen Intel(R) Core(TM) i7-13700H`。
@@ -564,6 +566,27 @@ pub fn probe_text(
         snap.disk_read_mbps.map(|v| format!("{v:.1} MB")).unwrap_or_else(|| "--".into()),
         snap.disk_write_mbps.map(|v| format!("{v:.1} MB")).unwrap_or_else(|| "--".into())
     ));
+    let vram = match (snap.gpu.vram_used_bytes, snap.gpu.vram_total_bytes) {
+        (Some(used), Some(total)) => format!(
+            "{:.1}/{:.1} GB",
+            used as f64 / 1_073_741_824.0,
+            total as f64 / 1_073_741_824.0
+        ),
+        _ => "--".to_string(),
+    };
+    s.push_str(&format!(
+        "显卡：温度 {}   功耗 {}   上限 {}   风扇 {}   核心 {}   显存 {}\n",
+        snap.gpu.temp_c.map(|v| format!("{v:.1}°C")).unwrap_or_else(|| "--".into()),
+        snap.gpu.power_w.map(|v| format!("{v:.1}W")).unwrap_or_else(|| "--".into()),
+        snap.gpu.limit_w.map(|v| format!("{v:.0}W")).unwrap_or_else(|| "--".into()),
+        snap.gpu.fan_pct.map(|v| format!("{v}%")).unwrap_or_else(|| "--".into()),
+        snap.gpu.clock_mhz.map(|v| format!("{v} MHz")).unwrap_or_else(|| "--".into()),
+        vram
+    ));
+    s.push_str(&format!(
+        "提权助手：{}\n",
+        if snap.elevated_live { "运行中" } else { "未运行" }
+    ));
     let p = &snap.power;
     let watts = |v: Option<f32>| v.map(|v| format!("{v:.1}W")).unwrap_or_else(|| "--".into());
     s.push_str(&format!(
@@ -612,6 +635,11 @@ pub fn probe() -> String {
     let (used, total) = read_memory().unwrap_or((0, 0));
     let _winrt = WinRtApartment::enter();
     let hardware = PdhCounters::new().sample();
+    let gpu = crate::monitor_gpu::GpuReader::open().map(|r| r.sample()).unwrap_or_default();
+    let mut sensors = hardware.temperature_sensors;
+    if sensors.iter().all(|s| s.is_none()) {
+        sensors = crate::monitor_wmi::Wmi::new().acpi_zones();
+    }
     let mut power = read_power();
     power.ac_power_w = hardware.ac_power_w;
     let snap = MonitorSnapshot {
@@ -620,11 +648,13 @@ pub fn probe() -> String {
         gpu_percent: hardware.gpu_percent,
         disk_percent: hardware.disk_percent,
         cpu_mhz: hardware.cpu_mhz,
-        temperature_c: hardware.temperature_c,
-        temperature_sensors: hardware.temperature_sensors,
+        temperature_c: sensors.iter().flatten().next().and_then(|s| s.celsius),
+        temperature_sensors: sensors,
         power,
         disk_read_mbps: hardware.disk_read_mbps,
         disk_write_mbps: hardware.disk_write_mbps,
+        gpu,
+        elevated_live: crate::monitor_elevated::read_zones().is_some(),
         ..Default::default()
     };
     let mut text = probe_text(&snap, &cfg, &[], 0);
@@ -644,14 +674,14 @@ pub struct Service {
 }
 
 impl Service {
-    pub fn start(ctx: Context, cfg: MonitorConfig) -> Self {
+    pub fn start(ctx: Context, cfg: MonitorConfig, elevated_sensors: bool) -> Self {
         let (tx, rx) = mpsc::sync_channel(1);
         let (alert_tx, alerts) = mpsc::sync_channel(4);
         let stop = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&stop);
         // Lane 上限 2 允许旧线程退出与新实例交接。
         let _ = crate::resources::SYSTEM_MONITOR
-            .spawn(move || run(ctx, cfg, tx, alert_tx, flag));
+            .spawn(move || run(ctx, cfg, elevated_sensors, tx, alert_tx, flag));
         Self { rx, alerts, stop }
     }
 
@@ -671,7 +701,14 @@ impl Drop for Service {
     }
 }
 
-fn run(ctx: Context, cfg: MonitorConfig, tx: SyncSender<MonitorSnapshot>, alert_tx: SyncSender<String>, stop: Arc<AtomicBool>) {
+fn run(
+    ctx: Context,
+    cfg: MonitorConfig,
+    elevated_sensors: bool,
+    tx: SyncSender<MonitorSnapshot>,
+    alert_tx: SyncSender<String>,
+    stop: Arc<AtomicBool>,
+) {
     let interval = cfg.interval();
     let mut rate = RateCalculator::new();
     let mut history = HistoryStore::load();
@@ -687,6 +724,12 @@ fn run(ctx: Context, cfg: MonitorConfig, tx: SyncSender<MonitorSnapshot>, alert_
     let pdh = PdhCounters::new();
     let _winrt = WinRtApartment::enter();
     let mut power_tracker = PowerTracker::default();
+    // 显卡（NVML）是零提权通道，打不开时整段退化为 None。
+    let gpu = crate::monitor_gpu::GpuReader::open();
+    let mut elevated: [Option<TemperatureSensor>; MAX_TEMPERATURE_SENSORS] =
+        [None; MAX_TEMPERATURE_SENSORS];
+    let mut elevated_live = false;
+    let mut elevated_at: Option<Instant> = None;
 
     while !stop.load(Ordering::Relaxed) {
         if !clock.ready(interval) {
@@ -713,6 +756,41 @@ fn run(ctx: Context, cfg: MonitorConfig, tx: SyncSender<MonitorSnapshot>, alert_
         let mut power = power_tracker.step(now, read_power());
         power.ac_power_w = hardware.ac_power_w;
 
+        // 显卡每秒都读：NVML 调用是内存级的，比一次 PDH 采集还便宜。
+        let gpu_info = gpu.as_ref().map(|reader| reader.sample()).unwrap_or_default();
+        // 提权助手的读数落在一个 JSON 文件里，5 秒读一次即可。
+        if elevated_sensors
+            && elevated_at.map_or(true, |at| now.duration_since(at) >= Duration::from_secs(5))
+        {
+            elevated = [None; MAX_TEMPERATURE_SENSORS];
+            elevated_live = false;
+            if let Some(zones) = crate::monitor_elevated::read_zones() {
+                elevated_live = true;
+                for (slot, (name, celsius)) in elevated.iter_mut().zip(zones.into_iter()) {
+                    let mut buf = [0u16; 24];
+                    for (cell, ch) in buf.iter_mut().zip(name.encode_utf16()) {
+                        *cell = ch;
+                    }
+                    *slot = Some(TemperatureSensor { name: buf, celsius: Some(celsius) });
+                }
+            }
+            elevated_at = Some(now);
+        } else if !elevated_sensors {
+            elevated = [None; MAX_TEMPERATURE_SENSORS];
+            elevated_live = false;
+        }
+        // ACPI 热区优先用 PDH（不需要提权），读不到时才用助手的结果。
+        let mut sensors = hardware.temperature_sensors;
+        if sensors.iter().all(|s| s.is_none()) {
+            sensors = elevated;
+        }
+        let temperature_c = sensors
+            .iter()
+            .flatten()
+            .next()
+            .and_then(|s| s.celsius)
+            .or(hardware.temperature_c);
+
         let date = today();
         history.add_delta(&date, sample.delta);
         let day = history.today(&date);
@@ -727,11 +805,13 @@ fn run(ctx: Context, cfg: MonitorConfig, tx: SyncSender<MonitorSnapshot>, alert_
             gpu_percent: hardware.gpu_percent,
             disk_percent: hardware.disk_percent,
             cpu_mhz: hardware.cpu_mhz,
-            temperature_c: hardware.temperature_c,
-            temperature_sensors: hardware.temperature_sensors,
+            temperature_c,
+            temperature_sensors: sensors,
             power,
             disk_read_mbps: hardware.disk_read_mbps,
             disk_write_mbps: hardware.disk_write_mbps,
+            gpu: gpu_info,
+            elevated_live,
         };
 
         if let Some(alert) = watcher.check(

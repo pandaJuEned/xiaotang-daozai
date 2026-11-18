@@ -624,6 +624,39 @@ impl TemperatureSensor {
 /// 最多保留的热区数量；界面按温度从高到低展示。
 pub const MAX_TEMPERATURE_SENSORS: usize = 4;
 
+/// 显卡读数（NVML，零提权）。不可用字段为 None，界面显示 `--` 而不是 0。
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct GpuInfo {
+    pub temp_c: Option<f32>,
+    /// 显卡整板功耗（W），NVML 给的是毫瓦。
+    pub power_w: Option<f32>,
+    /// 功耗上限（W），用来画「12 / 180W」。
+    pub limit_w: Option<f32>,
+    pub fan_pct: Option<u32>,
+    pub clock_mhz: Option<u32>,
+    pub vram_used_bytes: Option<u64>,
+    pub vram_total_bytes: Option<u64>,
+}
+
+impl GpuInfo {
+    /// 是否读到了至少一项，决定界面显示实值还是占位。
+    pub fn any(&self) -> bool {
+        self.temp_c.is_some() || self.power_w.is_some() || self.vram_total_bytes.is_some()
+    }
+
+    /// 「48°C · 86W」，两段都没有时给 None。
+    pub fn brief(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        if let Some(w) = self.power_w {
+            parts.push(format!("{w:.0}W"));
+        }
+        if let Some(t) = self.temp_c {
+            parts.push(format!("{t:.0}°C"));
+        }
+        (!parts.is_empty()).then(|| parts.join(" · "))
+    }
+}
+
 /// 电源与电池读数。功率单位统一为瓦，容量单位为 Wh。
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct PowerSnapshot {
@@ -663,6 +696,10 @@ pub struct MonitorSnapshot {
     /// 全盘读写吞吐（MB/s），仪表盘「硬盘」卡片用。
     pub disk_read_mbps: Option<f32>,
     pub disk_write_mbps: Option<f32>,
+    /// 显卡温度/功耗/显存（NVML，零提权）。非 NVIDIA 或 DLL 不可用时全为 None。
+    pub gpu: GpuInfo,
+    /// 提权助手是否正在提供读数（ACPI 热区）。关掉开关或助手未运行时为 false。
+    pub elevated_live: bool,
 }
 
 impl MonitorSnapshot {
@@ -674,6 +711,19 @@ impl MonitorSnapshot {
     pub fn today_total(&self) -> u64 {
         self.today_down_bytes.saturating_add(self.today_up_bytes)
     }
+
+    /// 全部温度源里最高的一个（热区 / 显卡）。
+    /// 桌面平台通常没有 ACPI 热区，此时它就是显卡温度。
+    pub fn hottest_temp(&self) -> Option<f32> {
+        let zones = self.temperature_sensors.iter().flatten().filter_map(|s| s.celsius);
+        self.temperature_c
+            .into_iter()
+            .chain(zones)
+            .chain(self.gpu.temp_c)
+            .filter(|v| v.is_finite())
+            .fold(None, |acc: Option<f32>, v| Some(acc.map_or(v, |a| a.max(v))))
+    }
+
 }
 
 /// 占用率迷你图的固定长度环形缓冲（P5）。纯逻辑、平台无关，值统一夹到 0..100。
@@ -848,6 +898,38 @@ pub fn temperature_from_kelvin_tenths(raw: f64) -> Option<f32> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn hottest_temp_takes_max_across_zones_and_gpu() {
+        let mut snap = MonitorSnapshot::default();
+        assert_eq!(snap.hottest_temp(), None, "一个温度都没有时不应编造数值");
+        snap.temperature_c = Some(71.0);
+        assert_eq!(snap.hottest_temp(), Some(71.0));
+        snap.temperature_sensors[0] = Some(TemperatureSensor {
+            name: [0; 24],
+            celsius: Some(83.0),
+        });
+        assert_eq!(snap.hottest_temp(), Some(83.0), "多个热区取最高的");
+        snap.gpu.temp_c = Some(64.0);
+        assert_eq!(snap.hottest_temp(), Some(83.0), "显卡更低时不应盖过热区");
+        snap.temperature_c = None;
+        snap.temperature_sensors = [None; MAX_TEMPERATURE_SENSORS];
+        assert_eq!(snap.hottest_temp(), Some(64.0), "没有热区时退回显卡温度");
+        snap.gpu.temp_c = Some(f32::NAN);
+        assert_eq!(snap.hottest_temp(), None, "非有限值不应参与比较");
+    }
+
+    #[test]
+    fn gpu_brief_lists_power_before_temperature() {
+        let mut gpu = GpuInfo::default();
+        assert_eq!(gpu.brief(), None);
+        assert!(!gpu.any());
+        gpu.temp_c = Some(37.4);
+        assert_eq!(gpu.brief().as_deref(), Some("37°C"));
+        gpu.power_w = Some(12.6);
+        assert_eq!(gpu.brief().as_deref(), Some("13W · 37°C"));
+        assert!(gpu.any());
+    }
 
     #[test]
     fn thermal_zone_tenths_kelvin_convert_to_celsius_and_drop_bad_readings() {

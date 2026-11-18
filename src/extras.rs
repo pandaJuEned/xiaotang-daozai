@@ -1383,7 +1383,25 @@ impl App {
                             ui.separator();
                             setting_row(ui,"硬盘信息","收起时显示实时硬盘占用率；无监控数据时自动隐藏",&mut self.settings.show_disk);
                             ui.separator();
-                            setting_row(ui,"机身温度","收起时显示 ACPI 热区温度；无热区读数时自动隐藏",&mut self.settings.show_temperature);
+                            setting_row(ui,"温度","收起时显示 ACPI 热区或显卡温度；都读不到时自动隐藏",&mut self.settings.show_temperature);
+                            ui.separator();
+                            let elevated_before=self.settings.elevated_sensors;
+                            setting_row(ui,"深度传感器","用一次管理员授权补读 ACPI 热区（笔记本机型才常见）；关闭时岛仔完全不申请提权",&mut self.settings.elevated_sensors);
+                            if self.settings.elevated_sensors!=elevated_before {
+                                // 打开即拉起提权助手；用户点了「否」就把开关拨回去，保持「开关 = 实际能力」。
+                                if self.settings.elevated_sensors && crate::monitor_elevated::launch().is_err() {
+                                    self.settings.elevated_sensors=false;
+                                }
+                            }
+                            if self.settings.elevated_sensors {
+                                let live=crate::monitor_elevated::helper_alive();
+                                ui.horizontal(|ui|{
+                                    ui.label(egui::RichText::new(if live {"助手运行中，热区读数已并入温度"} else {"助手未运行，读数不可用"}).size(11.5).color(settings_color(ctx,Color32::from_gray(175),Color32::from_gray(90))));
+                                    if !live && ui.small_button("重新授权").clicked() {
+                                        let _=crate::monitor_elevated::launch();
+                                    }
+                                });
+                            }
                         });
                         settings_label(ui,"功能页面");
                         settings_card(ui,|ui|{
