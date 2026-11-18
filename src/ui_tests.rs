@@ -8578,22 +8578,17 @@ fn hardware_status_components_line_up_with_the_resident_bar_and_preview(){
 fn system_monitor_page_shows_machine_temperature(){
     let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
     let mut h=H::new();
-    let mut name=[0u16;24];
-    for (i,c) in "_tz.tz02".encode_utf16().enumerate(){name[i]=c;}
     h.monitor=Some(crate::monitor::MonitorSnapshot{
         cpu_percent:Some(42.0),temperature_c:Some(71.0),
-        temperature_sensors:[
-            Some(crate::monitor::TemperatureSensor{celsius:Some(71.0),..Default::default()}),
-            Some(crate::monitor::TemperatureSensor{name,celsius:Some(55.0)}),
-            None,None,
-        ],
+        power:crate::monitor::PowerSnapshot{ac_online:Some(true),battery_percent:Some(96.0),charging:Some(true),charge_w:Some(25.0),ac_power_w:Some(31.0),..Default::default()},
         ..Default::default()
     });
     h.app.show_page(crate::app::MONITOR_PAGE);
     for _ in 0..60 {h.frame(vec![]);}
-    for label in ["71°C","55°C","热区 2"] {
+    for label in ["71°C","电源 · 交流"] {
         assert!(h.shapes.iter().any(|s|matches!(&s.shape,egui::Shape::Text(t)if t.galley.text().contains(label))),"系统监控页应显示 {label}");
     }
+    assert!(!h.shapes.iter().any(|s|matches!(&s.shape,egui::Shape::Text(t)if t.galley.text().contains("热区 2"))),"不应新增热区格");
 }
 #[test]
 fn resident_bar_shows_the_refill_time_only_when_quota_is_low(){

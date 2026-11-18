@@ -33,15 +33,20 @@ use windows::Win32::System::Performance::{
     PdhGetFormattedCounterValue, PdhOpenQueryW, PDH_FMT_COUNTERVALUE,
     PDH_FMT_COUNTERVALUE_ITEM_W, PDH_FMT_DOUBLE, PDH_MORE_DATA,
 };
+use windows::Devices::Power::Battery;
+use windows::System::Power::BatteryStatus as WinRtBatteryStatus;
 use windows::Win32::System::Power::{
-    CallNtPowerInformation, ProcessorInformation, PROCESSOR_POWER_INFORMATION,
+    CallNtPowerInformation, GetSystemPowerStatus, ProcessorInformation, SYSTEM_POWER_STATUS,
+    PROCESSOR_POWER_INFORMATION,
 };
+use windows::Win32::System::WinRT::{RoInitialize, RoUninitialize, RO_INIT_MULTITHREADED};
 use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 use windows::Win32::System::Threading::GetSystemTimes;
 
 use crate::monitor::{
     format_size, format_speed, Alert, Counters, HistoryStore, MonitorConfig, MonitorSnapshot,
-    RateCalculator, SavePolicy, TemperatureSensor, ThresholdWatcher, MAX_TEMPERATURE_SENSORS,
+    PowerSnapshot, RateCalculator, SavePolicy, TemperatureSensor, ThresholdWatcher,
+    MAX_TEMPERATURE_SENSORS,
 };
 use crate::poll_clock::PollClock;
 
@@ -201,6 +206,8 @@ pub struct Hardware {
     pub temperature_c: Option<f32>,
     /// 全部热区读数，按温度从高到低排列。
     pub temperature_sensors: [Option<TemperatureSensor>; MAX_TEMPERATURE_SENSORS],
+    /// Power Meter 计数器给出的交流/整机功率；不支持时为 None。
+    pub ac_power_w: Option<f32>,
     /// 全盘读写吞吐，MB/s（PDH 计数器给的是字节/秒）。
     pub disk_read_mbps: Option<f32>,
     pub disk_write_mbps: Option<f32>,
@@ -261,6 +268,67 @@ fn pdh_single(counter: isize) -> Option<f64> {
         }
         let v = value.Anonymous.doubleValue;
         v.is_finite().then_some(v)
+    }
+}
+
+/// 采集线程独占一个 WinRT MTA 套间；未初始化成功时不配对调用 RoUninitialize。
+struct WinRtApartment(bool);
+impl WinRtApartment {
+    fn enter() -> Self {
+        Self(unsafe { RoInitialize(RO_INIT_MULTITHREADED) }.is_ok())
+    }
+}
+impl Drop for WinRtApartment {
+    fn drop(&mut self) {
+        if self.0 {
+            unsafe { RoUninitialize() };
+        }
+    }
+}
+
+/// 电池使用与充放电功率。WinRT 的 AggregateBattery 不需要管理员权限。
+pub fn read_power() -> PowerSnapshot {
+    let mut out = PowerSnapshot::default();
+    unsafe {
+        let mut status = SYSTEM_POWER_STATUS::default();
+        if GetSystemPowerStatus(&mut status).is_ok() {
+            out.ac_online = Some(status.ACLineStatus != 0);
+            if status.BatteryLifePercent != 255 {
+                out.battery_percent = Some(status.BatteryLifePercent as f32);
+            }
+            if status.BatteryLifeTime != u32::MAX {
+                out.runtime_secs = Some(status.BatteryLifeTime);
+            }
+        }
+    }
+    if let Ok(battery) = Battery::AggregateBattery() {
+        if let Ok(report) = battery.GetReport() {
+            let mw = |value: windows::Foundation::IReference<i32>| value.Value().ok().map(|v| v as f32 / 1000.0);
+            out.charge_w = report.ChargeRateInMilliwatts().ok().and_then(mw).filter(|v| *v > 0.0);
+            out.remaining_wh = report.RemainingCapacityInMilliwattHours().ok().and_then(mw);
+            let status = report.Status().ok();
+            out.charging = status.map(|s| s == WinRtBatteryStatus::Charging);
+            out.discharging = status.map(|s| s == WinRtBatteryStatus::Discharging);
+        }
+    }
+    out
+}
+
+/// WinRT 不直接给放电功率；用剩余容量的时间差换算，0 间隔或充电时不出数。
+#[derive(Default)]
+struct PowerTracker {
+    last: Option<(Instant, f32)>,
+}
+impl PowerTracker {
+    fn step(&mut self, now: Instant, mut power: PowerSnapshot) -> PowerSnapshot {
+        if let (Some(remaining), Some((prev_at, prev))) = (power.remaining_wh, self.last) {
+            let elapsed = now.saturating_duration_since(prev_at).as_secs_f32();
+            if elapsed > 0.25 && power.discharging == Some(true) && remaining <= prev {
+                power.discharge_w = Some((prev - remaining) * 3600.0 / elapsed);
+            }
+        }
+        self.last = power.remaining_wh.map(|remaining| (now, remaining));
+        power
     }
 }
 
@@ -376,6 +444,7 @@ pub struct PdhCounters {
     read: Option<isize>,
     write: Option<isize>,
     temperature: Option<isize>,
+    ac_power: Option<isize>,
 }
 
 impl PdhCounters {
@@ -383,7 +452,7 @@ impl PdhCounters {
         unsafe {
             let mut query: isize = 0;
             if PdhOpenQueryW(PCWSTR::null(), 0, &mut query) != 0 {
-                return Self { query: 0, gpu: None, disk: None, read: None, write: None, temperature: None };
+                return Self { query: 0, gpu: None, disk: None, read: None, write: None, temperature: None, ac_power: None };
             }
             let add = |path: PCWSTR| -> Option<isize> {
                 let mut handle: isize = 0;
@@ -398,9 +467,10 @@ impl PdhCounters {
             let read = add(w!("\\PhysicalDisk(_Total)\\Disk Read Bytes/sec"));
             let write = add(w!("\\PhysicalDisk(_Total)\\Disk Write Bytes/sec"));
             let temperature = add(w!("\\Thermal Zone Information(*)\\High Precision Temperature"));
+            let ac_power = add(w!("\\Power Meter(_Total)\\Power"));
             // 比率型计数器至少需要一次 collect 才能产出有效值。
             let _ = PdhCollectQueryData(query);
-            Self { query, gpu, disk, read, write, temperature }
+            Self { query, gpu, disk, read, write, temperature, ac_power }
         }
     }
 
@@ -420,6 +490,7 @@ impl PdhCounters {
                     out.temperature_sensors = pdh_temperatures(counter);
                     out.temperature_c = out.temperature_sensors.iter().flatten().next().and_then(|s| s.celsius);
                 }
+                out.ac_power_w = self.ac_power.and_then(pdh_single).map(|v| v as f32).filter(|v| *v > 0.0);
                 out.disk_read_mbps = self.read.and_then(pdh_single).map(to_mbps);
                 out.disk_write_mbps = self.write.and_then(pdh_single).map(to_mbps);
             }
@@ -493,6 +564,17 @@ pub fn probe_text(
         snap.disk_read_mbps.map(|v| format!("{v:.1} MB")).unwrap_or_else(|| "--".into()),
         snap.disk_write_mbps.map(|v| format!("{v:.1} MB")).unwrap_or_else(|| "--".into())
     ));
+    let p = &snap.power;
+    let watts = |v: Option<f32>| v.map(|v| format!("{v:.1}W")).unwrap_or_else(|| "--".into());
+    s.push_str(&format!(
+        "电源：交流 {}   电池 {}   充电 {}   放电 {}   交流功率 {}   剩余 {}\n",
+        p.ac_online.map(|v| if v { "已接入" } else { "未接入" }).unwrap_or("--"),
+        p.battery_percent.map(|v| format!("{v:.0}%")).unwrap_or_else(|| "--".into()),
+        watts(p.charge_w),
+        watts(p.discharge_w),
+        watts(p.ac_power_w),
+        p.remaining_wh.map(|v| format!("{v:.1}Wh")).unwrap_or_else(|| "--".into()),
+    ));
     s.push_str(&format!(
         "今日：下行 {} / 上行 {}（合计 {}）   历史天数：{}\n",
         format_size(snap.today_down_bytes, d),
@@ -528,7 +610,10 @@ pub fn probe() -> String {
     let counters = read_counters().unwrap_or_default();
     let cpu = read_cpu_times();
     let (used, total) = read_memory().unwrap_or((0, 0));
+    let _winrt = WinRtApartment::enter();
     let hardware = PdhCounters::new().sample();
+    let mut power = read_power();
+    power.ac_power_w = hardware.ac_power_w;
     let snap = MonitorSnapshot {
         mem_used_bytes: used,
         mem_total_bytes: total,
@@ -537,6 +622,7 @@ pub fn probe() -> String {
         cpu_mhz: hardware.cpu_mhz,
         temperature_c: hardware.temperature_c,
         temperature_sensors: hardware.temperature_sensors,
+        power,
         disk_read_mbps: hardware.disk_read_mbps,
         disk_write_mbps: hardware.disk_write_mbps,
         ..Default::default()
@@ -597,8 +683,10 @@ fn run(ctx: Context, cfg: MonitorConfig, tx: SyncSender<MonitorSnapshot>, alert_
     let mut probe_at = prev_at;
     let mut alerts: Vec<Alert> = Vec::new();
     let mut last = MonitorSnapshot::default();
-    // P5：PDH 查询句柄绑在采样线程内，随线程一起创建/释放。
+    // P5：PDH 查询句柄与 WinRT 套间绑在采样线程内，随线程一起创建/释放。
     let pdh = PdhCounters::new();
+    let _winrt = WinRtApartment::enter();
+    let mut power_tracker = PowerTracker::default();
 
     while !stop.load(Ordering::Relaxed) {
         if !clock.ready(interval) {
@@ -622,6 +710,8 @@ fn run(ctx: Context, cfg: MonitorConfig, tx: SyncSender<MonitorSnapshot>, alert_
         cpu_last = cpu;
         let (used, total) = read_memory().unwrap_or((0, 0));
         let hardware = pdh.sample();
+        let mut power = power_tracker.step(now, read_power());
+        power.ac_power_w = hardware.ac_power_w;
 
         let date = today();
         history.add_delta(&date, sample.delta);
@@ -639,6 +729,7 @@ fn run(ctx: Context, cfg: MonitorConfig, tx: SyncSender<MonitorSnapshot>, alert_
             cpu_mhz: hardware.cpu_mhz,
             temperature_c: hardware.temperature_c,
             temperature_sensors: hardware.temperature_sensors,
+            power,
             disk_read_mbps: hardware.disk_read_mbps,
             disk_write_mbps: hardware.disk_write_mbps,
         };

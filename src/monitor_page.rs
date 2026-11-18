@@ -11,7 +11,6 @@
 use eframe::egui::{self, Color32, Shape, Stroke};
 
 use crate::app::{App, Env};
-use crate::monitor::MonitorSnapshot;
 use crate::paint::{Card, H};
 use crate::theme::{self, W};
 
@@ -30,11 +29,12 @@ const HAIR: Color32 = Color32::from_rgb(46, 46, 50);
 const LEFT: f32 = 42.0;
 const RIGHT: f32 = 376.0;
 
-/// 紧凑指标格的几何：三行两列，最后一行留给多路热区温度。
+/// 指标格与下方电源条的几何。
 const CELL_W: f32 = 104.0;
 const CELL_H: f32 = 24.0;
 const CELL_X: [f32; 2] = [160.0, 272.0];
-const CELL_Y: [f32; 3] = [30.0, 58.0, 86.0];
+const CELL_Y: [f32; 2] = [28.0, 56.0];
+const POWER_Y: f32 = 86.0;
 
 fn load_color(v: f32) -> Color32 {
     if v < 40.0 {
@@ -70,23 +70,6 @@ fn brief(bps: u64) -> String {
 
 fn pct(v: Option<f32>) -> String {
     v.map(|x| format!("{x:.0}%")).unwrap_or_else(|| "--".into())
-}
-
-/// 两格温度：按热区温度降序取前两路，其余热区数在悬停提示里不展开。
-fn temperature_cells(m: &MonitorSnapshot) -> [(String, String, String, Color32); 2] {
-    let mut cells = [
-        ("温度 1".to_string(), "--".to_string(), String::new(), theme::DIM),
-        ("温度 2".to_string(), "--".to_string(), String::new(), theme::DIM),
-    ];
-    for (index, cell) in cells.iter_mut().enumerate() {
-        if let Some(sensor) = m.temperature_sensors.get(index).copied().flatten() {
-            let value = sensor.celsius.unwrap_or(0.0);
-            cell.1 = format!("{value:.0}°C");
-            cell.2 = crate::monitor::thermal_zone_label(&sensor.name());
-            cell.3 = load_color(value);
-        }
-    }
-    cells
 }
 
 fn state_text(cpu: Option<f32>) -> &'static str {
@@ -178,7 +161,7 @@ impl App {
         let machine = c.fit(&crate::monitor::machine_name(), 8.5, W::Regular, 72.0);
         c.text(LEFT + tw + 6.0, 104.0, &machine, 8.5, W::Regular, theme::DIM, H::Left);
 
-        /* ---------- 右侧 3×2 指标格：常规四项 + 两路热区 ---------- */
+        /* ---------- 右侧 2×2 指标格 + 电源条 ---------- */
         let mem_sub = format!(
             "{:.1}/{:.1}G",
             m.mem_used_bytes as f64 / 1_073_741_824.0,
@@ -188,7 +171,7 @@ impl App {
             (Some(r), Some(w)) => format!("读{r:.0}·写{w:.0}"),
             _ => "读写 --".to_string(),
         };
-        let mut cells: Vec<(String, String, String, Color32, Color32)> = vec![
+        let cells: [(String, String, String, Color32, Color32); 4] = [
             ("内存".into(), pct(m.mem_percent()), mem_sub, BLUE, theme::WHITE),
             ("GPU".into(), pct(m.gpu_percent), String::new(), GREEN, theme::WHITE),
             ("硬盘".into(), pct(m.disk_percent), disk_sub, PURPLE, theme::WHITE),
@@ -200,9 +183,6 @@ impl App {
                 theme::WHITE,
             ),
         ];
-        for (label, value, sub, tint) in temperature_cells(&m) {
-            cells.push((label, value, sub, tint, tint));
-        }
         for (i, (label, value, sub, tint, value_color)) in cells.into_iter().enumerate() {
             let (x, y) = (CELL_X[i % 2], CELL_Y[i / 2]);
             c.painter
@@ -214,6 +194,28 @@ impl App {
                 c.text(x + CELL_W - 8.0, y + 20.0, &sub, 7.0, W::Regular, tint, H::Right);
             }
         }
+        let p = &m.power;
+        let ac = p.ac_online.map(|v| if v { "已接入" } else { "未接入" }).unwrap_or("--");
+        let battery = p.battery_percent.map(|v| format!("{v:.0}%")).unwrap_or_else(|| "--".into());
+        let remaining = p.remaining_wh.map(|v| format!("{v:.1}Wh")).unwrap_or_else(|| "--".into());
+        let flow = p
+            .charge_w
+            .map(|v| format!("充 {v:.1}W"))
+            .or_else(|| p.discharge_w.map(|v| format!("放 {v:.1}W")))
+            .unwrap_or_else(|| "充/放 --".into());
+        let input = p.ac_power_w.map(|v| format!("入 {v:.0}W")).unwrap_or_else(|| "入 --".into());
+        let power_text = c.fit(
+            &format!("电源 · 交流{ac} · 电池{battery} · 余{remaining} · {flow} · {input}"),
+            9.0,
+            W::Regular,
+            CELL_W * 2.0 + 4.0,
+        );
+        c.painter.rect_filled(
+            c.rect(CELL_X[0], POWER_Y, CELL_W * 2.0 + 12.0, 22.0),
+            8.0,
+            Color32::from_white_alpha(10),
+        );
+        c.text(CELL_X[0] + 8.0, POWER_Y + 12.0, &power_text, 9.0, W::Regular, theme::GRAY, H::Left);
 
         /* ---------- 分隔线 ---------- */
         c.painter

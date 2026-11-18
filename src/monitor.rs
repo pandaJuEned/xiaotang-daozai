@@ -624,6 +624,22 @@ impl TemperatureSensor {
 /// 最多保留的热区数量；界面按温度从高到低展示。
 pub const MAX_TEMPERATURE_SENSORS: usize = 4;
 
+/// 电源与电池读数。功率单位统一为瓦，容量单位为 Wh。
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PowerSnapshot {
+    pub ac_online: Option<bool>,
+    pub battery_percent: Option<f32>,
+    pub charging: Option<bool>,
+    pub discharging: Option<bool>,
+    pub charge_w: Option<f32>,
+    pub discharge_w: Option<f32>,
+    pub remaining_wh: Option<f32>,
+    pub runtime_secs: Option<u32>,
+    /// Windows Power Meter 计数器给出的整机/交流输入功率；不支持时为 None。
+    pub ac_power_w: Option<f32>,
+    pub battery_temp_c: Option<f32>,
+}
+
 /// P2 采集层与 P3 `app::Env` 之间的公共 DTO。先定好字段，避免后面改两遍。
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct MonitorSnapshot {
@@ -642,6 +658,8 @@ pub struct MonitorSnapshot {
     pub temperature_c: Option<f32>,
     /// 全部可读取的热区，按温度从高到低排列；空位为 None。
     pub temperature_sensors: [Option<TemperatureSensor>; MAX_TEMPERATURE_SENSORS],
+    /// 电源与电池读数。
+    pub power: PowerSnapshot,
     /// 全盘读写吞吐（MB/s），仪表盘「硬盘」卡片用。
     pub disk_read_mbps: Option<f32>,
     pub disk_write_mbps: Option<f32>,
