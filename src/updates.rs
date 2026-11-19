@@ -341,13 +341,21 @@ fn release_info(value: &serde_json::Value, current: &str) -> Result<Option<Relea
     let sums_url = assets.iter().find(|asset| asset["name"] == "SHA256SUMS.txt")
         .and_then(|asset| asset["browser_download_url"].as_str())
         .ok_or_else(|| "更新信息缺少校验文件".to_owned())?;
+    let sums = fetch_text(sums_url)?;
+    release_from_assets(value, current, &sums)
+}
+
+/// 纯解析：给定 Release JSON 与 SHA256SUMS 内容，组装下载包；测试也走这里。
+fn release_from_assets(value: &serde_json::Value, current: &str, sums: &str) -> Result<Option<Release>, String> {
+    let Some(tag) = parse_release(value, current)? else { return Ok(None); };
+    let name = format!("Daozai-v{}-windows-x64.zip", tag.trim_start_matches('v'));
+    let assets = value["assets"].as_array().ok_or_else(|| "更新信息缺少附件".to_owned())?;
     let zip = assets.iter().find(|asset| asset["name"] == name)
         .ok_or_else(|| "请通过浏览器下载此版本".to_owned())?;
     let url = zip["browser_download_url"].as_str().ok_or_else(|| "更新信息缺少下载地址".to_owned())?;
     if !url.starts_with(GITEA) { return Err("更新下载地址异常，请通过浏览器下载".to_owned()); }
     let size = zip["size"].as_u64().ok_or_else(|| "更新信息缺少大小".to_owned())?;
     if size == 0 || size > 200 * 1024 * 1024 { return Err("更新包大小异常，请通过浏览器下载".to_owned()); }
-    let sums = fetch_text(sums_url)?;
     let hash = sums.lines().find(|line| line.trim_end().ends_with(&name))
         .and_then(|line| line.split_whitespace().next())
         .filter(|hash| hash.len() == 64 && hash.bytes().all(|c| c.is_ascii_hexdigit()))
@@ -549,16 +557,20 @@ mod tests {
     fn only_matching_verified_windows_package_can_install() {
         let mut value = release("v0.6.40");
         value["body"] = "更新说明".into();
-        value["assets"] = serde_json::json!([{"name":"Daozai-v0.6.40-windows-x64.zip",
-            "browser_download_url":format!("{GITEA}/pandaju/daozai/releases/download/v0.6.40/Daozai-v0.6.40-windows-x64.zip"),
-            "size":123,"digest":format!("sha256:{}", "a".repeat(64))}]);
-        let parsed = release_info(&value, "0.6.39").unwrap().unwrap();
+        let zip_name = "Daozai-v0.6.40-windows-x64.zip";
+        value["assets"] = serde_json::json!([{"name":zip_name,
+            "browser_download_url":format!("{GITEA}/pandaju/daozai/releases/download/v0.6.40/{zip_name}"),
+            "size":123}]);
+        let sums = format!("{}  {}\n", "a".repeat(64), zip_name);
+        let parsed = release_from_assets(&value, "0.6.39", &sums).unwrap().unwrap();
         assert!(parsed.package.is_some()); assert_eq!(parsed.notes, "更新说明");
+        assert_eq!(parsed.package.as_ref().unwrap().hash, "a".repeat(64));
         for (field, bad) in [("name", serde_json::json!("source.zip")), ("browser_download_url", serde_json::json!("https://example.com/download.zip")),
-            ("digest", serde_json::Value::Null), ("digest", serde_json::json!("sha256:bad")), ("size", serde_json::json!(0))] {
+            ("size", serde_json::json!(0))] {
             let mut invalid = value.clone(); invalid["assets"][0][field] = bad;
-            assert!(release_info(&invalid, "0.6.39").unwrap().unwrap().package.is_none());
+            assert!(release_from_assets(&invalid, "0.6.39", &sums).is_err());
         }
+        assert!(release_from_assets(&value, "0.6.39", "没有校验和的文件").is_err(),"SUMS 里没有对应哈希时必须拒绝");
     }
     #[test]
     fn download_rejects_truncation_corruption_excess_and_cancellation() {
