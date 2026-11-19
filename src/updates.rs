@@ -2,10 +2,31 @@
 use eframe::egui;
 use std::{io::{Read, Write}, path::PathBuf, sync::{mpsc::{self, Receiver}, Arc, atomic::{AtomicBool, Ordering}}, time::Duration};
 
-const REPOSITORY: &str = "https://github.com/Renly1994/xiaotang-daozai";
-const API: &str = "https://api.github.com/repos/Renly1994/xiaotang-daozai/releases/latest";
-const RELEASES: &str = "https://github.com/Renly1994/xiaotang-daozai/releases/latest";
+/// 更新源是自己的 Gitea：Release 与附件都在上面，仓库私有，需要访问令牌。
+const GITEA: &str = "https://git.redbrick.asia";
+const API: &str = "https://git.redbrick.asia/api/v1/repos/pandaju/daozai/releases/latest";
+const RELEASES: &str = "https://git.redbrick.asia/pandaju/daozai/releases/latest";
 const BACKUP_DOWNLOAD: &str = "https://pan.quark.cn/s/0a39b4e1f332";
+
+/// Gitea 访问令牌：用户在「设置 → 关于」保存进凭据管理器（Daozai.Gitea）。
+pub(crate) fn load_gitea_token() -> Option<String> {
+    keyring::Entry::new("Daozai.Gitea", "token")
+        .ok()
+        .and_then(|entry| entry.get_password().ok())
+        .filter(|token| !token.trim().is_empty())
+}
+
+/// 保存 Gitea 访问令牌；只进凭据管理器，不落设置文件。
+pub(crate) fn save_gitea_token(token: &str) -> Result<(), String> {
+    keyring::Entry::new("Daozai.Gitea", "token")
+        .map_err(|error| format!("凭据管理器不可用：{error}"))?
+        .set_password(token)
+        .map_err(|error| format!("保存令牌失败：{error}"))
+}
+
+fn auth_header() -> Option<String> {
+    load_gitea_token().map(|token| format!("token {}", token))
+}
 
 #[derive(Clone, Debug)]
 struct Release { version: String, notes: String, page: String, package: Option<Package> }
@@ -299,13 +320,15 @@ fn http_agent() -> Result<ureq::Agent, String> {
 }
 
 fn check() -> Result<Option<Release>, String> {
-    let response = http_agent()?
-        .get(API).set("User-Agent", concat!("Daozai/", env!("CARGO_PKG_VERSION")))
-        .set("Accept", "application/vnd.github+json").call().map_err(|error| match error {
-            ureq::Error::Status(403 | 429, _) => "检查过于频繁，请稍后重试".to_owned(),
-            ureq::Error::Status(404, _) => "暂未找到正式版本，请查看发布页".to_owned(),
-            _ => "无法连接更新服务，请检查网络或代理后重试".to_owned(),
-        })?;
+    let mut request = http_agent()?
+        .get(API).set("User-Agent", concat!("Daozai/", env!("CARGO_PKG_VERSION")));
+    if let Some(header) = auth_header() { request = request.set("Authorization", &header); }
+    let response = request.call().map_err(|error| match error {
+        ureq::Error::Status(401 | 403, _) => "Gitea 仓库私有：请在「设置 → 关于」填入 Gitea 访问令牌后重试".to_owned(),
+        ureq::Error::Status(404, _) => "暂未找到正式版本，请查看发布页".to_owned(),
+        ureq::Error::Status(429, _) => "检查过于频繁，请稍后重试".to_owned(),
+        _ => "无法连接更新服务，请检查网络或代理后重试".to_owned(),
+    })?;
     let value: serde_json::Value = serde_json::from_reader(response.into_reader())
         .map_err(|_| "更新信息格式异常，请稍后重试".to_owned())?;
     release_info(&value, env!("CARGO_PKG_VERSION"))
@@ -314,17 +337,39 @@ fn check() -> Result<Option<Release>, String> {
 fn release_info(value: &serde_json::Value, current: &str) -> Result<Option<Release>, String> {
     let Some(tag) = parse_release(value, current)? else { return Ok(None); };
     let name = format!("Daozai-v{}-windows-x64.zip", tag.trim_start_matches('v'));
-    let expected = format!("{REPOSITORY}/releases/download/{tag}/{name}");
-    let package = value["assets"].as_array().and_then(|assets| assets.iter().find(|asset| asset["name"] == name))
-        .and_then(|asset| {
-            let hash = asset["digest"].as_str()?.strip_prefix("sha256:")?;
-            let size = asset["size"].as_u64()?;
-            (asset["browser_download_url"].as_str()? == expected && size > 0 && size <= 200 * 1024 * 1024
-                && hash.len() == 64 && hash.bytes().all(|c| c.is_ascii_hexdigit()))
-                .then(|| Package { url: expected, size, hash: hash.to_ascii_lowercase() })
-        });
-    Ok(Some(Release { page: format!("{REPOSITORY}/releases/tag/{tag}"), version: tag,
-        notes: value["body"].as_str().unwrap_or("").to_owned(), package }))
+    let assets = value["assets"].as_array().ok_or_else(|| "更新信息缺少附件".to_owned())?;
+    let sums_url = assets.iter().find(|asset| asset["name"] == "SHA256SUMS.txt")
+        .and_then(|asset| asset["browser_download_url"].as_str())
+        .ok_or_else(|| "更新信息缺少校验文件".to_owned())?;
+    let zip = assets.iter().find(|asset| asset["name"] == name)
+        .ok_or_else(|| "请通过浏览器下载此版本".to_owned())?;
+    let url = zip["browser_download_url"].as_str().ok_or_else(|| "更新信息缺少下载地址".to_owned())?;
+    if !url.starts_with(GITEA) { return Err("更新下载地址异常，请通过浏览器下载".to_owned()); }
+    let size = zip["size"].as_u64().ok_or_else(|| "更新信息缺少大小".to_owned())?;
+    if size == 0 || size > 200 * 1024 * 1024 { return Err("更新包大小异常，请通过浏览器下载".to_owned()); }
+    let sums = fetch_text(sums_url)?;
+    let hash = sums.lines().find(|line| line.trim_end().ends_with(&name))
+        .and_then(|line| line.split_whitespace().next())
+        .filter(|hash| hash.len() == 64 && hash.bytes().all(|c| c.is_ascii_hexdigit()))
+        .ok_or_else(|| "校验文件缺少此版本的哈希".to_owned())?
+        .to_ascii_lowercase();
+    Ok(Some(Release { page: format!("{GITEA}/pandaju/daozai/releases/tag/{tag}"), version: tag,
+        notes: value["body"].as_str().unwrap_or("").to_owned(),
+        package: Some(Package { url: url.to_owned(), size, hash }) }))
+}
+
+/// 拉取小文本（SHA256SUMS.txt）；同样需要令牌。
+fn fetch_text(url: &str) -> Result<String, String> {
+    let mut request = http_agent()?.get(url);
+    if let Some(header) = auth_header() { request = request.set("Authorization", &header); }
+    let response = request.call().map_err(|error| match error {
+        ureq::Error::Status(401 | 403, _) => "Gitea 仓库私有：请在「设置 → 关于」填入 Gitea 访问令牌后重试".to_owned(),
+        _ => "无法读取更新校验文件，请稍后重试".to_owned(),
+    })?;
+    let mut text = String::new();
+    response.into_reader().take(256 * 1024).read_to_string(&mut text)
+        .map_err(|_| "校验文件读取失败，请稍后重试".to_owned())?;
+    Ok(text)
 }
 
 fn download(release: &Release, tx: &mpsc::Sender<Event>, cancel: &AtomicBool) -> Result<PathBuf, String> {
@@ -333,9 +378,10 @@ fn download(release: &Release, tx: &mpsc::Sender<Event>, cancel: &AtomicBool) ->
     let work = root.join(format!("{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos()));
     std::fs::create_dir_all(&work).map_err(|_| "无法创建更新缓存")?;
     let result = (|| {
-        let response = http_agent()?
-            .get(&package.url).call().map_err(|_| "连接下载服务器失败，请检查网络或代理，或使用网盘下载")?;
-        if !response.get_url().starts_with("https://") { return Err("更新下载未使用安全连接".into()); }
+        let mut request = http_agent()?.get(&package.url);
+        if let Some(header) = auth_header() { request = request.set("Authorization", &header); }
+        let response = request.call().map_err(|_| "连接下载服务器失败，请检查网络或代理，或使用网盘下载")?;
+        if !response.get_url().starts_with(GITEA) { return Err("更新下载未使用安全连接".into()); }
         let mut input = response.into_reader();
         let mut output = std::fs::File::create(work.join("update.zip")).map_err(|_| "无法保存更新包")?;
         transfer(&mut input, &mut output, package, cancel, |progress| { let _ = tx.send(Event::Progress(progress)); })?;
@@ -504,7 +550,7 @@ mod tests {
         let mut value = release("v0.6.40");
         value["body"] = "更新说明".into();
         value["assets"] = serde_json::json!([{"name":"Daozai-v0.6.40-windows-x64.zip",
-            "browser_download_url":format!("{REPOSITORY}/releases/download/v0.6.40/Daozai-v0.6.40-windows-x64.zip"),
+            "browser_download_url":format!("{GITEA}/pandaju/daozai/releases/download/v0.6.40/Daozai-v0.6.40-windows-x64.zip"),
             "size":123,"digest":format!("sha256:{}", "a".repeat(64))}]);
         let parsed = release_info(&value, "0.6.39").unwrap().unwrap();
         assert!(parsed.package.is_some()); assert_eq!(parsed.notes, "更新说明");

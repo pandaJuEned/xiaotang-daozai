@@ -328,7 +328,7 @@ impl App {
                     .devices
                     .iter()
                     .filter(|device| device.online && device.id != self.sync_device.id)
-                    .filter_map(|device| device.monitor().map(|monitor| (device.name.clone(), monitor)))
+                    .filter_map(|device| device.presence_data().map(|presence| (device.name.clone(), presence)))
                     .collect();
                 if remote.is_empty() {
                     ui.add_space(18.0);
@@ -343,7 +343,8 @@ impl App {
                     return;
                 }
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    for (name, monitor) in remote {
+                    for (name, presence) in remote {
+                    let monitor = match presence.monitor { Some(monitor) => monitor, None => continue };
                         egui::Frame::new()
                             .fill(ui.visuals().faint_bg_color)
                             .corner_radius(10.0)
@@ -387,6 +388,24 @@ impl App {
                                     metric(ui, "硬盘", monitor.disk, "%");
                                     metric(ui, "温度", monitor.temp, "°");
                                     metric(ui, "显卡", monitor.gpu, "%");
+                                    let battery = presence.battery.as_ref();
+                                    let battery_text = match battery.and_then(|battery| battery.percent) {
+                                        Some(percent) => format!(
+                                            "电池 {}%{}",
+                                            percent,
+                                            if battery.is_some_and(|battery| battery.charging) { " 充电中" } else { "" }
+                                        ),
+                                        None if battery.is_some_and(|battery| battery.ac_online) => "电源供电".into(),
+                                        None if battery.is_some() => "未接电源".into(),
+                                        None => "--".into(),
+                                    };
+                                    ui.label(
+                                        egui::RichText::new("电池")
+                                            .size(11.0)
+                                            .color(ui.visuals().weak_text_color()),
+                                    );
+                                    ui.label(egui::RichText::new(battery_text).size(13.0).strong());
+                                    ui.add_space(10.0);
                                 });
                             });
                         ui.add_space(8.0);

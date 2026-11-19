@@ -39,10 +39,8 @@ pub const CALENDAR_PAGE: usize = 7;
 pub const WEATHER_PAGE: usize = 8;
 /// 系统监控页（第 10 个功能页面）。
 pub const MONITOR_PAGE: usize = 9;
-/// 异地天气页（第 11 个功能页面）：其他在线设备的当地天气。
-pub const REMOTE_WEATHER_PAGE: usize = 10;
-/// 异地监控页（第 12 个功能页面）：其他在线设备的监控与在场信息。
-pub const REMOTE_MONITOR_PAGE: usize = 11;
+/// 异地页（第 11 个功能页面）：其他在线设备的天气、监控、番茄与提醒数。
+pub const REMOTE_PAGE: usize = 10;
 pub(crate) const WEATHER_H: f32 = 232.0;
 pub(crate) const MONITOR_H: f32 = 236.0;
 pub(crate) const CALENDAR_H: f32 = 216.0;
@@ -71,8 +69,8 @@ fn pill_shadow(painter:&egui::Painter,rect:Rect,radius:f32,strength:f32){
         painter.rect_filled(r,radius+grow*0.8,Color32::from_black_alpha((255.0*a*strength) as u8));
     }
 }
-pub(crate) const PAGE_NAMES: [&str; 12] = ["音乐", "专注", "健康", "置物架", "待办", "邮箱", "AI 额度", "日程", "天气", "系统监控", "异地天气", "异地监控"];
-pub(crate) const PAGE_SETTINGS_TABS: [usize; 12] = [1,2,3,5,4,7,11,8,12,13,12,13];
+pub(crate) const PAGE_NAMES: [&str; 11] = ["音乐", "专注", "健康", "置物架", "待办", "邮箱", "AI 额度", "日程", "天气", "系统监控", "异地"];
+pub(crate) const PAGE_SETTINGS_TABS: [usize; 11] = [1,2,3,5,4,7,11,8,12,13,15];
 
 // ---------- 动效参数 ----------
 /// 悬停意图缓冲：光标停留这么久才真正展开（期间药丸轻微胀大作为反馈），防误触。
@@ -734,7 +732,7 @@ pub struct App {
     page_dir: f32,
     page_t0: f64,
     slide: Spring,
-    dots: [Spring; 12],
+    dots: [Spring; 11],
     wheel_delta: f32,
     wheel_at: f64,
     wheel_page_at: f64,
@@ -817,6 +815,8 @@ pub struct App {
     pub(crate) settings_tab:usize,
     /// 合并页「课表与多端」内部的分段：0 课表，1 多端同步。
     pub(crate) nos_sync_section:u8,
+    /// Gitea 访问令牌草稿（检查更新用，正式值在凭据管理器）。
+    pub(crate) gitea_token_draft: Option<String>,
     pub(crate) settings_category:usize,
     pub messenger_statuses:std::collections::HashMap<Messenger,String>,
     pub(crate) notification_apps:model::NotificationApps,
@@ -997,7 +997,7 @@ impl App {
             media_anchor: (String::new(), 0.0, 0.0, false),
             media: NowPlaying::default(),
             music_artwork: None,
-            forced_open_until:0.0, settings_open:false, settings_window:std::sync::Arc::new(std::sync::Mutex::new(crate::settings_window::State::load())), displays:Vec::new(), browser_at_top:false, browser_minimal_active:false, glass_tint:0.0, fluid:Default::default(), fluid_origin:Pos2::ZERO, fluid_art:None, fluid_title:String::new(), screen:None, settings_focus_requested:false, settings_tab:0, nos_sync_section:0, settings_category:0, messenger_statuses:Default::default(), notification_apps:model::NotificationApps::load(), subpage:None, task_dialog:None, todo_reminder:None,
+            forced_open_until:0.0, settings_open:false, settings_window:std::sync::Arc::new(std::sync::Mutex::new(crate::settings_window::State::load())), displays:Vec::new(), browser_at_top:false, browser_minimal_active:false, glass_tint:0.0, fluid:Default::default(), fluid_origin:Pos2::ZERO, fluid_art:None, fluid_title:String::new(), screen:None, settings_focus_requested:false, settings_tab:0, nos_sync_section:0, gitea_token_draft: None, settings_category:0, messenger_statuses:Default::default(), notification_apps:model::NotificationApps::load(), subpage:None, task_dialog:None, todo_reminder:None,
             monitor_cfg: crate::monitor::MonitorConfig::load(), monitor_open: false, remote_monitor_open: false,
             monitor_interfaces: Vec::new(), monitor_history: None,
             monitor_trend: Default::default(), monitor_last: None,
@@ -1316,6 +1316,14 @@ impl App {
                 gpu: snapshot.gpu_percent,
             }
         });
+        let battery = self.monitor_last.as_ref().and_then(|snapshot| {
+            let power = &snapshot.power;
+            Some(crate::sync::PresenceBattery {
+                percent: power.battery_percent.map(|percent| percent.round().clamp(0.0, 100.0) as u8),
+                charging: power.charging == Some(true),
+                ac_online: power.ac_online == Some(true),
+            })
+        });
         crate::sync::PresenceOut {
             weather,
             monitor,
@@ -1331,6 +1339,7 @@ impl App {
                     running: self.pomo.running,
                 }
             }),
+            battery,
         }
     }
 
@@ -3067,8 +3076,7 @@ impl App {
             5 => ("邮箱", "", theme::CYAN),
             6 => ("AI", "额度", theme::SOFT_GREEN),
             MONITOR_PAGE => ("系统", "监控", theme::CYAN),
-            REMOTE_WEATHER_PAGE => ("异地", "天气", theme::CYAN),
-            REMOTE_MONITOR_PAGE => ("异地", "监控", theme::SOFT_GREEN),
+            REMOTE_PAGE => ("异地", "设备", theme::CYAN),
             8 if self.weather.solar_open => ("日出", "日落", theme::YELLOW),
             8 => ("当地", "天气", theme::CYAN),
             _ => ("岛仔", "设置", theme::WHITE),
@@ -3083,7 +3091,7 @@ impl App {
         let pages: Vec<_>=self.settings.page_order.iter().copied().filter(|page|self.settings.visible_pages[*page]).collect();
         if pages.len()<2 { return; }
         // 高页面（额度、天气、系统监控、异地两页）的箭头要下移，跟内容中线对齐。
-        let arrow_y=if self.page==6||self.page==8||self.page==MONITOR_PAGE||self.page==REMOTE_WEATHER_PAGE||self.page==REMOTE_MONITOR_PAGE{88.0}else{68.0};
+        let arrow_y=if self.page==6||self.page==8||self.page==MONITOR_PAGE||self.page==REMOTE_PAGE{88.0}else{68.0};
         let l = c.hit(8.0, arrow_y-13.0, 26.0, 26.0, "nav-l");
         let r = c.hit(385.0, arrow_y-13.0, 26.0, 26.0, "nav-r");
         let (lh, lp) = c.hover_t(&l);
@@ -3132,8 +3140,7 @@ impl App {
             8 => self.page_weather(c,env,cmds),
             CALENDAR_PAGE => self.page_calendar(c,env),
             MONITOR_PAGE => self.page_monitor(c,env),
-            REMOTE_WEATHER_PAGE => self.page_remote_weather(c,env),
-            REMOTE_MONITOR_PAGE => self.page_remote_monitor(c,env),
+            REMOTE_PAGE => self.page_remote(c,env),
             _ => self.page_settings(c),
         }
     }

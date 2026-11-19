@@ -749,6 +749,20 @@ pub struct PresenceOut {
     /// 本机番茄状态：专注/休息与剩余分钟，实时在场的一部分。
     #[serde(default)]
     pub focus: Option<PresenceFocus>,
+    /// 本机电池：没有电池的台式机为 None 或 percent None。
+    #[serde(default)]
+    pub battery: Option<PresenceBattery>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct PresenceBattery {
+    #[serde(default)]
+    pub percent: Option<u8>,
+    #[serde(default)]
+    pub charging: bool,
+    /// 台式机没有电池：ac_online 时显示「电源供电」。
+    #[serde(default)]
+    pub ac_online: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]

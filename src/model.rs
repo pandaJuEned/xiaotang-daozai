@@ -199,8 +199,8 @@ pub struct Settings {
     pub browser_minimal: bool,
     pub avoid_browsers: bool,
     pub avoid_apps: Vec<(String,String)>,
-    pub visible_pages: [bool; 12],
-    pub page_order: [usize; 12],
+    pub visible_pages: [bool; 11],
+    pub page_order: [usize; 11],
     pub show_battery: bool,
     /// 常驻栏显示实时网速（P3）；无监控数据时自动隐藏。
     pub show_net_speed: bool,
@@ -309,7 +309,7 @@ pub struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { display_id: String::new(), skin: Skin::Classic, island_shape: IslandShape::Notch, glass_blur: true, island_size: 100, island_offset: 0, dock: Dock::Top, settings_theme: Default::default(), pet: true, minimal: false, browser_minimal: false, avoid_browsers: true, avoid_apps: Vec::new(), visible_pages: [true; 12], page_order: [0,1,2,3,4,5,6,7,8,9,10,11], show_battery: true, show_net_speed: false, show_course: false, show_quota: true, show_calendar_status: false, show_cpu: false, show_gpu: false, show_memory: false, show_disk: false, show_temperature: true, show_remote_monitor: false, elevated_sensors: false, quota_reset_notice: true, clock_12h: false, clock_period: 0, resident_order: Vec::new(), system_hud: true, bluetooth_notifications: true, read_notifications:false, wechat_notifications:false, wecom_notifications:false, feishu_notifications:false, dingtalk_notifications:false, wechat_tray_open:false, qq_only:false, notification_preview:false, notifications: true, sound: false, lyrics_enabled:true, island_lyrics:false, lyric_delay_ms:-350, hide_fullscreen: true, avoid_top_bar: true, focus_minutes: 25, rest_minutes: 5, water_minutes: 45, serving_ml: 250, water_start: 9, water_end: 22, sit_remind: true, sit_minutes: 60, lunch_rest: true, lunch_start: 720, lunch_end: 810, mail_enabled: true, mail_sync_operations:false, mail_code: true, mail_code_hide_seconds:60, mail_interval: 120, mail_ics: 15, ignored_mail_events: Vec::new(), calendar_prompt: true, calendar_auto_sync: true, clipboard_history: true, weather_city: String::new(), weather_position: None, weather_saved: Vec::new(), render_compat: false, render_compat_reason: String::new(), nos_enabled: false, nos_base_url: String::new(), sync_enabled: false, sync_primary_device: String::new(), nos_server_enabled: false, nos_server_auto_start: false, nos_server_dir: String::new(), nos_server_python: String::new(), nos_server_host: crate::nos_server::DEFAULT_HOST.into(), nos_server_port: crate::nos_server::DEFAULT_PORT }
+        Self { display_id: String::new(), skin: Skin::Classic, island_shape: IslandShape::Notch, glass_blur: true, island_size: 100, island_offset: 0, dock: Dock::Top, settings_theme: Default::default(), pet: true, minimal: false, browser_minimal: false, avoid_browsers: true, avoid_apps: Vec::new(), visible_pages: [true; 11], page_order: [0,1,2,3,4,5,6,7,8,9,10], show_battery: true, show_net_speed: false, show_course: false, show_quota: true, show_calendar_status: false, show_cpu: false, show_gpu: false, show_memory: false, show_disk: false, show_temperature: true, show_remote_monitor: false, elevated_sensors: false, quota_reset_notice: true, clock_12h: false, clock_period: 0, resident_order: Vec::new(), system_hud: true, bluetooth_notifications: true, read_notifications:false, wechat_notifications:false, wecom_notifications:false, feishu_notifications:false, dingtalk_notifications:false, wechat_tray_open:false, qq_only:false, notification_preview:false, notifications: true, sound: false, lyrics_enabled:true, island_lyrics:false, lyric_delay_ms:-350, hide_fullscreen: true, avoid_top_bar: true, focus_minutes: 25, rest_minutes: 5, water_minutes: 45, serving_ml: 250, water_start: 9, water_end: 22, sit_remind: true, sit_minutes: 60, lunch_rest: true, lunch_start: 720, lunch_end: 810, mail_enabled: true, mail_sync_operations:false, mail_code: true, mail_code_hide_seconds:60, mail_interval: 120, mail_ics: 15, ignored_mail_events: Vec::new(), calendar_prompt: true, calendar_auto_sync: true, clipboard_history: true, weather_city: String::new(), weather_position: None, weather_saved: Vec::new(), render_compat: false, render_compat_reason: String::new(), nos_enabled: false, nos_base_url: String::new(), sync_enabled: false, sync_primary_device: String::new(), nos_server_enabled: false, nos_server_auto_start: false, nos_server_dir: String::new(), nos_server_python: String::new(), nos_server_host: crate::nos_server::DEFAULT_HOST.into(), nos_server_port: crate::nos_server::DEFAULT_PORT }
     }
 }
 
@@ -364,26 +364,27 @@ impl Settings {
                 }
                 "page_order" => {
                     if let Ok(order)=v.split(',').map(str::parse::<usize>).collect::<Result<Vec<_>,_>>() {
+                        // 0.7.0 的 12 页顺序里第 12 位（旧异地监控）并入「异地」页。
                         if order.len()==12 && (0..12).all(|page|order.contains(&page)) {
+                            let merged: Vec<usize>=order.into_iter().filter(|page|*page!=11).collect();
+                            if merged.len()==11 { s.page_order.copy_from_slice(&merged); }
+                        } else if order.len()==11 && (0..11).all(|page|order.contains(&page)) {
                             s.page_order.copy_from_slice(&order);
                         } else if order.len()==10 && (0..10).all(|page|order.contains(&page)) {
-                            // 旧配置里没有异地两页：接在最后，其余顺序保持不变。
+                            // 旧配置里没有异地页：接在最后，其余顺序保持不变。
                             s.page_order[..10].copy_from_slice(&order);
                             s.page_order[10]=10;
-                            s.page_order[11]=11;
                         } else if order.len()==9 && (0..9).all(|page|order.contains(&page)) {
-                            // 旧配置里没有系统监控页：接在最后，其余顺序保持不变。
+                            // 更旧：没有系统监控页。
                             s.page_order[..9].copy_from_slice(&order);
                             s.page_order[9]=9;
                             s.page_order[10]=10;
-                            s.page_order[11]=11;
                         } else if order.len()==8 && (0..8).all(|page|order.contains(&page)) {
-                            // 更旧的配置里还没有天气页与系统监控页。
+                            // 最旧：没有天气页与系统监控页。
                             s.page_order[..8].copy_from_slice(&order);
                             s.page_order[8]=8;
                             s.page_order[9]=9;
                             s.page_order[10]=10;
-                            s.page_order[11]=11;
                         }
                     }
                 }
@@ -403,8 +404,14 @@ impl Settings {
                 "elevated_sensors" => s.elevated_sensors = v != "0",
                 "quota_reset_notice" => s.quota_reset_notice = v != "0",
                 "visible_pages" if (6..=12).contains(&v.len()) && v.bytes().all(|b| b==b'0' || b==b'1') => {
-                    for (enabled,value) in s.visible_pages.iter_mut().zip(v.bytes()) { *enabled=value==b'1'; }
-                    for enabled in &mut s.visible_pages[v.len()..]{*enabled=v.bytes().any(|b|b==b'1');}
+                    // 0.7.0 曾有 12 页：异地天气与监控合并为一页，第 12 位并入第 11 位。
+                    let mut merged: Vec<bool> = v.bytes().take(11).map(|b| b==b'1').collect();
+                    if v.len()==12 && v.as_bytes()[11]==b'1' {
+                        if let Some(last)=merged.last_mut() { *last=true; }
+                    }
+                    let any=merged.iter().any(|enabled|*enabled);
+                    for (enabled,value) in s.visible_pages.iter_mut().zip(merged.iter()) { *enabled=*value; }
+                    for enabled in s.visible_pages[merged.len()..].iter_mut() { *enabled=any; }
                 }
                 "read_notifications" => s.read_notifications=v=="1",
                 "wechat_notifications" => s.wechat_notifications=v=="1",

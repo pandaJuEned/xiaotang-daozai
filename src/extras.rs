@@ -2042,6 +2042,19 @@ impl App {
                                 ui.hyperlink_to("CC BY 4.0", "https://creativecommons.org/licenses/by/4.0/");
                             });
                         });
+                        ui.horizontal(|ui|{
+                            ui.label(egui::RichText::new("Gitea 令牌").size(12.5));
+                            if self.gitea_token_draft.is_none(){
+                                self.gitea_token_draft=Some(crate::updates::load_gitea_token().unwrap_or_default());
+                            }
+                            ui.add(egui::TextEdit::singleline(self.gitea_token_draft.as_mut().expect("Gitea 令牌草稿")).password(true).desired_width(200.0).hint_text("更新检查用，只进凭据管理器"));
+                            if ui.button("保存").clicked(){
+                                let value=self.gitea_token_draft.clone().unwrap_or_default().trim().to_string();
+                                if value.is_empty(){ self.say("请先粘贴 Gitea 访问令牌"); }
+                                else { match crate::updates::save_gitea_token(&value){ Ok(())=>self.say("Gitea 令牌已保存，可以检查更新了"), Err(error)=>self.say(format!("保存令牌失败：{error}")) } }
+                            }
+                        });
+                        ui.label(egui::RichText::new("Gitea 仓库私有：在 Gitea「设置 → 应用」生成只读令牌并保存后即可检查更新。").size(11.0).color(settings_color(ctx,Color32::from_gray(150),Color32::from_gray(105))));
                         settings_label(ui,"原始项目");
                         settings_card(ui,|ui|{
                             ui.horizontal_wrapped(|ui|{
