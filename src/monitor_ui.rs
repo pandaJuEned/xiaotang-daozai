@@ -195,9 +195,56 @@ impl App {
             setting_row(ui, "常驻栏显示网速", "收起时在岛上显示实时下行/上行速率", &mut self.settings.show_net_speed);
             ui.separator();
             setting_row(ui, "显示监控窗口", "独立仪表盘；也可从托盘菜单开关", &mut self.monitor_open);
+            ui.separator();
+            setting_row(ui, "查看其他设备的系统监控", "只接收 CPU / 内存 / 硬盘 / 温度 / 显卡这类数字，不传进程名；默认关闭", &mut self.settings.show_remote_monitor);
             ui.add_space(3.0);
             ui.small("窗口置顶、鼠标穿透、贴靠右下角在仪表盘右上角齿轮里切换。");
         });
+        if self.settings.show_remote_monitor {
+            settings_label(ui, "其他设备");
+            settings_card(ui, |ui| {
+                let remote: Vec<_> = self
+                    .sync
+                    .devices
+                    .iter()
+                    .filter(|device| device.online && device.id != self.sync_device.id)
+                    .filter_map(|device| device.monitor().map(|monitor| (device.name.clone(), monitor)))
+                    .collect();
+                if remote.is_empty() {
+                    ui.small("暂时没有其他在线设备上报监控；两台都启用同步并保持在线后，这里会出现读数。");
+                    return;
+                }
+                for (index, (name, monitor)) in remote.iter().enumerate() {
+                    if index > 0 {
+                        ui.separator();
+                    }
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(name).size(13.0));
+                    });
+                    let value = |value: Option<f32>, suffix: &str| {
+                        value
+                            .map(|value| format!("{value:.0}{suffix}"))
+                            .unwrap_or_else(|| "--".into())
+                    };
+                    ui.horizontal_wrapped(|ui| {
+                        for (label, text) in [
+                            ("CPU", value(monitor.cpu, "%")),
+                            ("内存", value(monitor.mem, "%")),
+                            ("硬盘", value(monitor.disk, "%")),
+                            ("温度", value(monitor.temp, "°")),
+                            ("显卡", value(monitor.gpu, "%")),
+                        ] {
+                            ui.label(RichText::new(format!("{label} {text}")).size(11.5).color(ui.visuals().weak_text_color()));
+                            ui.add_space(8.0);
+                        }
+                    });
+                }
+                ui.add_space(5.0);
+                if ui.button("打开异地监控窗口").clicked() {
+                    self.remote_monitor_open = true;
+                }
+            });
+        }
         settings_label(ui, "单位");
         settings_card(ui, |ui| {
             setting_row(ui, "以字节为单位", "关闭后按比特(bit)显示", &mut self.monitor_cfg.display.unit_byte);

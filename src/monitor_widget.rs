@@ -301,6 +301,102 @@ impl App {
         });
     }
 
+    /// 异地监控：只读其他在线设备通过 presence 带来的纯数字快照。
+    pub fn remote_monitor_window(&mut self, ctx: &egui::Context) {
+        if !self.remote_monitor_open {
+            return;
+        }
+        let id = egui::ViewportId::from_hash_of("daozai-remote-monitor");
+        let builder = egui::ViewportBuilder::default()
+            .with_title("异地监控")
+            .with_inner_size([520.0, 380.0])
+            .with_min_inner_size([420.0, 280.0]);
+        ctx.show_viewport_immediate(id, builder, |ctx, _| {
+            if ctx.input(|input| input.viewport().close_requested()) {
+                self.remote_monitor_open = false;
+            }
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.heading("其他设备");
+                ui.label(
+                    egui::RichText::new("只有在线、启用同步并上报了监控的设备会出现；数值每 30 秒刷新一次。")
+                        .size(11.5)
+                        .color(ui.visuals().weak_text_color()),
+                );
+                ui.separator();
+                let remote: Vec<_> = self
+                    .sync
+                    .devices
+                    .iter()
+                    .filter(|device| device.online && device.id != self.sync_device.id)
+                    .filter_map(|device| device.monitor().map(|monitor| (device.name.clone(), monitor)))
+                    .collect();
+                if remote.is_empty() {
+                    ui.add_space(18.0);
+                    ui.vertical_centered(|ui| {
+                        ui.label(egui::RichText::new("暂时没有其他在线设备").size(14.0));
+                        ui.label(
+                            egui::RichText::new("两台都启用同步并保持在线后，这里会显示 CPU、内存、温度等读数。")
+                                .size(11.5)
+                                .color(ui.visuals().weak_text_color()),
+                        );
+                    });
+                    return;
+                }
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    for (name, monitor) in remote {
+                        egui::Frame::new()
+                            .fill(ui.visuals().faint_bg_color)
+                            .corner_radius(10.0)
+                            .inner_margin(egui::Margin::symmetric(14, 10))
+                            .show(ui, |ui| {
+                                ui.set_min_width(ui.available_width());
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new(&name).size(14.0).strong());
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            ui.label(
+                                                egui::RichText::new("● 在线")
+                                                    .size(11.0)
+                                                    .color(egui::Color32::from_rgb(90, 190, 120)),
+                                            );
+                                        },
+                                    );
+                                });
+                                ui.add_space(4.0);
+                                ui.horizontal_wrapped(|ui| {
+                                    let metric = |ui: &mut egui::Ui, label: &str, value: Option<f32>, suffix: &str| {
+                                        ui.label(
+                                            egui::RichText::new(label)
+                                                .size(11.0)
+                                                .color(ui.visuals().weak_text_color()),
+                                        );
+                                        ui.label(
+                                            egui::RichText::new(
+                                                value
+                                                    .map(|value| format!("{value:.0}{suffix}"))
+                                                    .unwrap_or_else(|| "--".into()),
+                                            )
+                                            .size(13.0)
+                                            .strong(),
+                                        );
+                                        ui.add_space(10.0);
+                                    };
+                                    metric(ui, "CPU", monitor.cpu, "%");
+                                    metric(ui, "内存", monitor.mem, "%");
+                                    metric(ui, "硬盘", monitor.disk, "%");
+                                    metric(ui, "温度", monitor.temp, "°");
+                                    metric(ui, "显卡", monitor.gpu, "%");
+                                });
+                            });
+                        ui.add_space(8.0);
+                    }
+                });
+            });
+            ctx.request_repaint_after(std::time::Duration::from_secs(2));
+        });
+    }
+
     fn dashboard(
         &mut self,
         ui: &mut egui::Ui,

@@ -9,6 +9,30 @@ use crate::app::{App, Cmd};
 use crate::extras::{setting_row, settings_card, settings_label};
 
 impl App {
+    /// 合并页：课表与多端同步共用同一个 NOS 地址和一枚 PAT。
+    pub(crate) fn nos_sync_settings(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            for (section, label) in [(0u8, "课表"), (1, "多端同步")] {
+                let selected = self.nos_sync_section == section;
+                let button = egui::Button::new(RichText::new(label).size(13.0)).selected(selected);
+                if ui.add_sized([96.0, 30.0], button).clicked() {
+                    self.nos_sync_section = section;
+                }
+            }
+            ui.label(
+                RichText::new("同一个 NOS 地址与访问令牌；令牌勾选「读取日程 + 多机同步」即可两用")
+                    .size(11.0)
+                    .color(egui::Color32::from_gray(150)),
+            );
+        });
+        ui.separator();
+        match self.nos_sync_section {
+            0 => self.nos_settings(ui),
+            _ => self.sync_settings(ui),
+        }
+    }
+
     pub(crate) fn sync_settings(&mut self, ui: &mut egui::Ui) {
         ui.add_space(4.0);
         // 设备身份懒加载：只有真的打开这一页才生成 device.json。

@@ -676,6 +676,8 @@ pub struct App {
     pub monitor_cfg: crate::monitor::MonitorConfig,
     /// 独立监控悬浮窗是否打开（托盘开关与设置页共用）。
     pub monitor_open: bool,
+    /// 异地监控小窗：只在用户从监控页或设置页主动打开时出现。
+    pub remote_monitor_open: bool,
     /// 可用网卡（P4）：外壳在 Windows 启动时填充 `(InterfaceIndex, 名称)`，非 Windows 为空。
     pub monitor_interfaces: Vec<(u32, String)>,
     /// 历史流量缓存（P4）：打开历史页签时读一次，避免每帧读盘。
@@ -809,6 +811,8 @@ pub struct App {
     screen:Option<Rect>,
     pub(crate) settings_focus_requested:bool,
     pub(crate) settings_tab:usize,
+    /// 合并页「课表与多端」内部的分段：0 课表，1 多端同步。
+    pub(crate) nos_sync_section:u8,
     pub(crate) settings_category:usize,
     pub messenger_statuses:std::collections::HashMap<Messenger,String>,
     pub(crate) notification_apps:model::NotificationApps,
@@ -991,8 +995,8 @@ impl App {
             media_anchor: (String::new(), 0.0, 0.0, false),
             media: NowPlaying::default(),
             music_artwork: None,
-            forced_open_until:0.0, settings_open:false, settings_window:std::sync::Arc::new(std::sync::Mutex::new(crate::settings_window::State::load())), displays:Vec::new(), browser_at_top:false, browser_minimal_active:false, glass_tint:0.0, fluid:Default::default(), fluid_origin:Pos2::ZERO, fluid_art:None, fluid_title:String::new(), screen:None, settings_focus_requested:false, settings_tab:0, settings_category:0, messenger_statuses:Default::default(), notification_apps:model::NotificationApps::load(), subpage:None, task_dialog:None, todo_reminder:None,
-            monitor_cfg: crate::monitor::MonitorConfig::load(), monitor_open: false,
+            forced_open_until:0.0, settings_open:false, settings_window:std::sync::Arc::new(std::sync::Mutex::new(crate::settings_window::State::load())), displays:Vec::new(), browser_at_top:false, browser_minimal_active:false, glass_tint:0.0, fluid:Default::default(), fluid_origin:Pos2::ZERO, fluid_art:None, fluid_title:String::new(), screen:None, settings_focus_requested:false, settings_tab:0, nos_sync_section:0, settings_category:0, messenger_statuses:Default::default(), notification_apps:model::NotificationApps::load(), subpage:None, task_dialog:None, todo_reminder:None,
+            monitor_cfg: crate::monitor::MonitorConfig::load(), monitor_open: false, remote_monitor_open: false,
             monitor_interfaces: Vec::new(), monitor_history: None,
             monitor_trend: Default::default(), monitor_last: None,
             webdav: Default::default(), webdav_saved: crate::webdav::Config::load(),
@@ -1286,6 +1290,33 @@ impl App {
             base_url: self.settings.nos_base_url.trim().to_string(),
             token: crate::nos::secrets::load().unwrap_or_default(),
         }
+    }
+
+    /// 本机 presence：天气与系统监控的短状态，由同步线程每 30 秒带给其他设备。
+    pub fn presence_out(&self) -> crate::sync::PresenceOut {
+        let weather = self.weather.snapshot.as_ref().map(|snapshot| {
+            crate::sync::PresenceWeather {
+                city: if snapshot.place.trim().is_empty() {
+                    self.settings.weather_city.clone()
+                } else {
+                    snapshot.place.clone()
+                },
+                temp: snapshot.temp,
+                code: snapshot.code,
+                text: crate::weather::describe(snapshot.code).to_string(),
+                at: snapshot.at,
+            }
+        });
+        let monitor = self.monitor_last.as_ref().map(|snapshot| {
+            crate::sync::PresenceMonitor {
+                cpu: snapshot.cpu_percent,
+                mem: snapshot.mem_percent(),
+                disk: snapshot.disk_percent,
+                temp: snapshot.hottest_temp(),
+                gpu: snapshot.gpu_percent,
+            }
+        });
+        crate::sync::PresenceOut { weather, monitor }
     }
 
     /// 同步配置：地址来自设置，令牌来自凭据管理器，设备身份来自 `device.json`。

@@ -124,6 +124,30 @@ impl App {
         if refresh.clicked() {
             self.monitor_trend.clear();
         }
+        if self.settings.show_remote_monitor {
+            let count = self
+                .sync
+                .devices
+                .iter()
+                .filter(|device| device.online && device.id != self.sync_device.id && device.monitor().is_some())
+                .count();
+            if count > 0 {
+                let (button, body) = crate::paint::capsule(
+                    c,
+                    42.0,
+                    5.0,
+                    78.0,
+                    22.0,
+                    "monitor-remote",
+                    theme::BTN,
+                    theme::BTN_HOVER,
+                );
+                body.text(81.0, 21.0, &format!("异地 {count}"), 10.0, W::Semibold, theme::WHITE, H::Center);
+                if button.clicked() {
+                    self.remote_monitor_open = true;
+                }
+            }
+        }
 
         let Some(m) = env.monitor else {
             c.text(209.5, 96.0, "还没有监控数据", 13.0, W::Bold, theme::WHITE, H::Center);

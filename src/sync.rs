@@ -205,19 +205,29 @@ pub mod secrets {
             .map_err(|error| format!("凭据管理器不可用：{error}"))?;
         entry
             .set_password(token)
-            .map_err(|error| format!("保存令牌失败：{error}"))
+            .map_err(|error| format!("保存令牌失败：{error}"))?;
+        // 课表与多端同步共用一枚 NOS PAT：同步页保存时一并写入课表条目，
+        // 这样旧版课表页也能直接读到同一枚令牌。
+        crate::nos::secrets::save(token)
     }
 
     pub fn load() -> Result<String, String> {
         let entry = keyring::Entry::new(SERVICE, "token")
             .map_err(|error| format!("凭据管理器不可用：{error}"))?;
-        entry.get_password().map_err(|_| "没有保存令牌".to_string())
+        if let Ok(token) = entry.get_password() {
+            if !token.trim().is_empty() {
+                return Ok(token);
+            }
+        }
+        // 合并页只填一次令牌：同步条目没有时回退到课表条目。
+        crate::nos::secrets::load()
     }
 
     pub fn delete() {
         if let Ok(entry) = keyring::Entry::new(SERVICE, "token") {
             let _ = entry.delete_credential();
         }
+        crate::nos::secrets::delete();
     }
 }
 
@@ -526,6 +536,9 @@ pub struct Device {
     pub online: bool,
     #[serde(default)]
     pub last_seen_at: String,
+    /// 最后一次 presence：各端天气、系统监控等短状态。
+    #[serde(default)]
+    pub presence: serde_json::Value,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -671,6 +684,22 @@ fn devices(agent: &ureq::Agent, cfg: &Config) -> Result<DevicesResponse, String>
     get_json(agent, &format!("{base}/api/daozai/devices"), &cfg.token)
 }
 
+/// 在场心跳：不进变更流、90 秒过期，只给其他设备「看一眼」本机天气与监控。
+fn send_presence(agent: &ureq::Agent, cfg: &Config, state: &PresenceOut) -> Result<(), String> {
+    let base = normalize_base(&cfg.base_url);
+    let body = serde_json::json!({
+        "device": cfg.device_id,
+        "state": state,
+    });
+    let _: serde_json::Value = post_json(
+        agent,
+        &format!("{base}/api/daozai/presence"),
+        &cfg.token,
+        &body,
+    )?;
+    Ok(())
+}
+
 fn submit(agent: &ureq::Agent, cfg: &Config, ops: &[Op]) -> Result<OpsResponse, String> {
     let base = normalize_base(&cfg.base_url);
     post_json(
@@ -707,6 +736,43 @@ pub fn test_connection(base_url: &str, token: &str) -> Result<String, String> {
 
 // ---------------------------------------------------------------- 快照
 
+/// 本机每 30 秒上报一次的短状态：只放天气与监控这类「看一眼」的数据。
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct PresenceOut {
+    #[serde(default)]
+    pub weather: Option<PresenceWeather>,
+    #[serde(default)]
+    pub monitor: Option<PresenceMonitor>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct PresenceWeather {
+    #[serde(default)]
+    pub city: String,
+    #[serde(default)]
+    pub temp: f32,
+    #[serde(default)]
+    pub code: u8,
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub at: i64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct PresenceMonitor {
+    #[serde(default)]
+    pub cpu: Option<f32>,
+    #[serde(default)]
+    pub mem: Option<f32>,
+    #[serde(default)]
+    pub disk: Option<f32>,
+    #[serde(default)]
+    pub temp: Option<f32>,
+    #[serde(default)]
+    pub gpu: Option<f32>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct DeviceView {
     pub id: String,
@@ -714,6 +780,22 @@ pub struct DeviceView {
     pub online: bool,
     pub platform: String,
     pub last_seen: String,
+    /// 原始 presence JSON；用 `presence_data()` 转成结构化快照。
+    pub presence: serde_json::Value,
+}
+
+impl DeviceView {
+    pub fn presence_data(&self) -> Option<PresenceOut> {
+        serde_json::from_value(self.presence.clone()).ok()
+    }
+
+    pub fn weather(&self) -> Option<PresenceWeather> {
+        self.presence_data().and_then(|presence| presence.weather)
+    }
+
+    pub fn monitor(&self) -> Option<PresenceMonitor> {
+        self.presence_data().and_then(|presence| presence.monitor)
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -757,6 +839,7 @@ fn device_views(list: Vec<Device>) -> Vec<DeviceView> {
             online: device.online,
             platform: device.platform,
             last_seen: device.last_seen_at,
+            presence: device.presence,
         })
         .collect()
 }
@@ -769,11 +852,18 @@ pub struct Service {
 }
 
 impl Service {
-    pub fn start(ctx: egui::Context, cfg: Config, initial: Snapshot) -> Self {
+    pub fn start(
+        ctx: egui::Context,
+        cfg: Config,
+        initial: Snapshot,
+        presence_state: Arc<Mutex<PresenceOut>>,
+    ) -> Self {
         let (tx, rx) = mpsc::sync_channel(2);
         let stop = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&stop);
-        let _ = crate::resources::SYNC.spawn(move || run(ctx, cfg, initial, tx, flag));
+        let _ = crate::resources::SYNC.spawn(move || {
+            run(ctx, cfg, initial, tx, flag, presence_state)
+        });
         Self { rx, stop }
     }
 
@@ -838,6 +928,7 @@ fn run(
     mut snap: Snapshot,
     tx: SyncSender<Snapshot>,
     stop: Arc<AtomicBool>,
+    presence_state: Arc<Mutex<PresenceOut>>,
 ) {
     let agent = crate::nos::http_agent();
     let mut state = StateFile::load();
@@ -845,6 +936,7 @@ fn run(
     let mut failures: u32 = 0;
     let mut hello_ok = false;
     let mut next_devices = 0i64;
+    let mut next_presence = 0i64;
     // 每次重建服务都先拉一轮再允许 UI 上传，避免第二台设备抢先推本地数据。
     snap.ready = false;
 
@@ -1010,6 +1102,22 @@ fn run(
             next_devices = chrono::Local::now().timestamp() + 60;
         }
 
+        // 4) 在场心跳：天气与系统监控只走 presence，不进变更流。
+        if hello_ok && snap.connected {
+            let now = chrono::Local::now().timestamp();
+            if now >= next_presence {
+                let state = presence_state
+                    .lock()
+                    .map(|state| state.clone())
+                    .unwrap_or_default();
+                match send_presence(&agent, &cfg, &state) {
+                    Ok(()) => next_presence = now + 30,
+                    // 权限不足或网络抖动不报错到主状态，15 秒后重试。
+                    Err(_) => next_presence = now + 15,
+                }
+            }
+        }
+
         if cycle_ok {
             failures = 0;
             snap.connected = true;
@@ -1144,10 +1252,29 @@ mod tests {
                 online: true,
                 platform: "windows".into(),
                 last_seen: String::new(),
+                presence: serde_json::Value::Null,
             }],
             ..Default::default()
         };
         assert_eq!(snap.device_name("abcdef123456"), "书房台式");
         assert_eq!(snap.device_name("zzzzzzzzzzzz"), "zzzzzzzz");
+    }
+
+    #[test]
+    fn device_presence_carries_weather_and_monitor() {
+        let view = DeviceView {
+            id: "dev-a".into(),
+            name: "书房".into(),
+            online: true,
+            presence: serde_json::json!({
+                "weather": {"city":"绵阳","temp":18.5,"code":1,"text":"多云","at":10},
+                "monitor": {"cpu":12.0,"mem":40.0,"disk":55.0,"temp":61.0,"gpu":30.0}
+            }),
+            ..Default::default()
+        };
+        assert_eq!(view.weather().unwrap().city, "绵阳");
+        assert_eq!(view.weather().unwrap().temp, 18.5);
+        assert_eq!(view.monitor().unwrap().cpu, Some(12.0));
+        assert_eq!(view.monitor().unwrap().gpu, Some(30.0));
     }
 }

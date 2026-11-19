@@ -745,7 +745,7 @@ mod tests {
 
     #[test]
     fn settings_groups_keep_every_page_reachable() {
-        let groups = ["常规", "音乐与歌词", "专注与饮水", "专注与饮水", "待办与置物", "待办与置物", "通知、邮箱与日程", "通知、邮箱与日程", "通知、邮箱与日程", "关于", "页面管理", "AI 额度", "天气", "系统监控", "流量历史", "课表", "多端同步"];
+        let groups = ["常规", "音乐与歌词", "专注与饮水", "专注与饮水", "待办与置物", "待办与置物", "通知、邮箱与日程", "通知、邮箱与日程", "通知、邮箱与日程", "关于", "页面管理", "AI 额度", "天气", "系统监控", "流量历史", "课表与多端"];
         for (tab, expected) in groups.iter().enumerate() {
             let matches: Vec<_> = SETTINGS_GROUPS.iter().filter(|(_,start,end)| (*start..=*end).contains(&tab)).collect();
             assert_eq!(matches.len(), 1, "页面 {tab} 必须且只能属于一个分组");
@@ -754,12 +754,10 @@ mod tests {
     }
 
     #[test]
-    fn nos_course_settings_tab_sits_in_the_visible_part_of_the_sidebar() {
-        let group = SETTINGS_GROUPS.iter().find(|(name,_,_)|*name=="课表").expect("侧边栏必须有课表分组");
-        assert_eq!((group.1,group.2),(15,15),"课表对应第 15 号页签");
-        let position = SETTINGS_GROUPS.iter().position(|(name,_,_)|*name=="课表").unwrap();
-        assert!(position < SETTINGS_GROUPS.len()-4,
-            "课表不能排在末尾，设置窗口被拖矮时末尾几项会被裁掉");
+    fn nos_sync_settings_sit_just_above_about() {
+        let position = SETTINGS_GROUPS.iter().position(|(name,_,_)|*name=="课表与多端").expect("侧边栏必须有课表与多端分组");
+        assert_eq!((SETTINGS_GROUPS[position].1,SETTINGS_GROUPS[position].2),(15,15),"合并页对应第 15 号页签");
+        assert_eq!(SETTINGS_GROUPS[position+1].0,"关于","合并页必须紧挨在关于上方");
     }
 
     #[test]
@@ -1227,11 +1225,11 @@ fn setting_choices(ui:&mut egui::Ui,title:&str,value:&mut u32,values:[u32;3],uni
     let options:Vec<(u32,&str)>=values.iter().zip(labels.iter()).map(|(v,l)|(*v,l.as_str())).collect();
     settings_control_row_right(ui,title,|ui|{settings_segmented(ui,value,&options,62.0);});
 }
-const SETTINGS_GROUPS: [(&str,usize,usize);13] = [
+const SETTINGS_GROUPS: [(&str,usize,usize);12] = [
     ("常规",0,0), ("页面管理",10,10), ("音乐与歌词",1,1), ("专注与饮水",2,3),
-    ("待办与置物",4,5), ("通知、邮箱与日程",6,8), ("课表",15,15),
+    ("待办与置物",4,5), ("通知、邮箱与日程",6,8),
     ("AI 额度",11,11), ("天气",12,12), ("系统监控",13,13),
-    ("流量历史",14,14), ("多端同步",16,16), ("关于",9,9),
+    ("流量历史",14,14), ("课表与多端",15,15), ("关于",9,9),
 ];
 
 impl App {
@@ -1289,7 +1287,6 @@ impl App {
                         13=>egui::include_image!("../assets/settings-icons/system/general.svg"),
                         14=>egui::include_image!("../assets/settings-icons/system/quota.svg"),
                         15=>egui::include_image!("../assets/settings-icons/calendar-days.svg"),
-                        16=>egui::include_image!("../assets/settings-icons/system/pages.svg"),
                         _=>egui::include_image!("../assets/settings-icons/system/about.svg"),
                     };
                     let icon_bg=egui::Rect::from_center_size(egui::pos2(rect.left()+21.0,rect.center().y),egui::vec2(25.0,25.0));
@@ -1321,8 +1318,8 @@ impl App {
                     }
                 }
                 ui.visuals_mut().selection.bg_fill=settings_color(ctx,Color32::from_rgb(45,105,165),Color32::from_rgb(209,226,248));
-                let titles=["常规","音乐与歌词","专注","健康提醒","待办","置物","通知","邮箱","日程","关于","页面管理","AI 额度","天气","系统监控","流量历史","课表","多端同步"];
-                ui.label(egui::RichText::new(titles[self.settings_tab.min(16)]).size(18.0).strong().color(settings_color(ctx,Color32::WHITE,Color32::from_rgb(30,34,41))));
+                let titles=["常规","音乐与歌词","专注","健康提醒","待办","置物","通知","邮箱","日程","关于","页面管理","AI 额度","天气","系统监控","流量历史","课表与多端"];
+                ui.label(egui::RichText::new(titles[self.settings_tab.min(15)]).size(18.0).strong().color(settings_color(ctx,Color32::WHITE,Color32::from_rgb(30,34,41))));
                 if let Some((_,start,end))=SETTINGS_GROUPS.iter().find(|(_,start,end)|(*start..=*end).contains(&self.settings_tab)) {
                     if start!=end {
                         ui.add_space(7.0);
@@ -1358,8 +1355,7 @@ impl App {
                         if !self.module_on(page) {ui.disable();}
                     }
                     match self.settings_tab {
-                    16=>self.sync_settings(ui),
-                    15=>self.nos_settings(ui),
+                    15=>self.nos_sync_settings(ui),
                     14=>self.monitor_history_settings(ui),
                     13=>self.monitor_settings(ui),
                     12=>self.weather_settings(ui),

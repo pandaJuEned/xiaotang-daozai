@@ -53,9 +53,8 @@ pub const KEYS: &[&str] = &[
     "mail_code_hide_seconds",
     "calendar_prompt",
     "calendar_auto_sync",
-    "weather_city",
-    "weather_position",
-    "weather_saved",
+    // 天气城市 / 定位 / 缓存是机器级：每台看自己所在地的天气；
+    // 其他设备的天气由 presence 心跳带过来，显示为「异地天气」。
     "quota_reset_notice",
 ];
 

@@ -771,7 +771,12 @@ impl App {
             self.weather.cached_for("",None).map(|s|s.place.clone()).unwrap_or_else(||"按网络出口".into()))];
         for p in &self.settings.weather_saved {rows.push((Some(p.clone()),p.label.clone(),p.region.split(" · ").next().unwrap_or_default().to_string()));}
         let row=27.0;
-        let h=rows.len() as f32*row+row+10.0;
+        let mut remote=self.remote_weather();
+        // 面板是固定高度的画布，本地城市太多时先不塞异地行，避免超出页面底部；
+        // 异地天气在「设置 → 天气」始终可见。
+        if rows.len()+remote.len()+1>7 { remote.clear(); }
+        let remote_h=if remote.is_empty(){0.0}else{8.0+row*(remote.len() as f32+1.0)};
+        let h=rows.len() as f32*row+row+10.0+remote_h;
         // 从地点行下方展开；城市多时整体上移，保证不超出页面底部。
         let (x,w)=(92.0,200.0);
         let y=(124.0_f32).min(WEATHER_H-10.0-h).max(34.0);
@@ -802,7 +807,20 @@ impl App {
             if room>18.0 {p.text(x+32.0+lw+6.0,ry+17.0,&p.fit(detail,9.5,W::Regular,room),9.5,W::Regular,theme::DIM,H::Left);}
             if hit.clicked() {pick=Some(Pick::City(position.clone()));}
         }
-        let my=y+5.0+rows.len() as f32*row;
+        let mut my=y+5.0+rows.len() as f32*row;
+        if !remote.is_empty() {
+            p.seg((x+12.0,my+0.5),(x+w-12.0,my+0.5),0.7,Color32::from_white_alpha(18));
+            p.text(x+14.0,my+17.0,"异地天气",10.0,W::Semibold,theme::GRAY,H::Left);
+            my+=row;
+            for (i,(name,weather)) in remote.iter().enumerate() {
+                let ry=my+i as f32*row;
+                p.circle(x+18.0,ry+13.0,2.2,theme::CYAN);
+                let label=format!("{} · {}",name,weather.city);
+                p.text(x+28.0,ry+17.5,&p.fit(&label,10.5,W::Regular,108.0),10.5,W::Regular,theme::WHITE,H::Left);
+                paint_temp(&p,x+w-14.0,ry+17.5,&format!("{}°",weather.temp.round() as i32),10.5,W::Semibold,theme::GRAY,H::Right);
+            }
+            my+=remote.len() as f32*row;
+        }
         p.seg((x+12.0,my+0.5),(x+w-12.0,my+0.5),0.7,Color32::from_white_alpha(18));
         let manage=p.hit(x+4.0,my+2.0,w-8.0,row-2.0,"weather-picker-manage").on_hover_cursor(egui::CursorIcon::PointingHand);
         let (hover,_)=p.hover_t(&manage);
@@ -1048,6 +1066,26 @@ impl App {
         if button.clicked() { self.weather.refresh(&self.settings.weather_city, self.t); }
     }
 
+    /// 其他在线设备的当地天气；同城自动隐藏，最多三台。
+    pub(crate) fn remote_weather(&self) -> Vec<(String, crate::sync::PresenceWeather)> {
+        let local_city = self
+            .weather
+            .snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.place.as_str())
+            .unwrap_or(self.settings.weather_city.as_str());
+        self.sync
+            .devices
+            .iter()
+            .filter(|device| device.online && device.id != self.sync_device.id)
+            .filter_map(|device| device.weather().map(|weather| (device.name.clone(), weather)))
+            .filter(|(_, weather)| {
+                !weather.city.trim().is_empty() && weather.city.as_str() != local_city
+            })
+            .take(3)
+            .collect()
+    }
+
     pub(crate) fn weather_settings(&mut self, ui: &mut egui::Ui) {
         use crate::extras::{settings_card, settings_hint, settings_label};
         use crate::settings_theme::color;
@@ -1110,6 +1148,27 @@ impl App {
                 if !status.is_empty(){ui.label(egui::RichText::new(status).size(11.5).color(ui.visuals().weak_text_color()));}
             });
             if add && ready {self.add_weather_city();}
+        });
+
+        settings_label(ui,"异地天气");
+        settings_card(ui,|ui|{
+            let remote=self.remote_weather();
+            if remote.is_empty() {
+                settings_hint(ui,"其他设备在线并取到当地天气后，这里会显示它们的城市与温度；同城会自动隐藏。");
+                return;
+            }
+            for (index,(name,weather)) in remote.iter().enumerate() {
+                if index>0 {ui.separator();}
+                ui.horizontal(|ui|{
+                    ui.label(egui::RichText::new(name).size(13.0));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center),|ui|{
+                        ui.label(egui::RichText::new(format!("{}° {}",weather.temp.round() as i32,weather.text)).size(12.5).color(accent));
+                        ui.label(egui::RichText::new(weather.city.as_str()).size(12.0).color(ui.visuals().weak_text_color()));
+                    });
+                });
+                let age=(chrono::Local::now().timestamp()-weather.at).max(0);
+                ui.label(egui::RichText::new(format!("更新于 {} 分钟前 · 来自「{}」的心跳",age/60,name)).size(10.5).color(ui.visuals().weak_text_color()));
+            }
         });
 
         settings_label(ui,"更新与数据");

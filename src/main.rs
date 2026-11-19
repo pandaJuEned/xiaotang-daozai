@@ -111,6 +111,8 @@ struct Shell {
     sync_test_rx: Option<std::sync::mpsc::Receiver<String>>,
     /// 待办对账节流：500ms 一次，扫描当前 todo.txt 与上次同步快照的差异。
     sync_pump: PollClock,
+    /// 本机天气 / 监控的 presence 快照；UI 线程更新，同步线程读取。
+    presence: std::sync::Arc<std::sync::Mutex<daozai::sync::PresenceOut>>,
 }
 
 const MODULE_OFF:&str="该功能已在「页面管理」中关闭";
@@ -152,7 +154,7 @@ impl Shell {
         let sync_cfg=if sync_wanted {self.app.sync_config()} else {daozai::sync::Config::default()};
         let sync_on=sync_wanted && sync_cfg.ready();
         if sync_on!=self.sync.is_some() {
-            self.sync=if sync_on {Some(daozai::sync::Service::start(ctx.clone(),sync_cfg,self.app.sync.clone()))} else {None};
+            self.sync=if sync_on {Some(daozai::sync::Service::start(ctx.clone(),sync_cfg,self.app.sync.clone(),std::sync::Arc::clone(&self.presence)))} else {None};
             if !sync_on {self.app.sync.connected=false;self.app.sync.ready=false;self.app.sync.error=None;}
         }
         let clipboard_on=self.app.clipboard_active();
@@ -285,6 +287,7 @@ impl Shell {
             sync: None,
             sync_test_rx: None,
             sync_pump: PollClock::default(),
+            presence: std::sync::Arc::new(std::sync::Mutex::new(Default::default())),
         }
     }
 
@@ -740,6 +743,9 @@ impl eframe::App for Shell {
         // 待办对账：UI 线程独占 todo.txt，先采纳远端，再把本地差异推进 outbox。
         if self.app.settings.sync_enabled && self.sync_pump.ready(Duration::from_millis(500)) {
             self.sync_pump=PollClock::now();
+            if let Ok(mut presence)=self.presence.lock() {
+                *presence=self.app.presence_out();
+            }
             daozai::sync_map::pump(&mut self.app);
         }
         if let Some((message,rx))=&self.seek_rx {
@@ -1108,6 +1114,7 @@ impl eframe::App for Shell {
         #[cfg(not(windows))] let autostart = false;
         self.app.settings_ui(ctx, autostart);
         self.app.monitor_window(ctx, &env);
+        self.app.remote_monitor_window(ctx);
         self.app.mail_reader_ui(ctx);
         #[cfg(windows)] let repaint_after=if self.hidden{Duration::from_secs(1)}else{out.repaint_after};
         #[cfg(not(windows))] let repaint_after=out.repaint_after;

@@ -20,6 +20,7 @@ fn sync_and_devices_tabs_render_without_panicking() {
                 online: true,
                 platform: "windows".into(),
                 last_seen: "2026-11-18T14:50:40.262Z".into(),
+                presence: Default::default(),
             },
             crate::sync::DeviceView {
                 id: "dev-laptop".into(),
@@ -27,17 +28,21 @@ fn sync_and_devices_tabs_render_without_panicking() {
                 online: false,
                 platform: "windows".into(),
                 last_seen: "2026-11-18T10:00:00.000Z".into(),
+                presence: Default::default(),
             },
         ],
         ..Default::default()
     };
-    h.app.settings_tab = 16;
+    h.app.settings_tab = 15;
     h.app.open_settings();
     h.ctx.set_embed_viewports(false);
-    for _ in 0..3 {
-        let _ = h
-            .ctx
-            .run(eframe::egui::RawInput::default(), |ctx| h.app.settings_ui(ctx, false));
+    for section in [0u8, 1] {
+        h.app.nos_sync_section = section;
+        for _ in 0..3 {
+            let _ = h
+                .ctx
+                .run(eframe::egui::RawInput::default(), |ctx| h.app.settings_ui(ctx, false));
+        }
     }
 }
 
@@ -359,4 +364,49 @@ fn about_page_renders_with_the_project_credit() {
             .ctx
             .run(eframe::egui::RawInput::default(), |ctx| h.app.settings_ui(ctx, false));
     }
+}
+
+#[test]
+fn remote_weather_hides_same_city_and_offline_devices() {
+    use super::{ENV_LOCK, H};
+    let _g = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let mut h = H::new();
+    h.app.settings.weather_city = "绵阳".into();
+    h.app.weather.snapshot = Some(crate::weather::Snapshot {
+        place: "绵阳".into(),
+        temp: 18.0,
+        code: 1,
+        at: chrono::Local::now().timestamp(),
+        ..Default::default()
+    });
+    let device = |id: &str, name: &str, online: bool, city: &str| crate::sync::DeviceView {
+        id: id.into(),
+        name: name.into(),
+        online,
+        platform: "windows".into(),
+        last_seen: String::new(),
+        presence: serde_json::json!({
+            "weather": {"city":city,"temp":22.0,"code":1,"text":"晴","at":1}
+        }),
+    };
+    h.app.sync.devices = vec![
+        device("a", "宿舍笔记本", true, "上海"),
+        device("b", "同城台式", true, "绵阳"),
+        device("c", "离线机", false, "北京"),
+    ];
+    let remote = h.app.remote_weather();
+    assert_eq!(remote.len(), 1, "同城与离线设备不应重复出现");
+    assert_eq!(remote[0].0, "宿舍笔记本");
+    assert_eq!(remote[0].1.city, "上海");
+}
+
+#[test]
+fn remote_monitor_is_machine_level_and_opt_in() {
+    use super::{ENV_LOCK, H};
+    let _g = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let mut h = H::new();
+    h.app.settings.show_remote_monitor = true;
+    h.app.settings.save();
+    assert!(crate::model::Settings::load().show_remote_monitor);
+    assert!(!crate::sync_settings::KEYS.contains(&"show_remote_monitor"));
 }
