@@ -4,7 +4,7 @@ fn sync_and_devices_tabs_render_without_panicking() {
     let _g = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let mut h = H::new();
     h.app.settings.sync_enabled = true;
-    h.app.settings.sync_base_url = "https://nos.example.com".into();
+    h.app.settings.nos_base_url = "https://nos.example.com".into();
     h.app.sync = crate::sync::Snapshot {
         configured: true,
         connected: true,
@@ -219,13 +219,13 @@ fn sync_settings_roundtrip_keeps_primary_device() {
     let _g = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let mut h = H::new();
     h.app.settings.sync_enabled = true;
-    h.app.settings.sync_base_url = "https://nos.example.com".into();
+    h.app.settings.nos_base_url = "https://nos.example.com".into();
     h.app.settings.sync_primary_device = "dev-laptop".into();
     h.app.settings.save();
 
     let loaded = crate::model::Settings::load();
     assert!(loaded.sync_enabled, "同步开关应落盘");
-    assert_eq!(loaded.sync_base_url, "https://nos.example.com");
+    assert_eq!(loaded.nos_base_url, "https://nos.example.com");
     assert_eq!(loaded.sync_primary_device, "dev-laptop");
 }
 

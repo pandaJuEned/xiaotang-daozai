@@ -743,6 +743,22 @@ pub struct PresenceOut {
     pub weather: Option<PresenceWeather>,
     #[serde(default)]
     pub monitor: Option<PresenceMonitor>,
+    /// 待提醒数量：只报数字，不报内容——「哪里有通知」而不是「通知了什么」。
+    #[serde(default)]
+    pub alerts: u32,
+    /// 本机番茄状态：专注/休息与剩余分钟，实时在场的一部分。
+    #[serde(default)]
+    pub focus: Option<PresenceFocus>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct PresenceFocus {
+    #[serde(default)]
+    pub phase: String,
+    #[serde(default)]
+    pub remaining: u32,
+    #[serde(default)]
+    pub running: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]

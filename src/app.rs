@@ -39,6 +39,10 @@ pub const CALENDAR_PAGE: usize = 7;
 pub const WEATHER_PAGE: usize = 8;
 /// 系统监控页（第 10 个功能页面）。
 pub const MONITOR_PAGE: usize = 9;
+/// 异地天气页（第 11 个功能页面）：其他在线设备的当地天气。
+pub const REMOTE_WEATHER_PAGE: usize = 10;
+/// 异地监控页（第 12 个功能页面）：其他在线设备的监控与在场信息。
+pub const REMOTE_MONITOR_PAGE: usize = 11;
 pub(crate) const WEATHER_H: f32 = 232.0;
 pub(crate) const MONITOR_H: f32 = 236.0;
 pub(crate) const CALENDAR_H: f32 = 216.0;
@@ -67,8 +71,8 @@ fn pill_shadow(painter:&egui::Painter,rect:Rect,radius:f32,strength:f32){
         painter.rect_filled(r,radius+grow*0.8,Color32::from_black_alpha((255.0*a*strength) as u8));
     }
 }
-pub(crate) const PAGE_NAMES: [&str; 10] = ["音乐", "专注", "健康", "置物架", "待办", "邮箱", "AI 额度", "日程", "天气", "系统监控"];
-pub(crate) const PAGE_SETTINGS_TABS: [usize; 10] = [1,2,3,5,4,7,11,8,12,13];
+pub(crate) const PAGE_NAMES: [&str; 12] = ["音乐", "专注", "健康", "置物架", "待办", "邮箱", "AI 额度", "日程", "天气", "系统监控", "异地天气", "异地监控"];
+pub(crate) const PAGE_SETTINGS_TABS: [usize; 12] = [1,2,3,5,4,7,11,8,12,13,12,13];
 
 // ---------- 动效参数 ----------
 /// 悬停意图缓冲：光标停留这么久才真正展开（期间药丸轻微胀大作为反馈），防误触。
@@ -730,7 +734,7 @@ pub struct App {
     page_dir: f32,
     page_t0: f64,
     slide: Spring,
-    dots: [Spring; 10],
+    dots: [Spring; 12],
     wheel_delta: f32,
     wheel_at: f64,
     wheel_page_at: f64,
@@ -894,8 +898,6 @@ pub struct App {
     /// 本机设备身份（id + 显示名），启动时读一次，改名后就地更新。
     pub sync_device: crate::sync::DeviceFile,
     /// 同步设置页的输入草稿；egui 必须跨帧持有同一个缓冲。
-    pub(crate) sync_url_draft: Option<String>,
-    pub(crate) sync_token_draft: Option<String>,
     pub(crate) sync_name_draft: Option<String>,
     pub(crate) quota: crate::quota_ui::State,
     /// 天气页的当前数据与后台拉取状态。
@@ -1038,8 +1040,6 @@ impl App {
             nos_token_draft: None,
             sync: crate::sync::Snapshot::default(),
             sync_device: crate::sync::DeviceFile::default(),
-            sync_url_draft: None,
-            sync_token_draft: None,
             sync_name_draft: None,
             quota: crate::quota_ui::State::load(),
             weather,
@@ -1316,7 +1316,22 @@ impl App {
                 gpu: snapshot.gpu_percent,
             }
         });
-        crate::sync::PresenceOut { weather, monitor }
+        crate::sync::PresenceOut {
+            weather,
+            monitor,
+            alerts: self.alerts.len() as u32,
+            focus: matches!(self.pomo.state.as_str(), "running" | "paused").then(|| {
+                crate::sync::PresenceFocus {
+                    phase: match self.pomo.phase {
+                        crate::app::Phase::Focus => "focus",
+                        crate::app::Phase::Rest => "rest",
+                    }
+                    .into(),
+                    remaining: self.pomo.remaining.max(0.0) as u32,
+                    running: self.pomo.running,
+                }
+            }),
+        }
     }
 
     /// 同步配置：地址来自设置，令牌来自凭据管理器，设备身份来自 `device.json`。
@@ -1326,7 +1341,7 @@ impl App {
             self.sync_device = crate::sync::load_device();
         }
         crate::sync::Config {
-            base_url: self.settings.sync_base_url.trim().to_string(),
+            base_url: self.settings.nos_base_url.trim().to_string(),
             token: crate::sync::secrets::load().unwrap_or_default(),
             device_id: self.sync_device.id.clone(),
             device_name: crate::sync::display_name(&self.sync_device),
@@ -3052,6 +3067,8 @@ impl App {
             5 => ("邮箱", "", theme::CYAN),
             6 => ("AI", "额度", theme::SOFT_GREEN),
             MONITOR_PAGE => ("系统", "监控", theme::CYAN),
+            REMOTE_WEATHER_PAGE => ("异地", "天气", theme::CYAN),
+            REMOTE_MONITOR_PAGE => ("异地", "监控", theme::SOFT_GREEN),
             8 if self.weather.solar_open => ("日出", "日落", theme::YELLOW),
             8 => ("当地", "天气", theme::CYAN),
             _ => ("岛仔", "设置", theme::WHITE),
@@ -3065,8 +3082,8 @@ impl App {
     fn nav(&mut self, c: &Card) {
         let pages: Vec<_>=self.settings.page_order.iter().copied().filter(|page|self.settings.visible_pages[*page]).collect();
         if pages.len()<2 { return; }
-        // 高页面（额度、天气、系统监控）的箭头要下移，跟内容中线对齐。
-        let arrow_y=if self.page==6||self.page==8||self.page==MONITOR_PAGE{88.0}else{68.0};
+        // 高页面（额度、天气、系统监控、异地两页）的箭头要下移，跟内容中线对齐。
+        let arrow_y=if self.page==6||self.page==8||self.page==MONITOR_PAGE||self.page==REMOTE_WEATHER_PAGE||self.page==REMOTE_MONITOR_PAGE{88.0}else{68.0};
         let l = c.hit(8.0, arrow_y-13.0, 26.0, 26.0, "nav-l");
         let r = c.hit(385.0, arrow_y-13.0, 26.0, 26.0, "nav-r");
         let (lh, lp) = c.hover_t(&l);
@@ -3115,6 +3132,8 @@ impl App {
             8 => self.page_weather(c,env,cmds),
             CALENDAR_PAGE => self.page_calendar(c,env),
             MONITOR_PAGE => self.page_monitor(c,env),
+            REMOTE_WEATHER_PAGE => self.page_remote_weather(c,env),
+            REMOTE_MONITOR_PAGE => self.page_remote_monitor(c,env),
             _ => self.page_settings(c),
         }
     }

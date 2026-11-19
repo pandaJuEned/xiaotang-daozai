@@ -9,6 +9,7 @@
 pub mod display_layout;
 mod mail_privacy;
 pub mod poll_clock;
+pub mod remote_pages;
 pub mod resources;
 pub mod nos_server;
 pub mod anim;

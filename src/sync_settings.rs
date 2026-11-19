@@ -221,10 +221,10 @@ pub fn set(settings: &mut Settings, key: &str, value: &Value) -> bool {
         "clock_period" => set_u8(&mut settings.clock_period, value, 0, 2),
         "visible_pages" => {
             let Some(items) = value.as_array() else { return false };
-            if items.len() != 10 {
+            if items.len() != 12 {
                 return false;
             }
-            let mut next = [false; 10];
+            let mut next = [false; 12];
             for (index, item) in items.iter().enumerate() {
                 next[index] = item.as_bool().unwrap_or(false);
             }
@@ -236,15 +236,15 @@ pub fn set(settings: &mut Settings, key: &str, value: &Value) -> bool {
         }
         "page_order" => {
             let Some(items) = value.as_array() else { return false };
-            if items.len() != 10 {
+            if items.len() != 12 {
                 return false;
             }
-            let mut next = [0usize; 10];
+            let mut next = [0usize; 12];
             for (index, item) in items.iter().enumerate() {
                 let Some(page) = item.as_u64().map(|number| number as usize) else {
                     return false;
                 };
-                if page >= 10 || next[..index].contains(&page) {
+                if page >= 12 || next[..index].contains(&page) {
                     return false;
                 }
                 next[index] = page;
@@ -430,11 +430,11 @@ mod tests {
     #[test]
     fn page_order_rejects_duplicates_and_out_of_range() {
         let mut settings = Settings::default();
-        let duplicate = serde_json::json!([0, 0, 2, 3, 4, 5, 6, 7, 8, 9]);
+        let duplicate = serde_json::json!([0, 0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
         assert!(!set(&mut settings, "page_order", &duplicate));
-        let out_of_range = serde_json::json!([0, 1, 2, 3, 4, 5, 6, 7, 8, 10]);
+        let out_of_range = serde_json::json!([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12]);
         assert!(!set(&mut settings, "page_order", &out_of_range));
-        let valid = serde_json::json!([1, 2, 3, 4, 5, 6, 7, 8, 9, 0]);
+        let valid = serde_json::json!([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 0]);
         assert!(set(&mut settings, "page_order", &valid));
         assert_eq!(settings.page_order[0], 1);
     }
@@ -442,7 +442,7 @@ mod tests {
     #[test]
     fn all_pages_off_is_rejected() {
         let mut settings = Settings::default();
-        let all_off = serde_json::Value::Array(vec![Value::Bool(false); 10]);
+        let all_off = serde_json::Value::Array(vec![Value::Bool(false); 12]);
         assert!(!set(&mut settings, "visible_pages", &all_off));
     }
 

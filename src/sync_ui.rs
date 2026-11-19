@@ -21,7 +21,7 @@ impl App {
                 }
             }
             ui.label(
-                RichText::new("同一个 NOS 地址与访问令牌；令牌勾选「读取日程 + 多机同步」即可两用")
+                RichText::new("地址与令牌在「课表」分段设置，两段共用同一枚 PAT（勾选「读取日程 + 多机同步」）")
                     .size(11.0)
                     .color(egui::Color32::from_gray(150)),
             );
@@ -44,6 +44,25 @@ impl App {
         }
         let mut pending: Vec<Cmd> = Vec::new();
 
+        // ------------------------------------------------ 连接（与课表共用）
+        settings_label(ui, "连接");
+        settings_card(ui, |ui| {
+            ui.small("服务器地址与访问令牌在「课表」分段设置，课表和多端同步共用同一份；令牌勾选「读取日程 + 多机同步」即可两用。");
+            ui.horizontal(|ui| {
+                if ui.button("立即同步").clicked() {
+                    pending.push(Cmd::SyncNow);
+                }
+                if ui.button("忘记令牌").clicked() {
+                    // 共用令牌：课表与同步一起清除。
+                    crate::sync::secrets::delete();
+                    self.nos_token_draft = Some(String::new());
+                    pending.push(Cmd::SyncReconfigure);
+                }
+            });
+            ui.add_space(3.0);
+            status_block(ui, self.settings.sync_enabled, &self.sync);
+        });
+
         // ------------------------------------------------ 开关
         settings_label(ui, "云同步");
         settings_card(ui, |ui| {
@@ -55,140 +74,12 @@ impl App {
                 &mut self.settings.sync_enabled,
             );
             if self.settings.sync_enabled != before {
-                // 大多数人与课表用同一个 NOS，地址为空时直接沿用。
-                if self.settings.sync_enabled && self.settings.sync_base_url.trim().is_empty() {
-                    self.settings.sync_base_url = self.settings.nos_base_url.clone();
-                }
                 self.settings.save();
                 pending.push(Cmd::SyncReconfigure);
             }
-            if self.settings.sync_enabled && self.settings.sync_base_url.trim().is_empty() {
-                ui.small("还没有填服务器地址；填好并保存后才会开始同步。");
+            if self.settings.sync_enabled && self.settings.nos_base_url.trim().is_empty() {
+                ui.small("还没有填服务器地址；先在「课表」分段填好并保存后才会开始同步。");
             }
-        });
-
-        // ------------------------------------------------ 连接
-        // 输入草稿必须跨帧复用：每帧从设置/凭据管理器重建会让刚输入的字符消失。
-        if self.sync_url_draft.is_none() {
-            let initial = if self.settings.sync_base_url.trim().is_empty() {
-                self.settings.nos_base_url.clone()
-            } else {
-                self.settings.sync_base_url.clone()
-            };
-            self.sync_url_draft = Some(initial);
-        }
-        if self.sync_token_draft.is_none() {
-            self.sync_token_draft = Some(crate::sync::secrets::load().unwrap_or_default());
-        }
-        let token_known = crate::sync::secrets::load().is_ok();
-
-        settings_label(ui, "连接");
-        settings_card(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("服务器地址").size(13.0));
-                ui.add(
-                    egui::TextEdit::singleline(
-                        self.sync_url_draft.as_mut().expect("同步地址草稿已初始化"),
-                    )
-                    .desired_width(300.0)
-                    .hint_text("https://nos.example.com"),
-                );
-            });
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("访问令牌").size(13.0));
-                ui.add(
-                    egui::TextEdit::singleline(
-                        self.sync_token_draft.as_mut().expect("同步令牌草稿已初始化"),
-                    )
-                    .desired_width(300.0)
-                    .password(true),
-                );
-                if token_known
-                    && self
-                        .sync_token_draft
-                        .as_deref()
-                        .is_some_and(|value| value.is_empty())
-                {
-                    ui.label(
-                        RichText::new("已保存（输入新值可替换）")
-                            .size(11.5)
-                            .color(egui::Color32::from_gray(150)),
-                    );
-                }
-            });
-            ui.add_space(4.0);
-            let url = self.sync_url_draft.clone().unwrap_or_default();
-            if crate::sync::insecure_public(&url) {
-                ui.label(
-                    RichText::new("这是公网明文 http 地址：令牌与同步数据会被中间人看到，建议换 https")
-                        .size(11.5)
-                        .color(egui::Color32::from_rgb(230, 175, 80)),
-                );
-            }
-            ui.small("令牌需要 sync:read / sync:write / presence:write 权限；只读课表的 agenda:read 令牌不能同步。");
-            ui.small("地址存设置文件，令牌只进 Windows 凭据管理器。");
-        });
-
-        // ------------------------------------------------ 操作与状态
-        settings_card(ui, |ui| {
-            ui.horizontal(|ui| {
-                if ui.button("保存并测试连接").clicked() {
-                    let url = self
-                        .sync_url_draft
-                        .clone()
-                        .unwrap_or_default()
-                        .trim()
-                        .to_string();
-                    let token = self
-                        .sync_token_draft
-                        .clone()
-                        .unwrap_or_default()
-                        .trim()
-                        .to_string();
-                    self.sync_url_draft = Some(url.clone());
-                    self.settings.sync_base_url = url.clone();
-                    self.settings.sync_enabled = true;
-                    if !token.is_empty() {
-                        match crate::sync::secrets::save(&token) {
-                            Ok(()) => self.sync_token_draft = Some(token.clone()),
-                            Err(error) => self.say(format!("保存令牌失败：{error}")),
-                        }
-                    }
-                    self.settings.save();
-                    pending.push(Cmd::SyncTest(url, token));
-                    pending.push(Cmd::SyncReconfigure);
-                }
-                if ui.button("只保存令牌").clicked() {
-                    let token = self
-                        .sync_token_draft
-                        .clone()
-                        .unwrap_or_default()
-                        .trim()
-                        .to_string();
-                    if token.is_empty() {
-                        self.say("请先在「访问令牌」里填同步令牌");
-                    } else {
-                        match crate::sync::secrets::save(&token) {
-                            Ok(()) => {
-                                self.sync_token_draft = Some(token);
-                                self.say("访问令牌已保存到 Windows 凭据管理器");
-                            }
-                            Err(error) => self.say(format!("保存令牌失败：{error}")),
-                        }
-                    }
-                }
-                if ui.button("立即同步").clicked() {
-                    pending.push(Cmd::SyncNow);
-                }
-                if ui.button("忘记令牌").clicked() {
-                    crate::sync::secrets::delete();
-                    self.sync_token_draft = Some(String::new());
-                    pending.push(Cmd::SyncReconfigure);
-                }
-            });
-            ui.add_space(3.0);
-            status_block(ui, self.settings.sync_enabled, &self.sync);
         });
 
         // ------------------------------------------------ 本机
