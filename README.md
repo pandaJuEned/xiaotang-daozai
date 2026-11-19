@@ -208,8 +208,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\package.ps1
 
 「悬浮云」皮肤作者：啵（[@hanhb123](https://github.com/hanhb123)）。感谢 egui／eframe、Rust 社区，以及提供参考与素材的开源项目。
 
-## 感谢支持
+## 原始项目与致谢
 
-![感谢支持岛仔的朋友们](docs/images/readme/supporters.webp)
+岛仔基于 [Renly1994/xiaotang-daozai](https://github.com/Renly1994/xiaotang-daozai) 继续维护。感谢原作者、所有贡献者与开源社区，以及 egui／eframe、Rust 和「悬浮云」皮肤作者啵（[@hanhb123](https://github.com/hanhb123)）。
 
-喜欢岛仔的话，欢迎点一个 **Star**，也可以在 **设置 → 关于 → 支持作者** 请岛仔喝杯咖啡。
+喜欢岛仔的话，欢迎点一个 **Star**。

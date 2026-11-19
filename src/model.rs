@@ -10,6 +10,7 @@
 //! 设置环境变量 `DAOZAI_DATA_DIR` 可把以上目录整体改到别处（用于与已安装的
 //! 原工具并存、或跑测试时不碰真实数据）。
 
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -287,6 +288,12 @@ pub struct Settings {
     pub nos_enabled: bool,
     /// 课表服务器地址（如 `http://192.168.1.10:8000`）。令牌不存这里，走凭据管理器。
     pub nos_base_url: String,
+    /// 多机同步：接入 NOS 后开启。本机默认完全本地，不产生任何同步请求。
+    pub sync_enabled: bool,
+    /// 同步服务地址（通常与课表是同一个 NOS）。令牌不存这里，走凭据管理器。
+    pub sync_base_url: String,
+    /// 提醒主设备：只有这台响铃；留空时取最近活跃的设备。
+    pub sync_primary_device: String,
     /// 本地服务模式：NOS Web 端由岛仔拉起/停止，而不是连一台现成的服务器。
     pub nos_server_enabled: bool,
     /// 岛仔启动时自动拉起本地 NOS Web 服务。
@@ -302,7 +309,7 @@ pub struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { display_id: String::new(), skin: Skin::Classic, island_shape: IslandShape::Notch, glass_blur: true, island_size: 100, island_offset: 0, dock: Dock::Top, settings_theme: Default::default(), pet: true, minimal: false, browser_minimal: false, avoid_browsers: true, avoid_apps: Vec::new(), visible_pages: [true; 10], page_order: [0,1,2,3,4,5,6,7,8,9], show_battery: true, show_net_speed: false, show_course: false, show_quota: true, show_calendar_status: false, show_cpu: false, show_gpu: false, show_memory: false, show_disk: false, show_temperature: true, elevated_sensors: false, quota_reset_notice: true, clock_12h: false, clock_period: 0, resident_order: Vec::new(), system_hud: true, bluetooth_notifications: true, read_notifications:false, wechat_notifications:false, wecom_notifications:false, feishu_notifications:false, dingtalk_notifications:false, wechat_tray_open:false, qq_only:false, notification_preview:false, notifications: true, sound: false, lyrics_enabled:true, island_lyrics:false, lyric_delay_ms:-350, hide_fullscreen: true, avoid_top_bar: true, focus_minutes: 25, rest_minutes: 5, water_minutes: 45, serving_ml: 250, water_start: 9, water_end: 22, sit_remind: true, sit_minutes: 60, lunch_rest: true, lunch_start: 720, lunch_end: 810, mail_enabled: true, mail_sync_operations:false, mail_code: true, mail_code_hide_seconds:60, mail_interval: 120, mail_ics: 15, ignored_mail_events: Vec::new(), calendar_prompt: true, calendar_auto_sync: true, clipboard_history: true, weather_city: String::new(), weather_position: None, weather_saved: Vec::new(), render_compat: false, render_compat_reason: String::new(), nos_enabled: false, nos_base_url: String::new(), nos_server_enabled: false, nos_server_auto_start: false, nos_server_dir: String::new(), nos_server_python: String::new(), nos_server_host: crate::nos_server::DEFAULT_HOST.into(), nos_server_port: crate::nos_server::DEFAULT_PORT }
+        Self { display_id: String::new(), skin: Skin::Classic, island_shape: IslandShape::Notch, glass_blur: true, island_size: 100, island_offset: 0, dock: Dock::Top, settings_theme: Default::default(), pet: true, minimal: false, browser_minimal: false, avoid_browsers: true, avoid_apps: Vec::new(), visible_pages: [true; 10], page_order: [0,1,2,3,4,5,6,7,8,9], show_battery: true, show_net_speed: false, show_course: false, show_quota: true, show_calendar_status: false, show_cpu: false, show_gpu: false, show_memory: false, show_disk: false, show_temperature: true, elevated_sensors: false, quota_reset_notice: true, clock_12h: false, clock_period: 0, resident_order: Vec::new(), system_hud: true, bluetooth_notifications: true, read_notifications:false, wechat_notifications:false, wecom_notifications:false, feishu_notifications:false, dingtalk_notifications:false, wechat_tray_open:false, qq_only:false, notification_preview:false, notifications: true, sound: false, lyrics_enabled:true, island_lyrics:false, lyric_delay_ms:-350, hide_fullscreen: true, avoid_top_bar: true, focus_minutes: 25, rest_minutes: 5, water_minutes: 45, serving_ml: 250, water_start: 9, water_end: 22, sit_remind: true, sit_minutes: 60, lunch_rest: true, lunch_start: 720, lunch_end: 810, mail_enabled: true, mail_sync_operations:false, mail_code: true, mail_code_hide_seconds:60, mail_interval: 120, mail_ics: 15, ignored_mail_events: Vec::new(), calendar_prompt: true, calendar_auto_sync: true, clipboard_history: true, weather_city: String::new(), weather_position: None, weather_saved: Vec::new(), render_compat: false, render_compat_reason: String::new(), nos_enabled: false, nos_base_url: String::new(), sync_enabled: false, sync_base_url: String::new(), sync_primary_device: String::new(), nos_server_enabled: false, nos_server_auto_start: false, nos_server_dir: String::new(), nos_server_python: String::new(), nos_server_host: crate::nos_server::DEFAULT_HOST.into(), nos_server_port: crate::nos_server::DEFAULT_PORT }
     }
 }
 
@@ -434,6 +441,9 @@ impl Settings {
                 "render_compat_reason" => s.render_compat_reason = v.chars().filter(|c| !c.is_control()).take(200).collect(),
                 "nos_enabled" => s.nos_enabled = v == "1",
                 "nos_base_url" => s.nos_base_url = v.trim().chars().filter(|c| !c.is_control()).take(300).collect(),
+                "sync_enabled" => s.sync_enabled = v == "1",
+                "sync_base_url" => s.sync_base_url = v.trim().chars().filter(|c| !c.is_control()).take(300).collect(),
+                "sync_primary_device" => s.sync_primary_device = v.trim().chars().filter(|c| !c.is_control()).take(80).collect(),
                 "nos_server_enabled" => s.nos_server_enabled = v == "1",
                 "nos_server_auto_start" => s.nos_server_auto_start = v == "1",
                 "nos_server_dir" => s.nos_server_dir = v.trim().chars().filter(|c| !c.is_control()).take(300).collect(),
@@ -534,6 +544,9 @@ impl Settings {
                 ("render_compat_reason".into(), self.render_compat_reason.clone()),
                 ("nos_enabled".into(), (self.nos_enabled as u8).to_string()),
                 ("nos_base_url".into(), self.nos_base_url.clone()),
+                ("sync_enabled".into(), (self.sync_enabled as u8).to_string()),
+                ("sync_base_url".into(), self.sync_base_url.clone()),
+                ("sync_primary_device".into(), self.sync_primary_device.clone()),
                 ("nos_server_enabled".into(), (self.nos_server_enabled as u8).to_string()),
                 ("nos_server_auto_start".into(), (self.nos_server_auto_start as u8).to_string()),
                 ("nos_server_dir".into(), self.nos_server_dir.clone()),
@@ -756,6 +769,77 @@ pub struct Water {
 impl Default for Water {
     fn default() -> Self {
         Self { bottle_ml: 2000, goal_ml: 2000, start_day: String::new(), drunk_ml: 0, refills: 0, hours: [0; 24], remind: true }
+    }
+}
+
+/// 一次专注 / 休息的记录。跨机同步的 `focus_session` 落库后也进这里。
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct FocusEntry {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub phase: String,
+    #[serde(default)]
+    pub started_at: i64,
+    #[serde(default)]
+    pub ended_at: i64,
+    #[serde(default)]
+    pub duration: u32,
+    #[serde(default)]
+    pub completed: bool,
+    #[serde(default)]
+    pub device: String,
+    #[serde(default)]
+    pub remote: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct FocusHistory {
+    #[serde(default)]
+    pub entries: Vec<FocusEntry>,
+}
+
+impl FocusHistory {
+    pub fn load() -> Self {
+        std::fs::read(config_dir().join("focus-history.json"))
+            .ok()
+            .and_then(|raw| serde_json::from_slice::<Self>(&raw).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save(&self) {
+        if let Ok(raw) = serde_json::to_vec(self) {
+            let _ = atomic_write(&config_dir().join("focus-history.json"), &raw);
+        }
+    }
+
+    /// 按 id 去重后追加；只保留最近 400 条。
+    pub fn append(&mut self, entry: FocusEntry) {
+        if !entry.id.is_empty() && self.entries.iter().any(|item| item.id == entry.id) {
+            return;
+        }
+        self.entries.push(entry);
+        if self.entries.len() > 400 {
+            let drop = self.entries.len() - 400;
+            self.entries.drain(0..drop);
+        }
+        self.save();
+    }
+
+    pub fn has(&self, id: &str) -> bool {
+        !id.is_empty() && self.entries.iter().any(|entry| entry.id == id)
+    }
+
+    pub fn focus_count_today(&self, today: &str) -> usize {
+        self.entries
+            .iter()
+            .filter(|entry| {
+                entry.phase == "focus"
+                    && chrono::DateTime::from_timestamp(entry.started_at, 0)
+                        .map(|at| at.with_timezone(&chrono::Local).format("%Y-%m-%d").to_string() == today)
+                        .unwrap_or(false)
+            })
+            .count()
     }
 }
 

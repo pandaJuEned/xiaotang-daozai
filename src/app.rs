@@ -221,6 +221,12 @@ pub enum Cmd {
     NosServerOpenWeb,
     /// 打开本次服务的日志文件。
     NosServerOpenLog,
+    /// 同步配置已修改：外壳在下一帧重建同步服务。
+    SyncReconfigure,
+    /// 立即同步一次（重建服务，游标与 outbox 保留）。
+    SyncNow,
+    /// 测试同步服务器连接（地址、令牌只在内存里传给工作线程）。
+    SyncTest(String, String),
 }
 
 /// 毛玻璃皮肤下原生窗口区域的组成部分（相对 `win` 左上角，逻辑点）。
@@ -445,7 +451,7 @@ pub struct FrameOut {
     pub cmds: Vec<Cmd>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Phase {
     Focus,
     Rest,
@@ -464,6 +470,20 @@ pub(crate) struct Pomo {
     pub phase: Phase,
     pub remaining: f32,
     pub running: bool,
+    /// 运行时的截止时刻（Unix 秒）。有了它，睡眠/卡顿后按真实时间补算，不再漂移。
+    pub deadline: Option<i64>,
+    pub session_id: String,
+    pub started_at: i64,
+    /// 本阶段计划时长（秒），会话记录用；暂停后恢复也按它算进度。
+    pub duration: u32,
+    /// 会话归属设备；远程会话不本机响铃。
+    pub device: String,
+    pub remote: bool,
+    /// idle / running / paused / done / cancelled / superseded
+    pub state: String,
+    /// 刚结束的会话快照：完成时 phase 已切到下一阶段，必须先把「结束的那一段」
+    /// 原样留给同步线程，否则会把 done 记成下一阶段的。
+    pub last_done: Option<crate::sync_focus::FocusPayload>,
 }
 
 /// 本地歌词（酷狗、汽水）每 5 秒复查，最多约 1 分钟；网络失败每 30 秒重试，最多约 5 分钟。手动点重试会重新计数。
@@ -680,6 +700,8 @@ pub struct App {
     pub render_compat_running: bool,
     pub(crate) todos: model::TodoList,
     pub(crate) water: model::Water,
+    /// 最近 400 次专注 / 休息记录；跨机同步的完成记录也落这里。
+    pub(crate) focus_history: model::FocusHistory,
     pub(crate) shelf: model::Shelf,
 
     // 形变
@@ -863,6 +885,14 @@ pub struct App {
     /// 每帧从设置/凭据管理器重建会让刚输入的文字立刻消失。
     pub(crate) nos_url_draft: Option<String>,
     pub(crate) nos_token_draft: Option<String>,
+    /// 多机同步的运行时快照（连接状态、游标、设备列表、待上传数）。
+    pub sync: crate::sync::Snapshot,
+    /// 本机设备身份（id + 显示名），启动时读一次，改名后就地更新。
+    pub sync_device: crate::sync::DeviceFile,
+    /// 同步设置页的输入草稿；egui 必须跨帧持有同一个缓冲。
+    pub(crate) sync_url_draft: Option<String>,
+    pub(crate) sync_token_draft: Option<String>,
+    pub(crate) sync_name_draft: Option<String>,
     pub(crate) quota: crate::quota_ui::State,
     /// 天气页的当前数据与后台拉取状态。
     pub(crate) weather: crate::weather::State,
@@ -895,6 +925,7 @@ impl App {
             settings,
             todos: model::TodoList::load(),
             water: model::Water::default(),
+            focus_history: model::FocusHistory::load(),
             shelf: model::Shelf::load(),
             w: Spring::new(bw, CLOSE.0, CLOSE.1),
             h: Spring::new(bh, CLOSE.0, CLOSE.1),
@@ -943,7 +974,7 @@ impl App {
             sit_start: 0.0,
             sit_alerted: f64::NEG_INFINITY,
             sit_t: Spring::new(1.0, 400.0, 0.8),
-            pomo: Pomo { phase: Phase::Focus, remaining: focus_seconds, running: false }, focus_editing:false,
+            pomo: Pomo { phase: Phase::Focus, remaining: focus_seconds, running: false, deadline: None, session_id: String::new(), started_at: 0, duration: focus_seconds as u32, device: String::new(), remote: false, state: "idle".into(), last_done: None }, focus_editing:false,
             ring_shown: Spring::new(1.0, 160.0, 0.95),
             reset_spin: Spring::new(0.0, 160.0, 0.82),
             adding: false,
@@ -1001,6 +1032,11 @@ impl App {
             nos_server_note: None,
             nos_url_draft: None,
             nos_token_draft: None,
+            sync: crate::sync::Snapshot::default(),
+            sync_device: crate::sync::DeviceFile::default(),
+            sync_url_draft: None,
+            sync_token_draft: None,
+            sync_name_draft: None,
             quota: crate::quota_ui::State::load(),
             weather,
             updates: Default::default(),
@@ -1249,6 +1285,20 @@ impl App {
         crate::nos::Config {
             base_url: self.settings.nos_base_url.trim().to_string(),
             token: crate::nos::secrets::load().unwrap_or_default(),
+        }
+    }
+
+    /// 同步配置：地址来自设置，令牌来自凭据管理器，设备身份来自 `device.json`。
+    /// 设备身份懒加载：没开同步、也没打开设置页时，不产生任何文件。
+    pub fn sync_config(&mut self) -> crate::sync::Config {
+        if self.sync_device.id.is_empty() {
+            self.sync_device = crate::sync::load_device();
+        }
+        crate::sync::Config {
+            base_url: self.settings.sync_base_url.trim().to_string(),
+            token: crate::sync::secrets::load().unwrap_or_default(),
+            device_id: self.sync_device.id.clone(),
+            device_name: crate::sync::display_name(&self.sync_device),
         }
     }
 
@@ -3068,21 +3118,22 @@ impl App {
             self.water_ml = self.water.drunk_ml as f32;
             self.water_ring.snap(self.water.percent() / 100.0);
         }
-        if self.pomo.running && !self.module_on(FOCUS_PAGE) {self.pomo.running=false;}
+        if self.pomo.running && !self.module_on(FOCUS_PAGE) {
+            self.pomo.running=false;
+            self.pomo.deadline=None;
+            if self.pomo.state=="running" {self.pomo.state="paused".into();}
+        }
         if self.pomo.running {
-            self.pomo.remaining -= elapsed;
+            if let Some(deadline)=self.pomo.deadline {
+                // 有截止时刻就按真实时间算：睡眠 / 卡顿 / 掉帧都不会让倒计时变慢。
+                let now=chrono::Local::now().timestamp();
+                self.pomo.remaining=(deadline-now).max(0) as f32;
+            } else {
+                // 兼容直接置 running 的旧路径（测试与外部调用），仍按帧递减。
+                self.pomo.remaining -= elapsed;
+            }
             if self.pomo.remaining <= 0.0 {
-                let next = match self.pomo.phase {
-                    Phase::Focus => {
-                        self.pet.react(PetState::Happy);
-                        Phase::Rest
-                    }
-                    Phase::Rest => Phase::Focus,
-                };
-                self.pomo.phase = next;
-                self.pomo.remaining = self.phase_secs(next);
-                self.pomo.running = false;
-                self.alert("专注计时", format!("该{}了", next.label()), 1, true);
+                self.finish_focus_phase();
             }
         }
         self.ring_shown.target = (self.pomo.remaining / self.phase_secs(self.pomo.phase)).clamp(0.0, 1.0);

@@ -297,8 +297,12 @@ impl App {
         rc.circle(329.0, 50.0, 11.0, mix(Color32::from_rgb(28, 28, 30), Color32::from_rgb(50, 50, 54), h));
         paint::reset(&rc, 329.0, 50.0, -self.reset_spin.pos, Color32::from_gray(230));
         if r.clicked() {
+            crate::sync_focus::cancel_now(self);
             self.pomo.remaining = self.phase_secs(self.pomo.phase);
             self.pomo.running = false;
+            self.pomo.deadline = None;
+            self.pomo.state = "idle".into();
+            self.pomo.session_id.clear();
             self.reset_spin.target += TAU;
         }
 
@@ -314,18 +318,61 @@ impl App {
         paint::play_pause(&c2, 264.0, 106.5, 11.0, run, theme::WHITE);
         let b2=b2.on_hover_text(if self.pomo.running{"暂停计时"}else{"开始计时"});
         if b2.clicked() {
-            if self.pomo.remaining <= 0.0 {
-                self.pomo.remaining = self.phase_secs(self.pomo.phase);
+            if self.pomo.running {
+                if self.pomo.remote {
+                    // 接管另一台正在跑的会话：剩余时间变成自己的新会话，
+                    // 服务端会把旧会话 supersede，另一台随即停下。
+                    let remaining = self.pomo.remaining.max(1.0);
+                    let now = chrono::Local::now().timestamp();
+                    self.pomo.session_id = crate::sync::random_id();
+                    self.pomo.started_at = now;
+                    self.pomo.duration = remaining.round() as u32;
+                    self.pomo.device = self.sync_device.id.clone();
+                    self.pomo.remote = false;
+                    self.pomo.last_done = None;
+                    self.pomo.deadline = Some(now + remaining.round().max(1.0) as i64);
+                    self.pomo.state = "running".into();
+                } else {
+                    self.pomo.running = false;
+                    self.pomo.deadline = None;
+                    self.pomo.state = "paused".into();
+                }
+            } else {
+                if self.pomo.remaining <= 0.0 {
+                    self.pomo.remaining = self.phase_secs(self.pomo.phase);
+                }
+                let now = chrono::Local::now().timestamp();
+                let terminal = self.pomo.session_id.is_empty()
+                    || matches!(
+                        self.pomo.state.as_str(),
+                        "done" | "cancelled" | "superseded" | "idle"
+                    );
+                if terminal {
+                    self.pomo.session_id = crate::sync::random_id();
+                    self.pomo.started_at = now;
+                    self.pomo.duration = self.phase_secs(self.pomo.phase) as u32;
+                    self.pomo.device = self.sync_device.id.clone();
+                    self.pomo.remote = false;
+                    self.pomo.last_done = None;
+                    self.pomo.remaining = self.phase_secs(self.pomo.phase);
+                }
+                self.pomo.running = true;
+                self.pomo.deadline =
+                    Some(now + self.pomo.remaining.round().max(1.0) as i64);
+                self.pomo.state = "running".into();
             }
-            self.pomo.running = !self.pomo.running;
         }
     }
 
     fn set_phase(&mut self, ph: Phase) {
         if self.pomo.phase==ph {return;}
+        crate::sync_focus::cancel_now(self);
         self.pomo.phase = ph;
         self.pomo.remaining = self.phase_secs(ph);
         self.pomo.running = false;
+        self.pomo.deadline = None;
+        self.pomo.state = "idle".into();
+        self.pomo.session_id.clear();
     }
 
     // ================= 饮水 =================

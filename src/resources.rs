@@ -28,6 +28,9 @@ pub static SYSTEM_MONITOR:Lane=Lane::new("daozai-monitor",2);
 /// 课表拉取（NOS）：上限 2 允许「旧线程正在退出 / 新实例刚启动」短暂交接，
 /// 与 SYSTEM_MONITOR 同一策略。
 pub static NOS:Lane=Lane::new("daozai-nos",2);
+/// 多机同步：与 NOS 同策略，配置改动重启时允许旧线程与新实例短暂交接。
+pub static SYNC:Lane=Lane::new("daozai-sync",2);
+
 /// WebDAV 曲库：列目录与下载各占一条，避免下载把浏览卡住。
 pub static WEBDAV:Lane=Lane::new("daozai-webdav",2);
 // 允许旧实例正在退出与新实例短暂交接；阻塞任务跨缓存重建仍受此上限约束。

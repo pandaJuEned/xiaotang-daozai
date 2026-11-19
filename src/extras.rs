@@ -140,6 +140,64 @@ impl App {
         }) as f32
             * 60.0
     }
+
+    /// 一个阶段自然结束：落历史、切到下一阶段；只有本机会话才响铃。
+    pub(crate) fn finish_focus_phase(&mut self) {
+        let finished = self.pomo.phase;
+        let now = chrono::Local::now().timestamp();
+        if self.pomo.started_at > 0 {
+            let id = if self.pomo.session_id.is_empty() {
+                format!("local-{now}-{}", self.pomo.started_at)
+            } else {
+                self.pomo.session_id.clone()
+            };
+            self.focus_history.append(crate::model::FocusEntry {
+                id,
+                phase: match finished {
+                    Phase::Focus => "focus",
+                    Phase::Rest => "rest",
+                }
+                .into(),
+                started_at: self.pomo.started_at,
+                ended_at: now,
+                duration: self.phase_secs(finished) as u32,
+                completed: true,
+                device: self.pomo.device.clone(),
+                remote: self.pomo.remote,
+            });
+        }
+        let remote = self.pomo.remote;
+        if !self.pomo.session_id.is_empty() && self.pomo.started_at > 0 {
+            // 先留一份结束快照：下面会把 phase 切到下一阶段，同步线程不能拿新 phase 去记这次 done。
+            self.pomo.last_done = Some(crate::sync_focus::FocusPayload {
+                phase: match finished {
+                    Phase::Focus => "focus",
+                    Phase::Rest => "rest",
+                }
+                .into(),
+                state: "done".into(),
+                started_at: self.pomo.started_at,
+                end_at: now,
+                duration: self.phase_secs(finished) as u32,
+                remaining: 0,
+                device: self.pomo.device.clone(),
+                completed: true,
+            });
+        }
+        self.pomo.state = "done".into();
+        self.pomo.deadline = None;
+        self.pomo.running = false;
+        let next = match finished {
+            Phase::Focus => Phase::Rest,
+            Phase::Rest => Phase::Focus,
+        };
+        self.pomo.phase = next;
+        self.pomo.remaining = self.phase_secs(next);
+        if !remote {
+            self.pet.react(PetState::Happy);
+            self.alert("专注计时", format!("该{}了", next.label()), 1, true);
+        }
+    }
     /// 已连续久坐的分钟数。
     pub(crate) fn sat_minutes(&self) -> u32 {
         ((self.t - self.sit_start).max(0.0) / 60.0) as u32
@@ -687,7 +745,7 @@ mod tests {
 
     #[test]
     fn settings_groups_keep_every_page_reachable() {
-        let groups = ["常规", "音乐与歌词", "专注与饮水", "专注与饮水", "待办与置物", "待办与置物", "通知、邮箱与日程", "通知、邮箱与日程", "通知、邮箱与日程", "关于", "页面管理", "AI 额度", "天气", "系统监控", "流量历史", "课表"];
+        let groups = ["常规", "音乐与歌词", "专注与饮水", "专注与饮水", "待办与置物", "待办与置物", "通知、邮箱与日程", "通知、邮箱与日程", "通知、邮箱与日程", "关于", "页面管理", "AI 额度", "天气", "系统监控", "流量历史", "课表", "多端同步"];
         for (tab, expected) in groups.iter().enumerate() {
             let matches: Vec<_> = SETTINGS_GROUPS.iter().filter(|(_,start,end)| (*start..=*end).contains(&tab)).collect();
             assert_eq!(matches.len(), 1, "页面 {tab} 必须且只能属于一个分组");
@@ -1106,60 +1164,6 @@ pub(crate) fn settings_label(ui:&mut egui::Ui,text:&str){
     ui.label(egui::RichText::new(text).size(11.5).color(settings_color(ctx,Color32::from_gray(185),Color32::from_gray(70))));
     ui.add_space(2.0);
 }
-fn support_author(ui:&mut egui::Ui){
-    let id=egui::Id::new("support-author-open");
-    let open=ui.ctx().data(|data|data.get_temp::<bool>(id).unwrap_or(false));
-    if !open {release_support_codes(ui.ctx());}
-    let dark=ui.visuals().dark_mode;
-    let accent=if dark{Color32::from_rgb(182,163,245)}else{Color32::from_rgb(105,77,163)};
-    ui.scope(|ui|{
-    ui.set_min_height(225.0);
-    if !open {
-    egui::Frame::new().fill(if dark{Color32::from_rgb(42,37,53)}else{Color32::from_rgb(239,233,250)})
-        .corner_radius(10.0).show(ui,|ui|{
-            ui.set_min_width(ui.available_width());
-            ui.vertical_centered(|ui|{
-                ui.add(egui::Image::new(egui::include_image!("../assets/support/daozai-coffee.svg")).fit_to_exact_size(egui::vec2(211.0,110.0)));
-            });
-        });
-    ui.add_space(9.0);
-    ui.label(egui::RichText::new("小唐维护 · 岛仔陪伴").size(10.5).color(accent));
-    ui.label(egui::RichText::new("请小唐喝杯咖啡").size(19.0).strong());
-    ui.label("岛仔陪你认真生活，\n你的支持，陪小唐把它慢慢做好。");
-    } else {
-        let ctx=ui.ctx().clone();
-        // 只解码一次并裁出二维码区域，按实际显示像素缩小：原图解码后两张合计约 17MB，缩小后不到 1MB。
-        let pixels=((180.0*ctx.pixels_per_point()).ceil() as u32).clamp(180,600);
-        ui.columns(2,|columns|{
-            for (i,(name,bytes,crop,color)) in [
-                ("微信支付",include_bytes!("../assets/support/support-wechat-original.jpg").as_slice(),[330.0,370.0,600.0],Color32::from_rgb(5,160,80)),
-                ("支付宝",include_bytes!("../assets/support/support-alipay-original.jpg").as_slice(),[200.0,660.0,860.0],Color32::from_rgb(22,120,255)),
-            ].into_iter().enumerate(){
-                let texture_id=egui::Id::new(("support-author-qr",i));
-                let texture=ctx.data_mut(|data|data.get_temp::<egui::TextureHandle>(texture_id)).filter(|texture|texture.size()==[pixels as usize;2]).unwrap_or_else(||{
-                    let image=support_code_image(bytes,crop,pixels);
-                    let texture=ctx.load_texture(name,image,egui::TextureOptions::LINEAR);
-                    ctx.data_mut(|data|data.insert_temp(texture_id,texture.clone()));texture
-                });
-                let uv=egui::Rect::from_min_max(egui::pos2(0.0,0.0),egui::pos2(1.0,1.0));
-                columns[i].vertical_centered(|ui|{
-                    ui.label(egui::RichText::new(name).color(color).strong());
-                    let side=ui.available_width().min(180.0);
-                    ui.add(egui::Image::new((texture.id(),egui::vec2(side,side))).uv(uv));
-                    ui.label(egui::RichText::new(if i==0{"打开微信扫一扫"}else{"打开支付宝扫一扫"}).size(11.0));
-                });
-            }
-        });
-    }
-    });
-    let button=egui::Button::new(egui::RichText::new(if open{"返回"}else{"请喝咖啡 · 支持作者"}).color(Color32::from_rgb(33,27,51)))
-        .fill(Color32::from_rgb(182,163,245)).corner_radius(8.0);
-    if ui.add_sized([ui.available_width(),32.0],button).clicked(){
-        ui.ctx().data_mut(|data|data.insert_temp(id,!open));
-    }
-    ui.add_space(7.0);
-    ui.label(egui::RichText::new("完全自愿 · 感谢每一份支持 · 不影响功能使用").size(11.0).color(ui.visuals().weak_text_color()));
-}
 pub(crate) fn settings_control_row(ui:&mut egui::Ui,title:&str,label_width:f32,controls:impl FnOnce(&mut egui::Ui)->egui::Response)->egui::Response{
     ui.horizontal(|ui|{
         // 同一张卡片里的控件左缘对齐：标签列至少 SETTINGS_LABEL_W。
@@ -1223,15 +1227,16 @@ fn setting_choices(ui:&mut egui::Ui,title:&str,value:&mut u32,values:[u32;3],uni
     let options:Vec<(u32,&str)>=values.iter().zip(labels.iter()).map(|(v,l)|(*v,l.as_str())).collect();
     settings_control_row_right(ui,title,|ui|{settings_segmented(ui,value,&options,62.0);});
 }
-const SETTINGS_GROUPS: [(&str,usize,usize);12] = [
+const SETTINGS_GROUPS: [(&str,usize,usize);13] = [
     ("常规",0,0), ("页面管理",10,10), ("音乐与歌词",1,1), ("专注与饮水",2,3),
-    ("待办与置物",4,5), ("通知、邮箱与日程",6,8), ("课表",15,15), ("AI 额度",11,11), ("天气",12,12),
-    ("系统监控",13,13), ("流量历史",14,14), ("关于",9,9),
+    ("待办与置物",4,5), ("通知、邮箱与日程",6,8), ("课表",15,15),
+    ("AI 额度",11,11), ("天气",12,12), ("系统监控",13,13),
+    ("流量历史",14,14), ("多端同步",16,16), ("关于",9,9),
 ];
 
 impl App {
     pub fn settings_ui(&mut self,ctx:&egui::Context,autostart:bool){
-        if !self.settings_open{self.todo_reminder=None;self.quota.limit_editor=None;self.window_layout().close();release_support_codes(ctx);}
+        if !self.settings_open{self.todo_reminder=None;self.quota.limit_editor=None;self.window_layout().close();}
         self.updates.poll(ctx);
         self.updates.dialog_ui(ctx);
         if !self.settings_open{return;}
@@ -1259,7 +1264,7 @@ impl App {
             if ctx.input(|i|i.viewport().close_requested()){self.settings_open=false;self.todo_reminder=None;self.quota.limit_editor=None;self.quota_close_connection();}
             let before=format!("{:?}",self.settings);
             egui::SidePanel::left("settings-sidebar").resizable(false).exact_width(180.0).frame(egui::Frame::new().fill(settings_color(ctx,Color32::from_rgb(29,29,32),Color32::from_rgb(237,239,243))).stroke(egui::Stroke::new(1.0,settings_color(ctx,Color32::from_rgb(42,42,45),Color32::from_rgb(216,219,225)))).inner_margin(egui::Margin::symmetric(10,12))).show(ctx,|ui|{
-                // 页签已增至 16 个，窗口被拖矮时末尾几项会被裁掉；放进滚动区保证都能到达。
+                // 页签已增至 18 个，窗口被拖矮时末尾几项会被裁掉；放进滚动区保证都能到达。
                 egui::ScrollArea::vertical().id_salt("settings-sidebar-scroll").auto_shrink([false,false]).show(ui,|ui|{
                 ui.add_space(5.0);
                 ui.label(egui::RichText::new("设置").size(11.0).color(settings_color(ctx,Color32::from_gray(150),Color32::from_gray(105))));
@@ -1284,6 +1289,7 @@ impl App {
                         13=>egui::include_image!("../assets/settings-icons/system/general.svg"),
                         14=>egui::include_image!("../assets/settings-icons/system/quota.svg"),
                         15=>egui::include_image!("../assets/settings-icons/calendar-days.svg"),
+                        16=>egui::include_image!("../assets/settings-icons/system/pages.svg"),
                         _=>egui::include_image!("../assets/settings-icons/system/about.svg"),
                     };
                     let icon_bg=egui::Rect::from_center_size(egui::pos2(rect.left()+21.0,rect.center().y),egui::vec2(25.0,25.0));
@@ -1315,8 +1321,8 @@ impl App {
                     }
                 }
                 ui.visuals_mut().selection.bg_fill=settings_color(ctx,Color32::from_rgb(45,105,165),Color32::from_rgb(209,226,248));
-                let titles=["常规","音乐与歌词","专注","健康提醒","待办","置物","通知","邮箱","日程","关于","页面管理","AI 额度","天气","系统监控","流量历史","课表"];
-                ui.label(egui::RichText::new(titles[self.settings_tab.min(15)]).size(18.0).strong().color(settings_color(ctx,Color32::WHITE,Color32::from_rgb(30,34,41))));
+                let titles=["常规","音乐与歌词","专注","健康提醒","待办","置物","通知","邮箱","日程","关于","页面管理","AI 额度","天气","系统监控","流量历史","课表","多端同步"];
+                ui.label(egui::RichText::new(titles[self.settings_tab.min(16)]).size(18.0).strong().color(settings_color(ctx,Color32::WHITE,Color32::from_rgb(30,34,41))));
                 if let Some((_,start,end))=SETTINGS_GROUPS.iter().find(|(_,start,end)|(*start..=*end).contains(&self.settings_tab)) {
                     if start!=end {
                         ui.add_space(7.0);
@@ -1352,6 +1358,7 @@ impl App {
                         if !self.module_on(page) {ui.disable();}
                     }
                     match self.settings_tab {
+                    16=>self.sync_settings(ui),
                     15=>self.nos_settings(ui),
                     14=>self.monitor_history_settings(ui),
                     13=>self.monitor_settings(ui),
@@ -2039,8 +2046,16 @@ impl App {
                                 ui.hyperlink_to("CC BY 4.0", "https://creativecommons.org/licenses/by/4.0/");
                             });
                         });
-                        settings_label(ui,"支持作者");
-                        settings_card(ui,support_author);
+                        settings_label(ui,"原始项目");
+                        settings_card(ui,|ui|{
+                            ui.horizontal_wrapped(|ui|{
+                                ui.label(egui::RichText::new("项目地址").size(13.0));
+                                ui.hyperlink_to("Renly1994/xiaotang-daozai","https://github.com/Renly1994/xiaotang-daozai");
+                            });
+                            ui.add_space(4.0);
+                            ui.add(egui::Label::new(egui::RichText::new("感谢原作者、所有贡献者与开源社区，以及 egui／eframe、Rust 和「悬浮云」皮肤作者啵（@hanhb123）。").size(12.0).color(settings_color(ctx,Color32::from_gray(180),Color32::from_gray(75)))).wrap());
+                            ui.label(egui::RichText::new("岛仔基于该开源项目继续维护；第三方图标、皮肤与素材沿用各自的许可。").size(11.0).color(settings_color(ctx,Color32::from_gray(150),Color32::from_gray(105))));
+                        });
                     }
                     }
                 });
@@ -2055,38 +2070,4 @@ impl App {
         });
         if !self.settings_open{self.window_layout().close();}
     }
-}
-
-/// 收款码只在「支持作者」卡片展开时占用贴图；收起卡片或关闭设置窗口即释放。
-fn release_support_codes(ctx:&egui::Context){
-    ctx.data_mut(|data|for i in 0..2usize {data.remove::<egui::TextureHandle>(egui::Id::new(("support-author-qr",i)));});
-}
-
-/// 从原图裁出二维码区域 `[x, y, 边长]` 并缩放到 `pixels` 见方。
-fn support_code_image(bytes:&[u8],crop:[f32;3],pixels:u32)->egui::ColorImage {
-    let image=image::load_from_memory(bytes).expect("内置收款码图片有效");
-    let side=(crop[2] as u32).min(image.width().saturating_sub(crop[0] as u32)).min(image.height().saturating_sub(crop[1] as u32));
-    let code=image.crop_imm(crop[0] as u32,crop[1] as u32,side,side).resize_exact(pixels,pixels,image::imageops::FilterType::Lanczos3).to_rgba8();
-    egui::ColorImage::from_rgba_unmultiplied([pixels as usize,pixels as usize],code.as_raw())
-}
-
-#[test]
-fn support_codes_are_cropped_small_and_released_when_hidden(){
-    for (bytes,crop) in [(include_bytes!("../assets/support/support-wechat-original.jpg").as_slice(),[330.0,370.0,600.0]),(include_bytes!("../assets/support/support-alipay-original.jpg").as_slice(),[200.0,660.0,860.0])] {
-        let image=support_code_image(bytes,crop,360);
-        assert_eq!(image.size,[360,360]);
-        assert!(image.pixels.len()*4<=600*1024,"每张收款码贴图应小于 0.6MB");
-        // 裁剪结果应是二维码本身：同时含有大量深色与浅色像素。
-        let dark=image.pixels.iter().filter(|p|p.r()<80).count() as f32/image.pixels.len() as f32;
-        assert!((0.2..0.8).contains(&dark),"裁剪区域不像二维码：深色占比 {dark}");
-    }
-    let ctx=egui::Context::default();
-    let _=ctx.run(Default::default(),|ctx|{
-        let texture=ctx.load_texture("qr",egui::ColorImage::new([4,4],Color32::WHITE),Default::default());
-        ctx.data_mut(|data|data.insert_temp(egui::Id::new(("support-author-qr",0usize)),texture));
-    });
-    assert_eq!(ctx.tex_manager().read().allocated().filter(|(_,meta)|meta.name=="qr").count(),1);
-    release_support_codes(&ctx);
-    let _=ctx.run(Default::default(),|_|{});
-    assert_eq!(ctx.tex_manager().read().allocated().filter(|(_,meta)|meta.name=="qr").count(),0,"收起后应释放收款码贴图");
 }

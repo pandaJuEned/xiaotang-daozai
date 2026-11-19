@@ -1,0 +1,1153 @@
+//! 岛仔多机同步（P1）：设备身份、增量游标、outbox / inbox 与退避。
+//!
+//! 这一层只负责「把变更搬来搬去」，不懂业务：
+//!
+//! - `outbox` 是待上传的操作。**变更发生时就要落盘**——托盘退出走 `ExitProcess`，
+//!   Rust 的 `Drop` 不执行，不能等同步线程来写。
+//! - `inbox` 是已拉到、尚未被业务层应用的记录。**先落盘再推进游标**，
+//!   避免「游标前进了、数据却丢了」。P2 起由 `sync_map` 消费 inbox。
+//! - `sync-state.json` 只存游标、时钟偏差与最近成功时间；令牌进 Windows 凭据管理器。
+//!
+//! 协议见 `E:/dev/LDH/岛仔双机同步-方案.md` 与 `NOS/web/README.md`「多机同步（P0）」。
+
+use eframe::egui;
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
+use std::fs::OpenOptions;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender};
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use crate::poll_clock::PollClock;
+
+/// 正常同步间隔（秒）。两台机器的小数据量，15 秒足够。
+pub const INTERVAL: i64 = 15;
+/// 失败退避上限（秒）。
+const MAX_BACKOFF: f64 = 600.0;
+/// 首次失败后的退避基数（秒）。
+const BACKOFF_BASE: f64 = 30.0;
+/// 单次拉取的记录上限（与服务端默认一致）。
+const LIMIT: usize = 200;
+/// 单批上传上限：服务端硬限制 200，这里留一半，避免一次请求体过大。
+const MAX_BATCH: usize = 100;
+
+// ---------------------------------------------------------------- 路径
+
+pub fn device_path() -> PathBuf {
+    crate::model::config_dir().join("device.json")
+}
+pub fn state_path() -> PathBuf {
+    crate::model::config_dir().join("sync-state.json")
+}
+pub fn outbox_path() -> PathBuf {
+    crate::model::config_dir().join("sync-outbox.jsonl")
+}
+pub fn inbox_path() -> PathBuf {
+    crate::model::config_dir().join("sync-inbox.jsonl")
+}
+
+/// 两处写入（UI 线程追加、同步线程压缩）互斥；跨进程由单实例互斥体兜底。
+static OUTBOX_LOCK: Mutex<()> = Mutex::new(());
+static INBOX_LOCK: Mutex<()> = Mutex::new(());
+
+// ---------------------------------------------------------------- 设备身份
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct DeviceFile {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+}
+
+fn random_hex(bytes: usize) -> String {
+    use ring::rand::{SecureRandom, SystemRandom};
+    let mut buffer = vec![0u8; bytes];
+    if SystemRandom::new().fill(&mut buffer).is_ok() {
+        return buffer.iter().map(|byte| format!("{byte:02x}")).collect();
+    }
+    // 极端情况下 RNG 不可用：用时间 + pid 兜底，至少保证进程内唯一。
+    format!(
+        "{:016x}{:08x}",
+        chrono::Local::now().timestamp_nanos_opt().unwrap_or_default(),
+        std::process::id()
+    )
+}
+
+/// 生成一个稳定 id（32 位十六进制），供业务记录（待办等）使用。
+pub fn random_id() -> String {
+    random_hex(16)
+}
+
+fn sanitize_name(raw: &str) -> String {
+    raw.chars()
+        .filter(|ch| !ch.is_control())
+        .collect::<String>()
+        .trim()
+        .chars()
+        .take(40)
+        .collect()
+}
+
+/// 读取本机身份；首次调用时生成随机 id 并落盘。
+pub fn load_device() -> DeviceFile {
+    load_device_at(&device_path())
+}
+
+fn load_device_at(path: &Path) -> DeviceFile {
+    if let Ok(raw) = std::fs::read(path) {
+        if let Ok(mut device) = serde_json::from_slice::<DeviceFile>(&raw) {
+            if !device.id.trim().is_empty() {
+                device.name = sanitize_name(&device.name);
+                return device;
+            }
+        }
+    }
+    let fallback = std::env::var("COMPUTERNAME").unwrap_or_default();
+    let device = DeviceFile {
+        id: random_hex(16),
+        name: sanitize_name(&fallback),
+    };
+    let _ = save_device_at(path, &device);
+    device
+}
+
+fn save_device_at(path: &Path, device: &DeviceFile) -> Result<(), String> {
+    let raw = serde_json::to_vec(device).map_err(|error| format!("设备信息无法序列化：{error}"))?;
+    crate::model::atomic_write(path, &raw).map_err(|error| format!("写入设备信息失败：{error}"))
+}
+
+/// 修改本机显示名。设备 id 不变，服务端按 id 覆盖名称。
+pub fn rename_device(name: &str) -> Result<DeviceFile, String> {
+    let mut device = load_device();
+    device.name = sanitize_name(name);
+    save_device_at(&device_path(), &device)?;
+    Ok(device)
+}
+
+/// 给界面显示的默认名：没填时用 id 前 8 位，避免出现空白行。
+pub fn display_name(device: &DeviceFile) -> String {
+    if device.name.trim().is_empty() {
+        device.id.chars().take(8).collect()
+    } else {
+        device.name.clone()
+    }
+}
+
+// ---------------------------------------------------------------- 配置
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Config {
+    /// 服务地址，如 `https://nos.example.com`。
+    pub base_url: String,
+    /// Bearer 令牌，只进凭据管理器。
+    pub token: String,
+    /// 稳定设备 id（`device.json`）。
+    pub device_id: String,
+    /// 显示名（`device.json`）。
+    pub device_name: String,
+}
+
+impl Config {
+    pub fn ready(&self) -> bool {
+        !normalize_base(&self.base_url).is_empty()
+            && !self.token.trim().is_empty()
+            && !self.device_id.trim().is_empty()
+    }
+}
+
+/// 地址统一成「无尾斜杠、带 scheme」。用户只填 `nos.example.com` 也能用。
+pub fn normalize_base(raw: &str) -> String {
+    let mut value = raw.trim().trim_end_matches('/').to_string();
+    if value.is_empty() {
+        return value;
+    }
+    if !value.starts_with("http://") && !value.starts_with("https://") {
+        value = format!("http://{value}");
+    }
+    value
+}
+
+/// 公网明文地址提示：只用于界面提醒，不阻止（局域网 http 是常态）。
+pub fn insecure_public(base: &str) -> bool {
+    let lower = base.trim().to_ascii_lowercase();
+    if !lower.starts_with("http://") {
+        return false;
+    }
+    let host = lower["http://".len()..].split('/').next().unwrap_or("");
+    let local = host.starts_with("127.")
+        || host.starts_with("localhost")
+        || host.starts_with("[::1]")
+        || host.starts_with("192.168.")
+        || host.starts_with("10.")
+        || (host.starts_with("172.")
+            && host
+                .split('.')
+                .nth(1)
+                .and_then(|part| part.parse::<u8>().ok())
+                .is_some_and(|second| (16..=31).contains(&second)));
+    !local
+}
+
+// ---------------------------------------------------------------- 凭据
+
+#[cfg(windows)]
+pub mod secrets {
+    /// 测试用独立条目：`delete()` 会真的删凭据，不能和正式条目同名。
+    const SERVICE: &str = if cfg!(test) { "Daozai.Sync.test" } else { "Daozai.Sync" };
+
+    pub fn save(token: &str) -> Result<(), String> {
+        let entry = keyring::Entry::new(SERVICE, "token")
+            .map_err(|error| format!("凭据管理器不可用：{error}"))?;
+        entry
+            .set_password(token)
+            .map_err(|error| format!("保存令牌失败：{error}"))
+    }
+
+    pub fn load() -> Result<String, String> {
+        let entry = keyring::Entry::new(SERVICE, "token")
+            .map_err(|error| format!("凭据管理器不可用：{error}"))?;
+        entry.get_password().map_err(|_| "没有保存令牌".to_string())
+    }
+
+    pub fn delete() {
+        if let Ok(entry) = keyring::Entry::new(SERVICE, "token") {
+            let _ = entry.delete_credential();
+        }
+    }
+}
+
+#[cfg(not(windows))]
+pub mod secrets {
+    pub fn save(_token: &str) -> Result<(), String> {
+        Err("仅 Windows 支持凭据管理器".into())
+    }
+    pub fn load() -> Result<String, String> {
+        Err("仅 Windows 支持凭据管理器".into())
+    }
+    pub fn delete() {}
+}
+
+// ---------------------------------------------------------------- 游标
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct StateFile {
+    #[serde(default)]
+    pub cursor: i64,
+    /// 最近一次成功同步的本机时间（Unix 秒）。
+    #[serde(default)]
+    pub last_ok: i64,
+    /// 服务端时间 - 本机时间（毫秒）；P4 的番茄倒计时会用到。
+    #[serde(default)]
+    pub skew_ms: i64,
+}
+
+impl StateFile {
+    pub fn load() -> Self {
+        load_state_at(&state_path())
+    }
+
+    pub fn save(&self) {
+        let _ = save_state_at(&state_path(), self);
+    }
+}
+
+fn load_state_at(path: &Path) -> StateFile {
+    std::fs::read(path)
+        .ok()
+        .and_then(|raw| serde_json::from_slice::<StateFile>(&raw).ok())
+        .unwrap_or_default()
+}
+
+fn save_state_at(path: &Path, state: &StateFile) -> Result<(), String> {
+    let raw = serde_json::to_vec(state).map_err(|error| format!("同步状态无法序列化：{error}"))?;
+    crate::model::atomic_write(path, &raw).map_err(|error| format!("写入同步状态失败：{error}"))
+}
+
+// ---------------------------------------------------------------- 记录与操作
+
+/// 服务端返回的一条记录。`data` 保持原样，由 `sync_map` 解释。
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct Record {
+    #[serde(default)]
+    pub id: String,
+    #[serde(rename = "type", default)]
+    pub kind: String,
+    #[serde(default)]
+    pub day: String,
+    #[serde(default)]
+    pub rev: i64,
+    #[serde(default)]
+    pub seq: i64,
+    #[serde(default)]
+    pub deleted: bool,
+    #[serde(default)]
+    pub updated_at: String,
+    #[serde(default)]
+    pub updated_by: String,
+    #[serde(default)]
+    pub data: serde_json::Value,
+}
+
+/// 待上传的一次变更。字段与服务端 `OpIn` 对齐。
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct Op {
+    pub op_id: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub id: String,
+    #[serde(default)]
+    pub base_rev: i64,
+    #[serde(default)]
+    pub deleted: bool,
+    #[serde(default)]
+    pub day: String,
+    #[serde(default)]
+    pub data: serde_json::Value,
+    #[serde(default)]
+    pub client_at: i64,
+}
+
+impl Op {
+    pub fn new(kind: &str, id: &str, base_rev: i64, day: &str, data: serde_json::Value) -> Self {
+        Self {
+            op_id: random_hex(16),
+            kind: kind.into(),
+            id: id.into(),
+            base_rev,
+            deleted: false,
+            day: day.into(),
+            data,
+            client_at: chrono::Local::now().timestamp(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------- outbox
+
+/// 追加一条待上传操作。**变更发生时立即调用**，不要攒到同步线程。
+pub fn enqueue(op: &Op) -> Result<(), String> {
+    enqueue_at(&outbox_path(), op)
+}
+
+fn enqueue_at(path: &Path, op: &Op) -> Result<(), String> {
+    let _guard = OUTBOX_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| format!("创建同步目录失败：{error}"))?;
+    }
+    let mut line = serde_json::to_vec(op).map_err(|error| format!("操作无法序列化：{error}"))?;
+    line.push(b'\n');
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|error| format!("打开 outbox 失败：{error}"))?;
+    file.write_all(&line)
+        .and_then(|_| file.sync_data())
+        .map_err(|error| format!("写入 outbox 失败：{error}"))
+}
+
+pub fn pending_ops() -> Vec<Op> {
+    pending_at(&outbox_path())
+}
+
+fn pending_at(path: &Path) -> Vec<Op> {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    raw.lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| serde_json::from_str::<Op>(line).ok())
+        .collect()
+}
+
+/// 确认已处理的操作：只保留未确认的，原子重写整个文件。
+pub fn ack_ops(acked: &HashSet<String>) {
+    ack_at(&outbox_path(), acked)
+}
+
+fn ack_at(path: &Path, acked: &HashSet<String>) {
+    if acked.is_empty() {
+        return;
+    }
+    let _guard = OUTBOX_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let remaining: Vec<Op> = pending_at(path)
+        .into_iter()
+        .filter(|op| !acked.contains(&op.op_id))
+        .collect();
+    let mut body = Vec::new();
+    for op in remaining {
+        if let Ok(mut line) = serde_json::to_vec(&op) {
+            line.push(b'\n');
+            body.extend_from_slice(&line);
+        }
+    }
+    let _ = crate::model::atomic_write(path, &body);
+}
+
+// ---------------------------------------------------------------- inbox
+
+/// 先落盘、再推进游标；P2 的 `sync_map` 从这里取数据。
+pub fn append_inbox(records: &[Record]) -> Result<(), String> {
+    append_inbox_at(&inbox_path(), records)
+}
+
+fn append_inbox_at(path: &Path, records: &[Record]) -> Result<(), String> {
+    if records.is_empty() {
+        return Ok(());
+    }
+    let _guard = INBOX_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| format!("创建同步目录失败：{error}"))?;
+    }
+    let mut body = Vec::new();
+    for record in records {
+        body.extend_from_slice(
+            &serde_json::to_vec(record).map_err(|error| format!("记录无法序列化：{error}"))?,
+        );
+        body.push(b'\n');
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|error| format!("打开 inbox 失败：{error}"))?;
+    file.write_all(&body)
+        .and_then(|_| file.sync_data())
+        .map_err(|error| format!("写入 inbox 失败：{error}"))
+}
+
+pub fn inbox_len() -> usize {
+    std::fs::read_to_string(inbox_path())
+        .map(|raw| raw.lines().filter(|line| !line.trim().is_empty()).count())
+        .unwrap_or(0)
+}
+
+/// 取出 inbox 里的全部记录（不清空）。调用方应用成功后用 `replace_inbox` 写回剩余。
+pub fn read_inbox() -> Vec<Record> {
+    let _guard = INBOX_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let Ok(raw) = std::fs::read_to_string(inbox_path()) else {
+        return Vec::new();
+    };
+    raw.lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| serde_json::from_str::<Record>(line).ok())
+        .collect()
+}
+
+/// 用剩余记录重写 inbox。P2 只消费 `todo_item`，其它类型留给后续阶段。
+pub fn replace_inbox(records: &[Record]) {
+    let _guard = INBOX_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let mut body = Vec::new();
+    for record in records {
+        if let Ok(mut line) = serde_json::to_vec(record) {
+            line.push(b'\n');
+            body.extend_from_slice(&line);
+        }
+    }
+    let _ = crate::model::atomic_write(&inbox_path(), &body);
+}
+
+pub fn clear_inbox() {
+    let _guard = INBOX_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _ = crate::model::atomic_write(&inbox_path(), b"");
+}
+
+// ---------------------------------------------------------------- 回执
+
+/// 一条操作的处理结果。UI 线程靠它把 `rev` 与 `pending` 对齐。
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct Ack {
+    pub op_id: String,
+    pub status: String,
+    #[serde(default)]
+    pub rev: Option<i64>,
+    #[serde(default)]
+    pub seq: Option<i64>,
+}
+
+static ACK_LOCK: Mutex<()> = Mutex::new(());
+
+fn append_ack(ack: &Ack) {
+    let _guard = ACK_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let path = crate::model::config_dir().join("sync-acks.jsonl");
+    let Ok(mut line) = serde_json::to_vec(ack) else {
+        return;
+    };
+    line.push(b'\n');
+    let _ = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .and_then(|mut file| file.write_all(&line).and_then(|_| file.sync_data()));
+}
+
+/// 取走全部回执并清空。UI 每 500ms 泵一次，正常不会堆积。
+pub fn drain_acks() -> Vec<Ack> {
+    let _guard = ACK_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let path = crate::model::config_dir().join("sync-acks.jsonl");
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let acks = raw
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| serde_json::from_str::<Ack>(line).ok())
+        .collect();
+    let _ = crate::model::atomic_write(&path, b"");
+    acks
+}
+
+// ---------------------------------------------------------------- HTTP
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+pub struct UserInfo {
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub display_name: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+pub struct Device {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub platform: String,
+    #[serde(default)]
+    pub app_version: String,
+    #[serde(default)]
+    pub online: bool,
+    #[serde(default)]
+    pub last_seen_at: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct Hello {
+    #[serde(default)]
+    pub server_now: i64,
+    #[serde(default)]
+    pub cursor: i64,
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    #[serde(default)]
+    pub user: UserInfo,
+    #[serde(default)]
+    pub devices: Vec<Device>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct Changes {
+    #[serde(default)]
+    pub cursor: i64,
+    #[serde(default)]
+    pub reset: bool,
+    #[serde(default)]
+    pub server_now: i64,
+    #[serde(default)]
+    pub records: Vec<Record>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct DevicesResponse {
+    #[serde(default)]
+    pub devices: Vec<Device>,
+}
+
+#[derive(Serialize)]
+struct OpsRequest<'a> {
+    device: &'a str,
+    ops: &'a [Op],
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct OpResult {
+    #[serde(default)]
+    pub op_id: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub rev: Option<i64>,
+    #[serde(default)]
+    pub seq: Option<i64>,
+    #[serde(default)]
+    pub detail: Option<String>,
+    /// `conflict` 时服务端的整条现状；客户端据此采纳并落冲突箱。
+    #[serde(default)]
+    pub record: Option<Record>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct OpsResponse {
+    #[serde(default)]
+    pub results: Vec<OpResult>,
+    #[serde(default)]
+    pub cursor: i64,
+    #[serde(default)]
+    pub server_now: i64,
+}
+
+fn http_error(error: ureq::Error) -> String {
+    match error {
+        ureq::Error::Status(401, _) => "令牌无效或已被撤销，请在设置里重新生成".into(),
+        ureq::Error::Status(403, _) => "令牌缺少同步权限（需要 sync:read / sync:write）".into(),
+        ureq::Error::Status(404, _) => "服务端没有同步接口，请升级 NOS".into(),
+        ureq::Error::Status(413, _) => "单次提交的数据过大".into(),
+        ureq::Error::Status(503, _) => "服务端未配置访问令牌".into(),
+        ureq::Error::Status(code, _) => format!("服务返回 {code}"),
+        _ => "网络不可用".into(),
+    }
+}
+
+fn read_json<T: DeserializeOwned>(response: ureq::Response) -> Result<T, String> {
+    let mut body = String::new();
+    response
+        .into_reader()
+        .take(4 * 1024 * 1024)
+        .read_to_string(&mut body)
+        .map_err(|error| format!("读取响应失败：{error}"))?;
+    serde_json::from_str(&body).map_err(|error| format!("服务返回的数据无法解析：{error}"))
+}
+
+fn post_json<T: DeserializeOwned>(
+    agent: &ureq::Agent,
+    url: &str,
+    token: &str,
+    body: &impl Serialize,
+) -> Result<T, String> {
+    let payload = serde_json::to_vec(body).map_err(|error| format!("请求无法序列化：{error}"))?;
+    let response = agent
+        .post(url)
+        .set("Authorization", &format!("Bearer {token}"))
+        .set("Content-Type", "application/json")
+        .send_bytes(&payload)
+        .map_err(http_error)?;
+    read_json(response)
+}
+
+fn get_json<T: DeserializeOwned>(
+    agent: &ureq::Agent,
+    url: &str,
+    token: &str,
+) -> Result<T, String> {
+    let response = agent
+        .get(url)
+        .set("Authorization", &format!("Bearer {token}"))
+        .call()
+        .map_err(http_error)?;
+    read_json(response)
+}
+
+fn hello(agent: &ureq::Agent, cfg: &Config) -> Result<Hello, String> {
+    let base = normalize_base(&cfg.base_url);
+    let body = serde_json::json!({
+        "device": {
+            "id": cfg.device_id,
+            "name": cfg.device_name,
+            "platform": "windows",
+            "app": env!("CARGO_PKG_VERSION"),
+        }
+    });
+    post_json(agent, &format!("{base}/api/daozai/hello"), &cfg.token, &body)
+}
+
+fn changes(agent: &ureq::Agent, cfg: &Config, since: i64) -> Result<Changes, String> {
+    let base = normalize_base(&cfg.base_url);
+    get_json(
+        agent,
+        &format!("{base}/api/daozai/changes?since={since}&limit={LIMIT}"),
+        &cfg.token,
+    )
+}
+
+fn devices(agent: &ureq::Agent, cfg: &Config) -> Result<DevicesResponse, String> {
+    let base = normalize_base(&cfg.base_url);
+    get_json(agent, &format!("{base}/api/daozai/devices"), &cfg.token)
+}
+
+fn submit(agent: &ureq::Agent, cfg: &Config, ops: &[Op]) -> Result<OpsResponse, String> {
+    let base = normalize_base(&cfg.base_url);
+    post_json(
+        agent,
+        &format!("{base}/api/daozai/ops"),
+        &cfg.token,
+        &OpsRequest {
+            device: &cfg.device_id,
+            ops,
+        },
+    )
+}
+
+/// 测试连接：只读设备列表，不注册临时设备。
+pub fn test_connection(base_url: &str, token: &str) -> Result<String, String> {
+    let base = normalize_base(base_url);
+    if base.is_empty() {
+        return Err("请先填写服务器地址".into());
+    }
+    if token.trim().is_empty() {
+        return Err("请先填写访问令牌".into());
+    }
+    let agent = crate::nos::http_agent();
+    let response: DevicesResponse = get_json(
+        &agent,
+        &format!("{base}/api/daozai/devices"),
+        token.trim(),
+    )?;
+    Ok(format!(
+        "连接成功 · 服务器上已有 {} 台设备",
+        response.devices.len()
+    ))
+}
+
+// ---------------------------------------------------------------- 快照
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DeviceView {
+    pub id: String,
+    pub name: String,
+    pub online: bool,
+    pub platform: String,
+    pub last_seen: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Snapshot {
+    pub configured: bool,
+    pub connected: bool,
+    /// 首次增量拉取已完成。未 ready 时 `sync_map` 不上传本地数据，
+    /// 避免第二台设备在还没看到服务端记录前就把本地条目重复推上去。
+    pub ready: bool,
+    pub user: String,
+    pub cursor: i64,
+    pub pending: usize,
+    pub devices: Vec<DeviceView>,
+    pub last_ok: i64,
+    pub error: Option<String>,
+    pub skew_ms: i64,
+    pub last_batch: usize,
+    pub inbox: usize,
+}
+
+impl Snapshot {
+    pub fn device_name(&self, id: &str) -> String {
+        self.devices
+            .iter()
+            .find(|device| device.id == id)
+            .map(|device| device.name.clone())
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| id.chars().take(8).collect())
+    }
+}
+
+fn device_views(list: Vec<Device>) -> Vec<DeviceView> {
+    list.into_iter()
+        .map(|device| DeviceView {
+            name: if device.name.trim().is_empty() {
+                device.id.chars().take(8).collect()
+            } else {
+                device.name
+            },
+            id: device.id,
+            online: device.online,
+            platform: device.platform,
+            last_seen: device.last_seen_at,
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------- 服务
+
+pub struct Service {
+    rx: Receiver<Snapshot>,
+    stop: Arc<AtomicBool>,
+}
+
+impl Service {
+    pub fn start(ctx: egui::Context, cfg: Config, initial: Snapshot) -> Self {
+        let (tx, rx) = mpsc::sync_channel(2);
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        let _ = crate::resources::SYNC.spawn(move || run(ctx, cfg, initial, tx, flag));
+        Self { rx, stop }
+    }
+
+    pub fn try_recv(&self) -> Option<Snapshot> {
+        self.rx.try_recv().ok()
+    }
+}
+
+impl Drop for Service {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+fn backoff_secs(failures: u32) -> i64 {
+    // 30 / 60 / 120 / 240 / 480 / 600（上限）
+    (BACKOFF_BASE * 2f64.powi(failures.min(6) as i32 - 1)).min(MAX_BACKOFF) as i64
+}
+
+fn wait(stop: &AtomicBool, seconds: i64) {
+    let deadline = Instant::now() + Duration::from_secs(seconds.max(1) as u64);
+    while Instant::now() < deadline {
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// 令牌类错误要重新 hello：令牌可能被撤销，或刚换了 scope。
+fn needs_rehello(error: &str) -> bool {
+    error.starts_with("令牌")
+}
+
+fn log_conflict(result: &OpResult, op: Option<&Op>) {
+    let path = crate::model::config_dir().join(format!(
+        "sync-conflicts-{}.txt",
+        chrono::Local::now().format("%Y-%m-%d")
+    ));
+    let line = serde_json::json!({
+        "at": chrono::Local::now().to_rfc3339(),
+        "op": op,
+        "status": result.status,
+        "rev": result.rev,
+        "server": result.record,
+    });
+    let Ok(mut body) = serde_json::to_vec(&line) else {
+        return;
+    };
+    body.push(b'\n');
+    let _ = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .and_then(|mut file| file.write_all(&body));
+}
+
+/// 后台线程：hello → 上传 outbox → 拉 changes → 落 inbox → 推进游标。
+fn run(
+    ctx: egui::Context,
+    cfg: Config,
+    mut snap: Snapshot,
+    tx: SyncSender<Snapshot>,
+    stop: Arc<AtomicBool>,
+) {
+    let agent = crate::nos::http_agent();
+    let mut state = StateFile::load();
+    let mut clock = PollClock::default();
+    let mut failures: u32 = 0;
+    let mut hello_ok = false;
+    let mut next_devices = 0i64;
+    // 每次重建服务都先拉一轮再允许 UI 上传，避免第二台设备抢先推本地数据。
+    snap.ready = false;
+
+    while !stop.load(Ordering::Relaxed) {
+        if !clock.ready(Duration::from_secs(1)) {
+            std::thread::sleep(Duration::from_millis(50));
+            continue;
+        }
+        clock = PollClock::now();
+
+        if !cfg.ready() {
+            std::thread::sleep(Duration::from_secs(1));
+            continue;
+        }
+
+        snap.configured = true;
+        snap.pending = pending_ops().len();
+        snap.inbox = inbox_len();
+        let mut cycle_ok = true;
+
+        if !hello_ok {
+            match hello(&agent, &cfg) {
+                Ok(info) => {
+                    hello_ok = true;
+                    failures = 0;
+                    snap.connected = true;
+                    snap.error = None;
+                    snap.user = if info.user.display_name.trim().is_empty() {
+                        info.user.username.clone()
+                    } else {
+                        info.user.display_name.clone()
+                    };
+                    snap.devices = device_views(info.devices);
+                    snap.cursor = state.cursor;
+                    snap.skew_ms = (info.server_now - chrono::Local::now().timestamp()) * 1000;
+                    snap.last_ok = chrono::Local::now().timestamp();
+                    state.skew_ms = snap.skew_ms;
+                    state.save();
+                    next_devices = snap.last_ok + 60;
+                }
+                Err(error) => {
+                    failures = failures.saturating_add(1);
+                    snap.connected = false;
+                    snap.error = Some(error);
+                    cycle_ok = false;
+                }
+            }
+        }
+
+        if hello_ok && cycle_ok {
+            // 1) 上传：幂等由服务端 op_id 保证；冲突也视为已处理（写冲突箱）。
+            let pending = pending_ops();
+            if !pending.is_empty() {
+                let batch: Vec<Op> = pending.into_iter().take(MAX_BATCH).collect();
+                match submit(&agent, &cfg, &batch) {
+                    Ok(response) => {
+                        let mut acked = HashSet::new();
+                        for result in &response.results {
+                            append_ack(&Ack {
+                                op_id: result.op_id.clone(),
+                                status: result.status.clone(),
+                                rev: result.rev,
+                                seq: result.seq,
+                            });
+                            match result.status.as_str() {
+                                "applied" | "duplicate" => {
+                                    acked.insert(result.op_id.clone());
+                                }
+                                "conflict" => {
+                                    acked.insert(result.op_id.clone());
+                                    let op = batch.iter().find(|op| op.op_id == result.op_id);
+                                    log_conflict(result, op);
+                                    // 服务端胜：把它的整条现状塞回 inbox，由 UI 采纳。
+                                    match &result.record {
+                                        Some(record) => {
+                                            let _ = append_inbox(std::slice::from_ref(record));
+                                        }
+                                        None => {
+                                            // 记录在服务端已不存在：合成一条删除，避免本地复活。
+                                            if let Some(op) = op {
+                                                let _ = append_inbox(&[Record {
+                                                    id: op.id.clone(),
+                                                    kind: op.kind.clone(),
+                                                    deleted: true,
+                                                    rev: result.rev.unwrap_or(0),
+                                                    ..Default::default()
+                                                }]);
+                                            }
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        ack_ops(&acked);
+                        snap.pending = pending_ops().len();
+                    }
+                    Err(error) => {
+                        failures = failures.saturating_add(1);
+                        if needs_rehello(&error) {
+                            hello_ok = false;
+                            snap.ready = false;
+                        }
+                        snap.error = Some(error);
+                        cycle_ok = false;
+                    }
+                }
+            }
+        }
+
+        if hello_ok && cycle_ok {
+            // 2) 拉取：必须先落 inbox 再推进游标，否则断电会丢一批记录。
+            match changes(&agent, &cfg, state.cursor) {
+                Ok(batch) => {
+                    if batch.reset {
+                        clear_inbox();
+                        state.cursor = 0;
+                        snap.ready = false;
+                        snap.error = Some("服务器游标超前（可能恢复过备份），已重置等待全量重拉".into());
+                    } else {
+                        if !batch.records.is_empty() {
+                            match append_inbox(&batch.records) {
+                                Ok(()) => {
+                                    state.cursor = batch.cursor;
+                                }
+                                Err(error) => {
+                                    failures = failures.saturating_add(1);
+                                    snap.error = Some(error);
+                                    snap.ready = false;
+                                    cycle_ok = false;
+                                }
+                            }
+                        }
+                        if cycle_ok {
+                            snap.error = None;
+                            snap.ready = true;
+                        }
+                    }
+                    snap.last_batch = batch.records.len();
+                    snap.cursor = state.cursor;
+                    snap.inbox = inbox_len();
+                    state.last_ok = chrono::Local::now().timestamp();
+                    state.save();
+                    snap.last_ok = state.last_ok;
+                }
+                Err(error) => {
+                    failures = failures.saturating_add(1);
+                    if needs_rehello(&error) {
+                        hello_ok = false;
+                    }
+                    snap.ready = false;
+                    snap.error = Some(error);
+                    cycle_ok = false;
+                }
+            }
+        }
+
+        // 3) 设备列表每 60 秒刷新一次；失败不改变主链路的连接状态。
+        if hello_ok && chrono::Local::now().timestamp() >= next_devices {
+            if let Ok(response) = devices(&agent, &cfg) {
+                snap.devices = device_views(response.devices);
+            }
+            next_devices = chrono::Local::now().timestamp() + 60;
+        }
+
+        if cycle_ok {
+            failures = 0;
+            snap.connected = true;
+        }
+        let _ = tx.try_send(snap.clone());
+        ctx.request_repaint();
+
+        let interval = if snap.pending > 0 { 5 } else { INTERVAL };
+        let wait_secs = if failures == 0 {
+            interval
+        } else {
+            backoff_secs(failures)
+        };
+        wait(&stop, wait_secs);
+    }
+}
+
+// ---------------------------------------------------------------- 测试
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "daozai-sync-test-{}-{name}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        dir.join("file.jsonl")
+    }
+
+    #[test]
+    fn normalize_base_adds_scheme_and_strips_trailing_slash() {
+        assert_eq!(normalize_base("nos.example.com/"), "http://nos.example.com");
+        assert_eq!(normalize_base(" https://a.b/c/ "), "https://a.b/c");
+        assert_eq!(normalize_base(""), "");
+    }
+
+    #[test]
+    fn insecure_public_only_flags_public_plain_http() {
+        assert!(insecure_public("http://nos.example.com"));
+        assert!(!insecure_public("https://nos.example.com"));
+        assert!(!insecure_public("http://127.0.0.1:8000"));
+        assert!(!insecure_public("http://192.168.3.136:8000"));
+        assert!(!insecure_public("http://172.20.1.2"));
+        assert!(insecure_public("http://172.32.1.2"));
+    }
+
+    #[test]
+    fn outbox_append_ack_and_survives_broken_lines() {
+        let path = temp("outbox");
+        let _ = std::fs::remove_file(&path);
+        let first = Op::new("water_sip", "w1", 0, "2026-11-18", serde_json::json!({"ml":250}));
+        let second = Op::new("todo_item", "t1", 2, "", serde_json::json!({"text":"x"}));
+        enqueue_at(&path, &first).unwrap();
+        enqueue_at(&path, &second).unwrap();
+        assert_eq!(pending_at(&path).len(), 2);
+
+        let mut acked = HashSet::new();
+        acked.insert(first.op_id.clone());
+        ack_at(&path, &acked);
+        let left = pending_at(&path);
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].op_id, second.op_id);
+    }
+
+    #[test]
+    fn state_roundtrip_keeps_cursor_and_skew() {
+        let path = temp("state");
+        let _ = std::fs::remove_file(&path);
+        let state = StateFile { cursor: 42, last_ok: 100, skew_ms: -1500 };
+        save_state_at(&path, &state).unwrap();
+        assert_eq!(load_state_at(&path), state);
+    }
+
+    #[test]
+    fn device_identity_is_stable_and_name_is_sanitized() {
+        let path = temp("device");
+        let _ = std::fs::remove_file(&path);
+        let first = load_device_at(&path);
+        let second = load_device_at(&path);
+        assert_eq!(first.id, second.id, "同一文件必须得到同一 id");
+        assert!(!first.id.is_empty());
+        assert_eq!(sanitize_name("  书房\n台式  "), "书房台式");
+        assert_eq!(sanitize_name("一二三四五六七八九十").chars().count(), 10);
+    }
+
+    #[test]
+    fn hello_changes_and_ops_payloads_parse() {
+        let hello: Hello = serde_json::from_str(
+            r#"{"server_now":1795,"cursor":7,"scopes":["sync:read"],
+                "user":{"username":"a","display_name":"姚"},
+                "devices":[{"id":"d1","name":"书房","online":true}]}"#,
+        )
+        .unwrap();
+        assert_eq!(hello.cursor, 7);
+        assert_eq!(hello.devices[0].name, "书房");
+
+        let changes: Changes = serde_json::from_str(
+            r#"{"cursor":9,"reset":false,"records":[
+                {"id":"w1","type":"water_sip","seq":8,"rev":1,"data":{"ml":250}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(changes.records[0].kind, "water_sip");
+        assert_eq!(changes.records[0].data["ml"], 250);
+
+        let ops: OpsResponse = serde_json::from_str(
+            r#"{"cursor":9,"results":[
+                {"op_id":"o1","status":"applied","rev":1,"seq":9},
+                {"op_id":"o2","status":"conflict","rev":2,"record":{"id":"t1"}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(ops.results[1].status, "conflict");
+        assert_eq!(ops.results[1].rev, Some(2));
+    }
+
+    #[test]
+    fn backoff_grows_and_is_capped() {
+        assert_eq!(backoff_secs(1), 30);
+        assert_eq!(backoff_secs(2), 60);
+        assert_eq!(backoff_secs(3), 120);
+        assert_eq!(backoff_secs(9), 600);
+    }
+
+    #[test]
+    fn snapshot_resolves_device_name_with_fallback() {
+        let snap = Snapshot {
+            devices: vec![DeviceView {
+                id: "abcdef123456".into(),
+                name: "书房台式".into(),
+                online: true,
+                platform: "windows".into(),
+                last_seen: String::new(),
+            }],
+            ..Default::default()
+        };
+        assert_eq!(snap.device_name("abcdef123456"), "书房台式");
+        assert_eq!(snap.device_name("zzzzzzzzzzzz"), "zzzzzzzz");
+    }
+}

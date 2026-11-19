@@ -105,6 +105,12 @@ struct Shell {
     nos_server_probe_rx: Option<std::sync::mpsc::Receiver<daozai::nos_server::Status>>,
     /// 启动后的「就绪」回执通道。
     nos_server_ready_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
+    /// 多机同步服务：默认关闭，接入 NOS 后由配置开关启动。
+    sync: Option<daozai::sync::Service>,
+    /// 「测试连接」的结果通道。
+    sync_test_rx: Option<std::sync::mpsc::Receiver<String>>,
+    /// 待办对账节流：500ms 一次，扫描当前 todo.txt 与上次同步快照的差异。
+    sync_pump: PollClock,
 }
 
 const MODULE_OFF:&str="该功能已在「页面管理」中关闭";
@@ -139,6 +145,15 @@ impl Shell {
         if nos_on!=self.nos.is_some() {
             self.nos=if nos_on {Some(daozai::nos::Service::start(ctx.clone(),nos_cfg))} else {None};
             if !nos_on {self.app.nos_error=None;self.app.nos_events.clear();self.app.nos_breaks.clear();self.app.nos_todos.clear();self.app.nos_agenda=None;}
+        }
+        // 多机同步：与课表同一个 NOS，但走独立开关、独立凭据与独立线程。
+        // 关闭时不读 device.json / 凭据管理器，保持「本地模式零变化」。
+        let sync_wanted=self.app.settings.sync_enabled;
+        let sync_cfg=if sync_wanted {self.app.sync_config()} else {daozai::sync::Config::default()};
+        let sync_on=sync_wanted && sync_cfg.ready();
+        if sync_on!=self.sync.is_some() {
+            self.sync=if sync_on {Some(daozai::sync::Service::start(ctx.clone(),sync_cfg,self.app.sync.clone()))} else {None};
+            if !sync_on {self.app.sync.connected=false;self.app.sync.ready=false;self.app.sync.error=None;}
         }
         let clipboard_on=self.app.clipboard_active();
         if clipboard_on!=self.clipboard_watch.is_some() {
@@ -267,6 +282,9 @@ impl Shell {
             nos_server_at: PollClock::default(),
             nos_server_probe_rx: None,
             nos_server_ready_rx: None,
+            sync: None,
+            sync_test_rx: None,
+            sync_pump: PollClock::default(),
         }
     }
 
@@ -707,6 +725,23 @@ impl eframe::App for Shell {
                 }
             }
         }
+        // 多机同步：后台线程只推快照，界面与服务层都只读 `app.sync`。
+        if let Some(service)=&self.sync {
+            while let Some(snapshot)=service.try_recv() {
+                self.app.sync=snapshot;
+            }
+        }
+        if let Some(rx)=&self.sync_test_rx {
+            if let Ok(message)=rx.try_recv() {
+                self.app.say(message);
+                self.sync_test_rx=None;
+            }
+        }
+        // 待办对账：UI 线程独占 todo.txt，先采纳远端，再把本地差异推进 outbox。
+        if self.app.settings.sync_enabled && self.sync_pump.ready(Duration::from_millis(500)) {
+            self.sync_pump=PollClock::now();
+            daozai::sync_map::pump(&mut self.app);
+        }
         if let Some((message,rx))=&self.seek_rx {
             if let Some(success)=match rx.try_recv(){Ok(success)=>Some(success),Err(std::sync::mpsc::TryRecvError::Disconnected)=>Some(false),Err(_)=>None}{
                 let message=*message;
@@ -1041,6 +1076,29 @@ impl eframe::App for Shell {
                         let _=std::fs::write(&path,b"");
                     }
                     if let Err(error)=open_path(&path){self.app.say(error);}
+                },
+                Cmd::SyncReconfigure => {
+                    // 配置已由设置页写盘；只让旧服务退出，下一帧按新配置重建。
+                    self.sync=None;
+                    self.app.sync.connected=false;
+                    self.app.sync.error=None;
+                },
+                Cmd::SyncNow => {
+                    self.sync=None;
+                    self.app.sync.error=None;
+                },
+                Cmd::SyncTest(base_url, token) => {
+                    let ctx=ctx.clone();
+                    let (tx,rx)=std::sync::mpsc::channel::<String>();
+                    std::thread::Builder::new().name("daozai-sync-test".into()).spawn(move||{
+                        let message=match daozai::sync::test_connection(&base_url,&token) {
+                            Ok(text)=>text,
+                            Err(error)=>format!("连接失败：{error}"),
+                        };
+                        let _=tx.send(message);
+                        ctx.request_repaint();
+                    }).ok();
+                    self.sync_test_rx=Some(rx);
                 },
             }
         }
