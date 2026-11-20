@@ -29,6 +29,8 @@ pub struct Ui {
     pub busy: bool,
     pub collection: String,
     pub entries: Vec<Entry>,
+    /// 播放序列：按加入顺序播放，不与目录里的其它曲目混在一起。
+    pub queue: Vec<Entry>,
     pub loading: bool,
     pub error: Option<String>,
     /// 当前目录是否已经取过一次：用来区分「还没读」和「读到了空目录」。
@@ -57,6 +59,7 @@ impl Default for Ui {
             busy: false,
             collection: cfg.dir.clone(),
             entries: Vec::new(),
+            queue: Vec::new(),
             loading: false,
             error: None,
             loaded: false,
@@ -316,21 +319,70 @@ impl App {
                     } else {
                         format!("· {}", entry.name)
                     };
-                    let response = ui.add_enabled(
-                        entry.is_dir || entry.playable(),
-                        egui::Button::new(RichText::new(label).size(12.5)).frame(false),
-                    );
-                    if response.clicked() {
-                        if entry.is_dir {
-                            self.open_webdav_dir(ctx, entry.url.clone());
-                        } else {
-                            self.play_webdav(entry, ctx);
+                    ui.horizontal(|ui| {
+                        let response = ui.add_enabled(
+                            entry.is_dir || entry.playable(),
+                            egui::Button::new(RichText::new(label).size(12.5)).frame(false),
+                        );
+                        if response.clicked() {
+                            if entry.is_dir {
+                                self.open_webdav_dir(ctx, entry.url.clone());
+                            } else {
+                                self.play_webdav(entry, ctx);
+                            }
                         }
-                    }
+                        if entry.playable() && ui.small_button("＋序列").on_hover_text("加入播放序列").clicked() {
+                            if !self.webdav.queue.iter().any(|item| item.url == entry.url) {
+                                self.webdav.queue.push(entry.clone());
+                                self.webdav.note = Some((true, format!("已将「{}」加入播放序列", entry.name)));
+                            }
+                        }
+                    });
                 }
             });
         });
+        if !self.webdav.queue.is_empty() {
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("播放序列").size(12.5).strong());
+                ui.label(RichText::new(format!("{} 首", self.webdav.queue.len())).size(11.0).color(ui.visuals().weak_text_color()));
+                if ui.small_button("播放序列").clicked() {
+                    self.play_webdav_queue(ctx);
+                }
+                if ui.small_button("清空").clicked() {
+                    self.webdav.queue.clear();
+                }
+            });
+            for (index, item) in self.webdav.queue.clone().iter().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("{}. {}", index + 1, item.name)).size(11.5));
+                    if ui.small_button("↑").clicked() && index > 0 { self.webdav.queue.swap(index, index - 1); }
+                    if ui.small_button("↓").clicked() && index + 1 < self.webdav.queue.len() { self.webdav.queue.swap(index, index + 1); }
+                    if ui.small_button("×").clicked() { self.webdav.queue.remove(index); }
+                });
+            }
+        }
     }
+
+    #[cfg(windows)]
+    fn play_webdav_queue(&mut self, ctx: &egui::Context) {
+        let playlist: Vec<crate::webdav_player::Track> = self.webdav.queue.iter()
+            .map(|item| crate::webdav_player::Track { name: item.name.clone(), url: item.url.clone() })
+            .collect();
+        if playlist.is_empty() { return; }
+        if self.webdav.engine.is_none() {
+            let cfg = self.webdav.config();
+            let _ = cfg.save();
+            match crate::webdav_player::Engine::start(ctx.clone(), cfg, self.webdav.password.clone()) {
+                Some(engine) => self.webdav.engine = Some(engine),
+                None => { self.webdav.note = Some((false, "无法启动播放线程".into())); return; }
+            }
+        }
+        if let Some(engine) = &self.webdav.engine { engine.play(playlist, 0); }
+    }
+
+    #[cfg(not(windows))]
+    fn play_webdav_queue(&mut self, _ctx: &egui::Context) {}
 
     #[cfg(windows)]
     fn play_webdav(&mut self, entry: &Entry, ctx: &egui::Context) {

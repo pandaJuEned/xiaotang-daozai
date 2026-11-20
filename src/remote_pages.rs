@@ -12,7 +12,8 @@ use crate::theme::{self, W};
 
 const LEFT: f32 = 42.0;
 const RIGHT: f32 = 376.0;
-const ROW_H: f32 = 66.0;
+const ROW_H: f32 = 82.0;
+const PER_PAGE: usize = 2;
 
 impl App {
     /// 第 11 页：异地——同一台设备的天气、监控、电池与提醒合并显示。
@@ -35,7 +36,7 @@ impl App {
             .iter()
             .filter(|device| device.online && device.id != self.sync_device.id)
             .filter_map(|device| device.presence_data().map(|presence| (device.name.clone(), presence)))
-            .take(3)
+            .take(8)
             .collect();
         if devices.is_empty() {
             c.text(209.5, 88.0, "暂时没有其他在线设备", 13.0, W::Bold, theme::WHITE, H::Center);
@@ -50,8 +51,12 @@ impl App {
             );
             return;
         }
-        let mut y = 38.0;
-        for (index, (name, presence)) in devices.iter().enumerate() {
+        let pages = devices.len().div_ceil(PER_PAGE).max(1);
+        if self.remote_group >= pages { self.remote_group = pages - 1; }
+        let start = self.remote_group * PER_PAGE;
+        let shown: Vec<_> = devices.iter().skip(start).take(PER_PAGE).collect();
+        let mut y = 34.0;
+        for (index, (name, presence)) in shown.iter().enumerate() {
             let height = ROW_H - 6.0;
             c.fill(LEFT, y, RIGHT - LEFT, height, 8.0, theme::CARD);
             let hit = c.hit(LEFT, y, RIGHT - LEFT, height, ("remote-row", index as u32));
@@ -69,7 +74,12 @@ impl App {
                 theme::WHITE,
                 H::Left,
             );
-            let status = if presence.alerts > 0 {
+            let status = if !presence.messages.is_empty() {
+                let text = presence.messages.iter().take(2)
+                    .map(|message| format!("{} {}", message.source, message.count))
+                    .collect::<Vec<_>>().join(" · ");
+                (format!("消息 {text}"), Color32::from_rgb(90, 190, 120), W::Semibold)
+            } else if presence.alerts > 0 {
                 (format!("有 {} 条提醒", presence.alerts), Color32::from_rgb(255, 176, 46), W::Semibold)
             } else if presence.focus.as_ref().is_some_and(|focus| focus.running) {
                 let focus = presence.focus.as_ref().expect("已判断存在");
@@ -144,20 +154,44 @@ impl App {
                 theme::GRAY,
                 H::Left,
             );
+            // 第四行：正在播放的媒体。
+            let music = match presence.music.as_ref() {
+                Some(music) => format!(
+                    "{}播放：{} · {} · {}",
+                    if music.playing { "" } else { "暂停 " },
+                    music.source,
+                    music.title,
+                    music.artist,
+                ),
+                None => String::new(),
+            };
+            if !music.is_empty() {
+                c.text(
+                    LEFT + 12.0,
+                    y + 63.0,
+                    &c.fit(&music, 9.5, W::Regular, 312.0),
+                    9.5,
+                    W::Regular,
+                    theme::CYAN,
+                    H::Left,
+                );
+            }
             if c.live && hit.clicked() {
                 self.remote_monitor_open = true;
             }
             y += ROW_H;
         }
-        c.text(
-            209.5,
-            (y + 10.0).max(216.0),
-            "点卡片打开异地监控窗口；通知只报数量与来源，不显示内容",
-            9.5,
-            W::Regular,
-            theme::DIM,
-            H::Center,
-        );
+        if pages > 1 {
+            let (prev, prev_body) = paint::capsule(c, 150.0, y + 4.0, 44.0, 20.0, "remote-prev", theme::BTN, theme::BTN_HOVER);
+            prev_body.text(172.0, y + 18.0, "◀", 9.5, W::Semibold, theme::WHITE, H::Center);
+            let (next, next_body) = paint::capsule(c, 226.0, y + 4.0, 44.0, 20.0, "remote-next", theme::BTN, theme::BTN_HOVER);
+            next_body.text(248.0, y + 18.0, "▶", 9.5, W::Semibold, theme::WHITE, H::Center);
+            c.text(209.5, y + 18.0, &format!("{}/{}", self.remote_group + 1, pages), 9.5, W::Regular, theme::GRAY, H::Center);
+            if c.live && prev.clicked() && self.remote_group > 0 { self.remote_group -= 1; }
+            if c.live && next.clicked() && self.remote_group + 1 < pages { self.remote_group += 1; }
+        } else {
+            c.text(209.5, y + 18.0, "点卡片打开异地监控窗口；只报来源与数量，不显示内容", 9.0, W::Regular, theme::DIM, H::Center);
+        }
     }
 
     /// 引导卡：说明 + 「去打开」胶囊。

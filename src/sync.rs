@@ -752,6 +752,32 @@ pub struct PresenceOut {
     /// 本机电池：没有电池的台式机为 None 或 percent None。
     #[serde(default)]
     pub battery: Option<PresenceBattery>,
+    /// 未读消息摘要（来源 + 数量，不含内容）；已读后不再上报，其他端自然消失。
+    #[serde(default)]
+    pub messages: Vec<PresenceMessage>,
+    /// 正在播放的媒体来源与曲目，方便其他设备知道谁在用哪台机器听什么。
+    #[serde(default)]
+    pub music: Option<PresenceMusic>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct PresenceMessage {
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub count: u32,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct PresenceMusic {
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub artist: String,
+    #[serde(default)]
+    pub playing: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]

@@ -817,6 +817,8 @@ pub struct App {
     pub(crate) nos_sync_section:u8,
     /// Gitea 访问令牌草稿（检查更新用，正式值在凭据管理器）。
     pub(crate) gitea_token_draft: Option<String>,
+    /// 异地页当前显示第几组设备（每组 2 台）。
+    pub(crate) remote_group: usize,
     pub(crate) settings_category:usize,
     pub messenger_statuses:std::collections::HashMap<Messenger,String>,
     pub(crate) notification_apps:model::NotificationApps,
@@ -997,7 +999,7 @@ impl App {
             media_anchor: (String::new(), 0.0, 0.0, false),
             media: NowPlaying::default(),
             music_artwork: None,
-            forced_open_until:0.0, settings_open:false, settings_window:std::sync::Arc::new(std::sync::Mutex::new(crate::settings_window::State::load())), displays:Vec::new(), browser_at_top:false, browser_minimal_active:false, glass_tint:0.0, fluid:Default::default(), fluid_origin:Pos2::ZERO, fluid_art:None, fluid_title:String::new(), screen:None, settings_focus_requested:false, settings_tab:0, nos_sync_section:0, gitea_token_draft: None, settings_category:0, messenger_statuses:Default::default(), notification_apps:model::NotificationApps::load(), subpage:None, task_dialog:None, todo_reminder:None,
+            forced_open_until:0.0, settings_open:false, settings_window:std::sync::Arc::new(std::sync::Mutex::new(crate::settings_window::State::load())), displays:Vec::new(), browser_at_top:false, browser_minimal_active:false, glass_tint:0.0, fluid:Default::default(), fluid_origin:Pos2::ZERO, fluid_art:None, fluid_title:String::new(), screen:None, settings_focus_requested:false, settings_tab:0, nos_sync_section:0, gitea_token_draft: None, remote_group: 0, settings_category:0, messenger_statuses:Default::default(), notification_apps:model::NotificationApps::load(), subpage:None, task_dialog:None, todo_reminder:None,
             monitor_cfg: crate::monitor::MonitorConfig::load(), monitor_open: false, remote_monitor_open: false,
             monitor_interfaces: Vec::new(), monitor_history: None,
             monitor_trend: Default::default(), monitor_last: None,
@@ -1340,6 +1342,25 @@ impl App {
                 }
             }),
             battery,
+            messages: {
+                let mut counts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+                for unread in &self.pending_messengers {
+                    *counts.entry(unread.source.name().to_string()).or_default() += 1;
+                }
+                let mut items: Vec<crate::sync::PresenceMessage> = counts
+                    .into_iter()
+                    .map(|(source, count)| crate::sync::PresenceMessage { source, count })
+                    .collect();
+                items.sort_by(|a, b| b.count.cmp(&a.count));
+                items.truncate(5);
+                items
+            },
+            music: (!self.media.title.trim().is_empty()).then(|| crate::sync::PresenceMusic {
+                source: self.media.source.clone(),
+                title: self.media.title.clone(),
+                artist: self.media.artist.clone(),
+                playing: self.media.playing,
+            }),
         }
     }
 
