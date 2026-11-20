@@ -38,6 +38,7 @@ mod task_picker;
 pub mod model;
 pub mod monitor;
 pub mod webdav;
+pub mod webdav_nos;
 #[cfg(windows)]
 pub mod webdav_player;
 pub mod webdav_ui;

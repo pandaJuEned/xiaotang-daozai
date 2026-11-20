@@ -627,6 +627,9 @@ impl eframe::App for Shell {
             // 课表：消费后台拉取结果。成功时更新快照；失败时保留上一次成功的课表，
             // 只把错误记下来供设置页显示（离线也能看到今天的课）。
             if let Some(service)=&self.nos {
+                if service.take_webdav_signal() {
+                    self.app.reload_webdav_config();
+                }
                 if let Some(result)=service.try_recv() {
                     match result {
                         Ok(agenda)=>{self.app.set_nos_agenda(agenda);self.app.nos_error=None;}

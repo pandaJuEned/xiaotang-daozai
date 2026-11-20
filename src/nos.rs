@@ -510,20 +510,28 @@ impl Config {
 /// 后台拉取服务。丢弃即停线程。
 pub struct Service {
     rx: Receiver<Result<Agenda, String>>,
+    /// WebDAV 连接配置随课表一起拉，界面收到后刷新设置页字段。
+    webdav_rx: Receiver<()>,
     stop: Arc<AtomicBool>,
 }
 
 impl Service {
     pub fn start(ctx: egui::Context, cfg: Config) -> Self {
         let (tx, rx) = mpsc::sync_channel(1);
+        let (wtx, wrx) = mpsc::sync_channel(1);
         let stop = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&stop);
-        let _ = crate::resources::NOS.spawn(move || run(ctx, cfg, tx, flag));
-        Self { rx, stop }
+        let _ = crate::resources::NOS.spawn(move || run(ctx, cfg, tx, wtx, flag));
+        Self { rx, webdav_rx: wrx, stop }
     }
 
     pub fn try_recv(&self) -> Option<Result<Agenda, String>> {
         self.rx.try_recv().ok()
+    }
+
+    /// 有一份新的 WebDAV 配置已落盘（只发信号，界面自己去读文件）。
+    pub fn take_webdav_signal(&self) -> bool {
+        self.webdav_rx.try_recv().is_ok()
     }
 }
 
@@ -537,7 +545,13 @@ impl Drop for Service {
 ///
 /// 配置变更由外壳重启本服务实现（`Cmd::NosReconfigure`），与系统监控同一策略，
 /// 因此线程内不再处理配置切换。
-fn run(ctx: egui::Context, cfg: Config, tx: SyncSender<Result<Agenda, String>>, stop: Arc<AtomicBool>) {
+fn run(
+    ctx: egui::Context,
+    cfg: Config,
+    tx: SyncSender<Result<Agenda, String>>,
+    webdav_tx: SyncSender<()>,
+    stop: Arc<AtomicBool>,
+) {
     let agent = http_agent();
     let mut clock = PollClock::default();
     let mut failures: u32 = 0;
@@ -570,6 +584,13 @@ fn run(ctx: egui::Context, cfg: Config, tx: SyncSender<Result<Agenda, String>>, 
                     &crate::model::config_dir().join("nos-agenda.json"),
                     &serde_json::to_vec(agenda).unwrap_or_default(),
                 );
+                // WebDAV 连接配置随课表一并自动获取：各端不再各自填写。
+                // 成功落盘才发信号，拉取失败静默（配置留在 NOS，下轮再取）。
+                if let Ok(remote) = crate::webdav_nos::fetch(&agent, &cfg.base_url, &cfg.token) {
+                    if crate::webdav_nos::apply(&remote).unwrap_or(false) {
+                        let _ = webdav_tx.try_send(());
+                    }
+                }
             }
             Err(_) => {
                 failures = failures.saturating_add(1);

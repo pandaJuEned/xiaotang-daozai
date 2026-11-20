@@ -7,7 +7,7 @@ use std::sync::mpsc;
 
 use eframe::egui::{self, Color32, RichText};
 
-use crate::app::App;
+use crate::app::{App, Cmd};
 use crate::extras::{settings_card, settings_control_row, settings_hint, settings_label};
 use crate::settings_theme::color as settings_color;
 use crate::webdav::{self, Entry};
@@ -15,12 +15,17 @@ use crate::webdav::{self, Entry};
 enum Msg {
     Listed(Result<(String, Vec<Entry>), String>),
     Tested(Result<usize, String>),
+    /// 从 NOS 拉取连接配置的结果（提示文案）。
+    Pulled(Result<String, String>),
 }
 
 pub struct Ui {
     pub url: String,
     pub user: String,
     pub password: String,
+    /// 连接配置由 NOS 集中下发：三项只读，改到 NOS Web「我的」页。
+    pub from_nos: bool,
+    pub from_nos_at: String,
     /// 是否已经从凭据管理器读过密码（打开设置时才读）。
     pub password_loaded: bool,
     pub show_password: bool,
@@ -53,6 +58,8 @@ impl Default for Ui {
             url: cfg.url,
             user: cfg.user,
             password: String::new(),
+            from_nos: cfg.from_nos,
+            from_nos_at: cfg.from_nos_at,
             password_loaded: false,
             show_password: false,
             note: None,
@@ -79,6 +86,8 @@ impl Ui {
             url: self.url.trim().to_string(),
             user: self.user.trim().to_string(),
             dir: self.collection.clone(),
+            from_nos: self.from_nos,
+            from_nos_at: self.from_nos_at.clone(),
         }
     }
 
@@ -122,6 +131,27 @@ impl Ui {
                         Err(error) => self.note = Some((false, error)),
                     }
                 }
+                Msg::Pulled(result) => {
+                    self.busy = false;
+                    match result {
+                        Ok(message) => {
+                            // 配置可能已变：重新读入界面字段与凭据，避免显示旧的。
+                            let cfg = webdav::Config::load();
+                            self.url = cfg.url.clone();
+                            self.user = cfg.user.clone();
+                            self.from_nos = cfg.from_nos;
+                            self.from_nos_at = cfg.from_nos_at.clone();
+                            self.password = webdav::load_password(&cfg).unwrap_or_default();
+                            self.password_loaded = true;
+                            // 同源目录保留，换服务器则由 apply 清空：直接读回磁盘值。
+                            self.collection = cfg.dir.clone();
+                            self.entries.clear();
+                            self.loaded = false;
+                            self.note = Some((true, message));
+                        }
+                        Err(error) => self.note = Some((false, error)),
+                    }
+                }
             }
         }
     }
@@ -156,43 +186,66 @@ impl App {
         }
         let ctx = ui.ctx().clone();
 
+        let managed = self.webdav.from_nos;
         settings_label(ui, "WebDAV 音乐");
         settings_card(ui, |ui| {
-            settings_control_row(ui, "服务器", 56.0, |ui| {
-                ui.add_sized(
-                    [ui.available_width(), 30.0],
-                    egui::TextEdit::singleline(&mut self.webdav.url)
-                        .vertical_align(egui::Align::Center)
-                        .hint_text("https://nas.example.com/music"),
-                )
-            });
-            settings_control_row(ui, "用户名", 56.0, |ui| {
-                ui.add_sized(
-                    [ui.available_width(), 30.0],
-                    egui::TextEdit::singleline(&mut self.webdav.user)
-                        .vertical_align(egui::Align::Center)
-                        .hint_text("WebDAV 账号"),
-                )
-            });
-            settings_control_row(ui, "密码", 56.0, |ui| {
-                let field = ui.add_sized(
-                    [(ui.available_width() - 48.0).max(80.0), 30.0],
-                    egui::TextEdit::singleline(&mut self.webdav.password)
-                        .vertical_align(egui::Align::Center)
-                        .password(!self.webdav.show_password)
-                        .hint_text("留空表示匿名只读"),
-                );
-                if ui
-                    .add_sized([48.0, 30.0], egui::Button::new(if self.webdav.show_password { "隐藏" } else { "显示" }))
-                    .clicked()
-                {
-                    self.webdav.show_password = !self.webdav.show_password;
-                }
-                field
-            });
+            if managed {
+                // 连接配置由 NOS 集中下发：只读展示，避免各端各填一份后互相漂移。
+                settings_hint(ui, "连接配置由「不止课表」统一管理：请到 NOS Web「我的」页填写地址、账号与密码，各端连接后自动获取。");
+                ui.add_space(3.0);
+                settings_control_row(ui, "服务器", 56.0, |ui| {
+                    ui.add_sized(
+                        [ui.available_width(), 30.0],
+                        egui::TextEdit::singleline(&mut self.webdav.url)
+                            .vertical_align(egui::Align::Center)
+                            .interactive(false),
+                    )
+                });
+                settings_control_row(ui, "用户名", 56.0, |ui| {
+                    ui.add_sized(
+                        [ui.available_width(), 30.0],
+                        egui::TextEdit::singleline(&mut self.webdav.user)
+                            .vertical_align(egui::Align::Center)
+                            .interactive(false),
+                    )
+                });
+            } else {
+                settings_control_row(ui, "服务器", 56.0, |ui| {
+                    ui.add_sized(
+                        [ui.available_width(), 30.0],
+                        egui::TextEdit::singleline(&mut self.webdav.url)
+                            .vertical_align(egui::Align::Center)
+                            .hint_text("https://nas.example.com/music"),
+                    )
+                });
+                settings_control_row(ui, "用户名", 56.0, |ui| {
+                    ui.add_sized(
+                        [ui.available_width(), 30.0],
+                        egui::TextEdit::singleline(&mut self.webdav.user)
+                            .vertical_align(egui::Align::Center)
+                            .hint_text("WebDAV 账号"),
+                    )
+                });
+                settings_control_row(ui, "密码", 56.0, |ui| {
+                    let field = ui.add_sized(
+                        [(ui.available_width() - 48.0).max(80.0), 30.0],
+                        egui::TextEdit::singleline(&mut self.webdav.password)
+                            .vertical_align(egui::Align::Center)
+                            .password(!self.webdav.show_password)
+                            .hint_text("留空表示匿名只读"),
+                    );
+                    if ui
+                        .add_sized([48.0, 30.0], egui::Button::new(if self.webdav.show_password { "隐藏" } else { "显示" }))
+                        .clicked()
+                    {
+                        self.webdav.show_password = !self.webdav.show_password;
+                    }
+                    field
+                });
+            }
             ui.horizontal(|ui| {
                 let idle = !self.webdav.busy;
-                if ui
+                if !managed && ui
                     .add_enabled(idle, egui::Button::new(if self.webdav.busy { "连接中…" } else { "测试连接" }))
                     .clicked()
                 {
@@ -202,6 +255,10 @@ impl App {
                     let target = self.webdav.collection.clone();
                     self.open_webdav_dir(&ctx, target);
                 }
+                // 未托管时提供「从 NOS 获取」；已托管时提供「重新获取」。
+                if self.nos_config().ready() && ui.button(if managed { "从 NOS 重新获取" } else { "从 NOS 获取配置" }).clicked() {
+                    self.pull_webdav_from_nos(&ctx);
+                }
             });
             if let Some((ok, text)) = &self.webdav.note {
                 ui.add_space(3.0);
@@ -210,7 +267,11 @@ impl App {
             }
             settings_hint(
                 ui,
-                "密码保存在 Windows 凭据管理器，配置文件只记地址、账号与当前目录。只支持 https，本机回环可用 http。",
+                if managed {
+                    "密码由 NOS 下发后存进本机凭据管理器。改连接请到 NOS Web「我的」页，改完点「从 NOS 重新获取」。"
+                } else {
+                    "密码保存在 Windows 凭据管理器，配置文件只记地址、账号与当前目录。只支持 https，本机回环可用 http。"
+                },
             );
         });
 
@@ -222,6 +283,42 @@ impl App {
         if cfg != self.webdav_saved && cfg.save().is_ok() {
             self.webdav_saved = cfg;
         }
+    }
+
+    /// 后台自动拉取成功后的刷新：只读入新配置到界面，不打断正在进行的浏览。
+    pub fn reload_webdav_config(&mut self) {
+        let cfg = webdav::Config::load();
+        self.webdav.url = cfg.url.clone();
+        self.webdav.user = cfg.user.clone();
+        self.webdav.from_nos = cfg.from_nos;
+        self.webdav.from_nos_at = cfg.from_nos_at.clone();
+        // 同源目录保留，换服务器则由 apply 清空：直接读回磁盘值。
+        self.webdav.collection = cfg.dir.clone();
+        self.webdav.entries.clear();
+        self.webdav.loaded = false;
+        self.webdav.password = webdav::load_password(&cfg).unwrap_or_default();
+        self.webdav.password_loaded = true;
+        self.webdav_saved = cfg;
+        self.webdav.note = Some((true, "已从 NOS 更新 WebDAV 连接配置".into()));
+    }
+
+    /// 从 NOS 拉取 WebDAV 连接配置。地址与令牌取自课表共用的一份连接，
+    /// 不另存配置；网络与凭据写入都在后台线程，界面只读结果。
+    fn pull_webdav_from_nos(&mut self, ctx: &egui::Context) {
+        let cfg = self.nos_config();
+        if !cfg.ready() {
+            self.webdav.note = Some((false, "请先在「课表与多端」里连接 NOS".into()));
+            return;
+        }
+        self.webdav.busy = true;
+        self.webdav.note = None;
+        let paint = ctx.clone();
+        self.webdav.spawn(move |tx| {
+            let agent = crate::nos::http_agent();
+            let result = crate::webdav_nos::pull(&agent, &cfg.base_url, &cfg.token);
+            let _ = tx.send(Msg::Pulled(result));
+            paint.request_repaint();
+        });
     }
 
     fn start_webdav_test(&mut self, ctx: &egui::Context) {

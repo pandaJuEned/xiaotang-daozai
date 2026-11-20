@@ -26,6 +26,12 @@ pub struct Config {
     pub user: String,
     /// 上次浏览到的集合地址（绝对 URL）；空表示从 `url` 开始。
     pub dir: String,
+    /// 连接配置由 NOS 集中下发（设置页只读，改到 NOS Web「我的」页改）。
+    #[serde(default)]
+    pub from_nos: bool,
+    /// 服务端配置的更新时间，用来跳过重复落盘。
+    #[serde(default)]
+    pub from_nos_at: String,
 }
 
 impl Config {
@@ -491,6 +497,15 @@ pub fn download(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn old_config_without_nos_fields_still_loads() {
+        let raw = r#"{"url":"https://nas.local/music/","user":"u","dir":""}"#;
+        let cfg: Config = serde_json::from_str(raw).unwrap();
+        assert!(!cfg.from_nos);
+        assert!(cfg.from_nos_at.is_empty());
+        assert!(cfg.ready());
+    }
 
     #[test]
     fn base_url_is_normalized_and_credentials_are_rejected() {
