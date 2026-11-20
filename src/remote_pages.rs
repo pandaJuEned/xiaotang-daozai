@@ -93,7 +93,7 @@ impl App {
                     W::Semibold,
                 )
             } else {
-                ("在线".into(), theme::DIM, W::Regular)
+                ("在线 · 无未读".into(), theme::DIM, W::Regular)
             };
             c.text(RIGHT - 12.0, y + 15.0, &status.0, 10.5, status.2, status.1, H::Right);
             // 第二行：天气。
@@ -105,7 +105,7 @@ impl App {
                     weather.city,
                     (chrono::Local::now().timestamp() - weather.at).max(0) / 60
                 ),
-                None => "天气未获取".into(),
+                None => "天气：对方未上报".into(),
             };
             c.text(
                 LEFT + 12.0,
@@ -133,7 +133,7 @@ impl App {
                         value(monitor.gpu, "%"),
                     )
                 }
-                None => "监控未上报".into(),
+                None => "监控：对方未上报".into(),
             };
             let battery = match presence.battery.as_ref() {
                 Some(battery) => match battery.percent {
@@ -163,19 +163,17 @@ impl App {
                     music.title,
                     music.artist,
                 ),
-                None => String::new(),
+                None => "音乐：未播放".into(),
             };
-            if !music.is_empty() {
-                c.text(
-                    LEFT + 12.0,
-                    y + 63.0,
-                    &c.fit(&music, 9.5, W::Regular, 312.0),
-                    9.5,
-                    W::Regular,
-                    theme::CYAN,
-                    H::Left,
-                );
-            }
+            c.text(
+                LEFT + 12.0,
+                y + 63.0,
+                &c.fit(&music, 9.5, W::Regular, 312.0),
+                9.5,
+                W::Regular,
+                if presence.music.is_some() { theme::CYAN } else { theme::DIM },
+                H::Left,
+            );
             if c.live && hit.clicked() {
                 self.remote_monitor_open = true;
             }

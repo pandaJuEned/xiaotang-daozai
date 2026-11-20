@@ -1320,6 +1320,9 @@ impl App {
         });
         let battery = self.monitor_last.as_ref().and_then(|snapshot| {
             let power = &snapshot.power;
+            if power.battery_percent.is_none() && power.charging.is_none() && power.ac_online.is_none() {
+                return None;
+            }
             Some(crate::sync::PresenceBattery {
                 percent: power.battery_percent.map(|percent| percent.round().clamp(0.0, 100.0) as u8),
                 charging: power.charging == Some(true),
@@ -1949,7 +1952,7 @@ impl App {
     }
 
     pub(crate) fn expanded_height(&self)->f32 {
-        if self.page==CALENDAR_PAGE {CALENDAR_H}else if self.page==WEATHER_PAGE {WEATHER_H}else if self.page==MONITOR_PAGE {MONITOR_H}else if self.page==6{176.0}else if self.page==5&&self.mail.open_uid.is_some(){236.0}else{PH}
+        if self.page==CALENDAR_PAGE {CALENDAR_H}else if self.page==WEATHER_PAGE {WEATHER_H}else if self.page==MONITOR_PAGE||self.page==REMOTE_PAGE {MONITOR_H}else if self.page==6{176.0}else if self.page==5&&self.mail.open_uid.is_some(){236.0}else{PH}
     }
 
     // ---------------------------------------------------------------

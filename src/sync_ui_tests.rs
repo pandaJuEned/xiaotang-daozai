@@ -410,3 +410,34 @@ fn remote_monitor_is_machine_level_and_opt_in() {
     assert!(crate::model::Settings::load().show_remote_monitor);
     assert!(!crate::sync_settings::KEYS.contains(&"show_remote_monitor"));
 }
+
+#[test]
+fn presence_out_reports_messages_music_and_battery() {
+    use super::{ENV_LOCK, H};
+    let _g = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let mut h = H::new();
+    h.app.pending_messengers = vec![crate::messenger::Unread::of(crate::messenger::Messenger::Wechat)];
+    h.app.monitor_last = Some(crate::monitor::MonitorSnapshot {
+        power: crate::monitor::PowerSnapshot {
+            ac_online: Some(true),
+            battery_percent: Some(100.0),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    h.app.media = crate::smtc::NowPlaying {
+        title: "晴天".into(),
+        artist: "周杰伦".into(),
+        source: "cloudmusic.exe".into(),
+        playing: true,
+        ..Default::default()
+    };
+    let presence = h.app.presence_out();
+    assert_eq!(presence.messages.len(), 1);
+    assert_eq!(presence.messages[0].count, 1);
+    let music = presence.music.expect("正在播放时应上报");
+    assert_eq!(music.title, "晴天");
+    assert_eq!(music.artist, "周杰伦");
+    assert!(music.playing);
+    assert!(presence.battery.is_some());
+}
