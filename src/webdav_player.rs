@@ -29,6 +29,43 @@ pub enum Status {
     Error(String),
 }
 
+/// 播放顺序。顺序 / 乱序由岛仔音乐页切换，状态随播放快照一起给界面。
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum Order {
+    #[default]
+    Sequential,
+    Shuffle,
+}
+
+impl Order {
+    pub fn label(self) -> &'static str {
+        match self {
+            Order::Sequential => "顺序",
+            Order::Shuffle => "乱序",
+        }
+    }
+}
+
+/// 给定曲目数、当前下标与随机种子，算出「下一首」的下标。
+/// 乱序时保证不等于当前（只有一首时只能播它自己），纯函数便于单测。
+pub fn next_index(order: Order, len: usize, current: usize, seed: u64) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let current = current % len;
+    match order {
+        Order::Sequential => (current + 1) % len,
+        Order::Shuffle if len == 1 => 0,
+        Order::Shuffle => {
+            let mut next = (seed % (len as u64 - 1)) as usize;
+            if next >= current {
+                next += 1;
+            }
+            next
+        }
+    }
+}
+
 impl Default for Status {
     fn default() -> Self {
         Status::Idle
@@ -48,6 +85,8 @@ pub struct State {
     pub volume: u8,
     /// 音量条上的静音开关：静音时音量值保留，恢复后回到原音量。
     pub muted: bool,
+    /// 播放顺序（顺序 / 乱序）。
+    pub order: Order,
     /// `position` 的采样时刻：两次回写之间按它外推，进度条才不会一跳一跳。
     pub sampled_at: Option<Instant>,
 }
@@ -81,6 +120,8 @@ enum Cmd {
     Seek(f64),
     Volume(u8),
     Mute(bool),
+    /// 切换顺序 / 乱序。
+    Order(Order),
     Stop,
 }
 
@@ -150,6 +191,10 @@ impl Engine {
 
     pub fn mute(&self, muted: bool) {
         let _ = self.tx.send(Cmd::Mute(muted));
+    }
+
+    pub fn set_order(&self, order: Order) {
+        let _ = self.tx.send(Cmd::Order(order));
     }
 }
 
@@ -281,7 +326,12 @@ fn handle(
         Cmd::Next => {
             if !session.playlist.is_empty() {
                 let current = state.lock().map(|state| state.index).unwrap_or(0);
-                let next = (current + 1) % session.playlist.len();
+                let order = state.lock().map(|state| state.order).unwrap_or_default();
+                let seed = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0);
+                let next = next_index(order, session.playlist.len(), current, seed);
                 move_to(player, state, ctx, cfg, password, session, next);
             }
         }
@@ -319,6 +369,11 @@ fn handle(
                 current.muted = muted;
             }
             apply_volume(player, state);
+        }
+        Cmd::Order(order) => {
+            if let Ok(mut current) = state.lock() {
+                current.order = order;
+            }
         }
     }
     true
@@ -396,4 +451,40 @@ fn move_to(
     player.play();
     session.loaded = Some(Instant::now());
     set_status(state, Status::Playing, ctx);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sequential_wraps_after_the_last_track() {
+        assert_eq!(next_index(Order::Sequential, 3, 0, 0), 1);
+        assert_eq!(next_index(Order::Sequential, 3, 2, 0), 0);
+    }
+
+    #[test]
+    fn shuffle_never_repeats_the_current_track() {
+        for seed in 0..64 {
+            let next = next_index(Order::Shuffle, 5, 2, seed);
+            assert_ne!(next, 2, "seed={seed}");
+            assert!(next < 5);
+        }
+        assert_eq!(next_index(Order::Shuffle, 1, 0, 99), 0);
+    }
+
+    #[test]
+    fn shuffle_visits_every_other_track() {
+        let mut seen = std::collections::BTreeSet::new();
+        for seed in 0..16 {
+            seen.insert(next_index(Order::Shuffle, 4, 0, seed));
+        }
+        assert_eq!(seen.len(), 3, "乱序应能落到除当前外的每一首");
+    }
+
+    #[test]
+    fn order_label_matches_the_island_toggle() {
+        assert_eq!(Order::Sequential.label(), "顺序");
+        assert_eq!(Order::Shuffle.label(), "乱序");
+    }
 }

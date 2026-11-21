@@ -8577,3 +8577,109 @@ fn resident_bar_shows_the_refill_time_only_when_quota_is_low(){
     assert!(shows_clock(&h),"快用完且 12 小时内回血时应在岛上显示时刻");
     assert!(h.app.current_width()>roomy+10.0,"时刻要给额度槽多申请一点宽度");
 }
+
+#[test]
+fn webdav_queue_persists_across_app_restarts() {
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+    std::fs::create_dir_all(crate::model::config_dir()).unwrap();
+    let entry=crate::webdav::Entry{name:"歌手 - 歌.mp3".into(),url:"https://nas.local/a.mp3".into(),is_dir:false,bytes:1024};
+    {
+        let mut h=H::new();
+        std::fs::create_dir_all(crate::model::config_dir()).unwrap();
+        h.app.webdav.queue.push(entry.clone());
+        h.app.webdav.shuffle=true;
+        h.app.webdav.persist_queue();
+    }
+    // H::new 会换一个临时目录，直接读回同一路径下的文件验证格式。
+    let loaded=crate::webdav::QueueFile::load();
+    assert!(loaded.shuffle,"乱序标记要持久化");
+    assert_eq!(loaded.tracks.len(),1);
+    assert_eq!(loaded.tracks[0].url,"https://nas.local/a.mp3");
+}
+
+#[test]
+fn webdav_toggle_shuffle_updates_state_and_persists() {
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+    let mut h=H::new();
+    std::fs::create_dir_all(crate::model::config_dir()).unwrap();
+    assert_eq!(h.app.webdav_order(),crate::webdav_player::Order::Sequential);
+    h.app.webdav_toggle_shuffle();
+    assert_eq!(h.app.webdav_order(),crate::webdav_player::Order::Shuffle);
+    assert!(crate::webdav::QueueFile::load().shuffle);
+    h.app.webdav_toggle_shuffle();
+    assert_eq!(h.app.webdav_order(),crate::webdav_player::Order::Sequential);
+}
+
+#[test]
+fn music_page_shows_webdav_status_without_system_media() {
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+    let mut h=H::new();
+    std::fs::create_dir_all(crate::model::config_dir()).unwrap();
+    h.hover(Pos2::new(WIN_W/2.0,12.0),1.0);
+    h.frame(vec![]);
+    fn shows(h:&H,text:&str)->bool{h.shapes.iter().any(|s|matches!(&s.shape,egui::Shape::Text(t)if t.galley.text().contains(text)))};
+    assert!(shows(&h,"暂无音乐"));
+    // 写入配置后重新构造 App，音乐页应显示 WebDAV 状态而不是「暂无音乐」。
+    crate::webdav::Config{url:"https://webmusic.redbrick.asia/music/".into(),user:"webmusic".into(),dir:String::new(),from_nos:true,from_nos_at:"x".into()}.save().unwrap();
+    h.app=App::new(&h.ctx,Options{fetch_lyrics:false,pet_idle:1e9});
+    for _ in 0..20 { h.frame(vec![]); }
+    assert!(shows(&h,"WebDAV 音乐"));
+    assert!(!shows(&h,"暂无音乐"));
+    assert!(shows(&h,"webmusic.redbrick.asia"));
+}
+
+#[test]
+fn music_page_webdav_list_opens_and_toggle_shuffle_emits_command() {
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+    let mut h=H::new();
+    std::fs::create_dir_all(crate::model::config_dir()).unwrap();
+    h.app.webdav.queue.push(crate::webdav::Entry{name:"A.mp3".into(),url:"https://nas.local/a.mp3".into(),is_dir:false,bytes:1});
+    h.app.webdav.persist_queue();
+    crate::webdav::Config{url:"https://nas.local/music/".into(),user:"u".into(),dir:String::new(),from_nos:false,from_nos_at:String::new()}.save().unwrap();
+    h.app=App::new(&h.ctx,Options{fetch_lyrics:false,pet_idle:1e9});
+    h.hover(Pos2::new(WIN_W/2.0,12.0),1.0);
+    h.frame(vec![]);
+    h.click(H::local(361.0,58.0));
+    for _ in 0..20 { h.frame(vec![]); }
+    assert!(h.app.webdav_list_open,"点曲库胶囊要打开列表面板");
+    fn shows(h:&H,text:&str)->bool{h.shapes.iter().any(|s|matches!(&s.shape,egui::Shape::Text(t)if t.galley.text().contains(text)))};
+    assert!(shows(&h,"WebDAV 音乐"));
+    assert!(shows(&h,"A.mp3"));
+    // 面板里的顺序按钮发出切换命令。
+    h.cmds.clear();
+    h.click(H::local(83.0,74.0));
+    assert!(h.cmds.contains(&crate::app::Cmd::WebdavToggleShuffle));
+}
+
+#[test]
+#[ignore="按需导出音乐页 WebDAV 面板实际画面：DAOZAI_WEBDAV_PREVIEW=目录"]
+fn webdav_panel_preview(){
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+    let dest=std::path::PathBuf::from(std::env::var_os("DAOZAI_WEBDAV_PREVIEW").expect("需指定预览目录"));
+    std::fs::create_dir_all(&dest).unwrap();
+    let mut h=H::new();
+    h.ctx.set_pixels_per_point(2.0);
+    h.app.settings.pet=false;
+    std::fs::create_dir_all(crate::model::config_dir()).unwrap();
+    crate::webdav::Config{url:"https://webmusic.redbrick.asia/music/".into(),user:"webmusic".into(),dir:String::new(),from_nos:true,from_nos_at:String::new()}.save().unwrap();
+    crate::webdav::DirCache{collection:"https://webmusic.redbrick.asia/music/".into(),entries:vec![
+        crate::webdav::Entry{name:"陈奕迅-十年 (电影《摆渡人》插曲).mp3".into(),url:"https://webmusic.redbrick.asia/music/1.mp3".into(),is_dir:false,bytes:3},
+        crate::webdav::Entry{name:"陈一发儿-童话镇.flac".into(),url:"https://webmusic.redbrick.asia/music/2.flac".into(),is_dir:false,bytes:4},
+        crate::webdav::Entry{name:"迟跑计划-夜空中最亮的星.mp3".into(),url:"https://webmusic.redbrick.asia/music/3.mp3".into(),is_dir:false,bytes:5},
+        crate::webdav::Entry{name:"雅まさ-僕が死のうと思ったのは.flac".into(),url:"https://webmusic.redbrick.asia/music/4.flac".into(),is_dir:false,bytes:6},
+        crate::webdav::Entry{name:"封面.jpg".into(),url:"https://webmusic.redbrick.asia/music/c.jpg".into(),is_dir:false,bytes:7},
+    ]}.save();
+    h.app=crate::app::App::new(&h.ctx,Options{fetch_lyrics:false,pet_idle:1e9});
+    h.app.webdav.loaded=true;
+    h.hover(Pos2::new(WIN_W/2.0,12.0),1.0);
+    h.click(H::local(361.0,58.0));
+    for _ in 0..30 { h.frame(vec![]); }
+    let ppp=h.ctx.pixels_per_point();
+    let mut raster=crate::preview_raster::Raster::new((crate::app::CANVAS_W*ppp) as usize,(WIN_H*ppp) as usize);
+    raster.update_textures(&egui::TexturesDelta{set:vec![(egui::TextureId::default(),egui::epaint::ImageDelta::full(h.ctx.fonts(|f|f.image()),egui::TextureOptions::LINEAR))],..Default::default()});
+    raster.buf.fill([0.10,0.12,0.16,1.0]);
+    raster.draw(&h.ctx.tessellate(h.shapes.clone(),ppp),ppp);
+    let mut rgba=Vec::new();raster.to_rgba8(&mut rgba);
+    let image=image::RgbaImage::from_raw(raster.w as u32,raster.h as u32,rgba).unwrap();
+    image::imageops::crop_imm(&image,((WIN_W-crate::app::PW)/2.0*ppp-12.0) as u32,0,((crate::app::PW+12.0)*ppp+12.0) as u32,((crate::app::PH+12.0)*ppp) as u32).to_image().save(dest.join("webdav-panel.png")).unwrap();
+}

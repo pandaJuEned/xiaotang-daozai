@@ -191,6 +191,12 @@ pub enum Cmd {
     MailSync,
     /// 测试某个邮箱的连接（授权码只在内存里传给工作线程）。
     MailTest(mail::Account, String),
+    /// 岛仔音乐页：从已保存的 WebDAV 播放列表起播。
+    WebdavPlay,
+    /// 岛仔音乐页：从播放列表的指定下标起播。
+    WebdavPlayIndex(usize),
+    /// 岛仔音乐页：切换顺序 / 乱序播放。
+    WebdavToggleShuffle,
     MailManage(crate::mail_manage::Request),
     /// v0.5.6：用临时密码试连日历，成功后才允许落盘。
     CalendarTest(calendar::Config, String),
@@ -866,6 +872,8 @@ pub struct App {
     pub(crate) music_volume_ui: Option<(u32,bool)>,
     pub(crate) music_volume_quiet_until: f64,
     pub(crate) music_volume_open: bool,
+    /// WebDAV 曲库列表面板是否展开（岛仔音乐页）。
+    pub(crate) webdav_list_open: bool,
     /// 上一次看到的蓝牙设备，用来只在连接/断开时提示一次。
     pub(crate) bt_shown: Vec<crate::bt::Device>,
     bt_initialized: bool,
@@ -1025,6 +1033,7 @@ impl App {
             music_volume_ui: None,
             music_volume_quiet_until: 0.0,
             music_volume_open: false,
+            webdav_list_open: false,
             bt_shown: Vec::new(),
             bt_initialized: false,
             mail: MailState { accounts: mail::load_accounts(), ..Default::default() },
@@ -2078,6 +2087,9 @@ impl App {
         if self.music_volume_open && ctx.input_mut(|i|i.consume_key(egui::Modifiers::NONE,egui::Key::Escape)) {
             self.music_volume_open=false;
         }
+        if self.webdav_list_open && ctx.input_mut(|i|i.consume_key(egui::Modifiers::NONE,egui::Key::Escape)) {
+            self.webdav_list_open=false;
+        }
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) && self.is_editing() {
             self.cancel_edit();
         }
@@ -2132,7 +2144,8 @@ impl App {
             }
         } else {self.wheel_delta=0.0;}
         let volume_dragging=self.music_volume_open && ctx.is_being_dragged(egui::Id::new(("card-drag",true,"m-volume-track")));
-        let want = (inside && !self.hover_lock && (self.compact_notices()||self.notice.is_none()||self.open)) || self.open && on_notice || (self.open && self.t<self.forced_open_until) || self.drag_hot || volume_dragging || (self.is_editing() && self.open);
+        let list_open=self.webdav_list_open && self.page==0;
+        let want = (inside && !self.hover_lock && (self.compact_notices()||self.notice.is_none()||self.open)) || self.open && on_notice || (self.open && self.t<self.forced_open_until) || self.drag_hot || volume_dragging || list_open || (self.is_editing() && self.open);
         self.morph(want, inside, env.t, dt);
         self.update_pet(env, cx);
 
@@ -3084,7 +3097,7 @@ impl App {
             self.render_page(self.page, c, env, cmds);
         }
         self.nav(c);
-        if self.page==0 && c.live {self.draw_music_volume(c,cmds);}
+        if self.page==0 && c.live {self.draw_music_volume(c,cmds);self.draw_webdav_list(c,cmds);}
     }
 
     fn page_title(&self, page: usize, c: &Card) {

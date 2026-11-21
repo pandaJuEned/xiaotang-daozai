@@ -36,10 +36,14 @@ pub struct Ui {
     pub entries: Vec<Entry>,
     /// 播放序列：按加入顺序播放，不与目录里的其它曲目混在一起。
     pub queue: Vec<Entry>,
+    /// 乱序播放：切歌时随机选一首，播完自动续播也遵循。
+    pub shuffle: bool,
     pub loading: bool,
     pub error: Option<String>,
     /// 当前目录是否已经取过一次：用来区分「还没读」和「读到了空目录」。
     pub loaded: bool,
+    /// 岛上自动拉过一次目录，失败后不再每帧重试。
+    pub auto_tried: bool,
     /// 拖动进度条期间的临时值；松手才真正跳转。
     pub draft: Option<f64>,
     /// 拖动音量条期间的临时值；松手后回到播放器的实际音量。
@@ -53,6 +57,10 @@ pub struct Ui {
 impl Default for Ui {
     fn default() -> Self {
         let cfg = webdav::Config::load();
+        // 播放序列与顺序跨重启保留：音乐页不依赖设置页先打开过。
+        let saved_queue = webdav::QueueFile::load();
+        // 上一份目录也缓存下来：重启后岛上立刻能显示歌单，联网成功再覆盖。
+        let cached_dir = webdav::DirCache::load();
         // 密码不在这里读：App::new 会被测试反复调用，凭据管理器只该在真正打开设置时碰。
         Self {
             url: cfg.url,
@@ -64,12 +72,14 @@ impl Default for Ui {
             show_password: false,
             note: None,
             busy: false,
-            collection: cfg.dir.clone(),
-            entries: Vec::new(),
-            queue: Vec::new(),
+            collection: if cached_dir.collection.is_empty() { cfg.dir.clone() } else { cached_dir.collection },
+            entries: cached_dir.entries,
+            queue: saved_queue.tracks,
+            shuffle: saved_queue.shuffle,
             loading: false,
             error: None,
             loaded: false,
+            auto_tried: false,
             draft: None,
             volume_draft: None,
             tx: None,
@@ -91,8 +101,26 @@ impl Ui {
         }
     }
 
+    /// 岛上播放列表：有自定义序列就用序列，否则用当前曲库目录里的音频。
+    /// 这样「曲库里有歌」和「列表有歌」是同一件事，不需要先逐首点「＋序列」。
+    pub fn playlist(&self) -> Vec<Entry> {
+        if !self.queue.is_empty() {
+            self.queue.clone()
+        } else {
+            self.entries.iter().filter(|item| item.playable()).cloned().collect()
+        }
+    }
+
+    /// 队列或播放顺序变了就落盘，重启后音乐页仍有列表。
+    pub fn persist_queue(&mut self) {
+        webdav::QueueFile {
+            tracks: self.queue.clone(),
+            shuffle: self.shuffle,
+        }.save();
+    }
+
     /// 收取后台线程的结果。先把消息取干净再改状态，避免与 `rx` 的借用冲突。
-    fn receive(&mut self) {
+    pub fn receive(&mut self) {
         let mut messages = Vec::new();
         if let Some(rx) = &self.rx {
             loop {
@@ -117,6 +145,11 @@ impl Ui {
                             self.entries = entries;
                             self.error = None;
                             self.loaded = true;
+                            // 存一份目录，下次启动岛上不用等网络就有歌单。
+                            webdav::DirCache {
+                                collection: self.collection.clone(),
+                                entries: self.entries.clone(),
+                            }.save();
                         }
                         Err(error) => {
                             self.error = Some(error.clone());
@@ -285,6 +318,135 @@ impl App {
         }
     }
 
+    /// 岛仔音乐页点「播放」：从当前播放列表起播。返回是否成功起播。
+    pub fn webdav_play_queue(&mut self, ctx: &egui::Context) -> bool {
+        #[cfg(windows)]
+        {
+            let playlist = self.webdav.playlist();
+            if playlist.is_empty() {
+                self.webdav.note = Some((false, "曲库还没读到歌，先到设置里「重新读取目录」".into()));
+                return false;
+            }
+            let tracks: Vec<crate::webdav_player::Track> = playlist.iter()
+                .map(|item| crate::webdav_player::Track { name: item.name.clone(), url: item.url.clone() })
+                .collect();
+            let cfg = self.webdav.config();
+            if !cfg.ready() {
+                self.webdav.note = Some((false, "WebDAV 未配置，请到设置里连接".into()));
+                return false;
+            }
+            if self.webdav.engine.is_none() {
+                let password = webdav::load_password(&cfg).unwrap_or_default();
+                match crate::webdav_player::Engine::start(ctx.clone(), cfg, password) {
+                    Some(engine) => self.webdav.engine = Some(engine),
+                    None => {
+                        self.webdav.note = Some((false, "无法启动播放线程".into()));
+                        return false;
+                    }
+                }
+            }
+            if let Some(engine) = &self.webdav.engine {
+                engine.play(tracks, 0);
+                engine.set_order(self.webdav_order());
+            }
+            return true;
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = ctx;
+            false
+        }
+    }
+
+    /// 岛仔音乐页点列表里的某一首：从该下标起播。
+    pub fn webdav_play_index(&mut self, index: usize, ctx: &egui::Context) {
+        #[cfg(windows)]
+        {
+            let playlist = self.webdav.playlist();
+            if index >= playlist.len() {
+                return;
+            }
+            let tracks: Vec<crate::webdav_player::Track> = playlist.iter()
+                .map(|item| crate::webdav_player::Track { name: item.name.clone(), url: item.url.clone() })
+                .collect();
+            let cfg = self.webdav.config();
+            if !cfg.ready() {
+                return;
+            }
+            if self.webdav.engine.is_none() {
+                let password = webdav::load_password(&cfg).unwrap_or_default();
+                match crate::webdav_player::Engine::start(ctx.clone(), cfg, password) {
+                    Some(engine) => self.webdav.engine = Some(engine),
+                    None => return,
+                }
+            }
+            if let Some(engine) = &self.webdav.engine {
+                engine.play(tracks, index);
+                engine.set_order(self.webdav_order());
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (index, ctx);
+        }
+    }
+
+    /// 岛上打开曲库面板时自动读一次目录（只试一次，失败靠设置页重试）。
+    /// 密码只在此时从凭据管理器取，避免每帧读盘。
+    pub fn webdav_ensure_listed(&mut self, ctx: &egui::Context) {
+        if self.webdav.loaded || self.webdav.loading || self.webdav.auto_tried {
+            return;
+        }
+        // 测试里不发起真实网络请求：单测只验界面与状态，联网由设置页手动触发。
+        if cfg!(test) {
+            return;
+        }
+        let cfg = self.webdav.config();
+        if !cfg.ready() {
+            // 配置还没到位（比如 NOS 下发的还没回来）：不算试过，等下一帧。
+            return;
+        }
+        self.webdav.auto_tried = true;
+        if self.webdav.password.is_empty() {
+            self.webdav.password = webdav::load_password(&cfg).unwrap_or_default();
+        }
+        let target = if self.webdav.collection.trim().is_empty() {
+            cfg.base().unwrap_or_default()
+        } else {
+            self.webdav.collection.clone()
+        };
+        if target.is_empty() {
+            return;
+        }
+        let user = cfg.user.clone();
+        let password = self.webdav.password.clone();
+        self.webdav.loading = true;
+        let paint = ctx.clone();
+        self.webdav.spawn(move |tx| {
+            let result = webdav::list(&target, &user, &password);
+            let _ = tx.send(Msg::Listed(result));
+            paint.request_repaint();
+        });
+    }
+
+    /// 当前播放顺序（顺序 / 乱序）。
+    pub fn webdav_order(&self) -> crate::webdav_player::Order {
+        if self.webdav.shuffle {
+            crate::webdav_player::Order::Shuffle
+        } else {
+            crate::webdav_player::Order::Sequential
+        }
+    }
+
+    /// 切换顺序 / 乱序，落盘并同步给运行中的播放线程。
+    pub fn webdav_toggle_shuffle(&mut self) {
+        self.webdav.shuffle = !self.webdav.shuffle;
+        self.webdav.persist_queue();
+        if let Some(engine) = &self.webdav.engine {
+            engine.set_order(self.webdav_order());
+        }
+    }
+
     /// 后台自动拉取成功后的刷新：只读入新配置到界面，不打断正在进行的浏览。
     pub fn reload_webdav_config(&mut self) {
         let cfg = webdav::Config::load();
@@ -296,6 +458,8 @@ impl App {
         self.webdav.collection = cfg.dir.clone();
         self.webdav.entries.clear();
         self.webdav.loaded = false;
+        // 换地址后要重新读一次目录，允许自动加载再来一次。
+        self.webdav.auto_tried = false;
         self.webdav.password = webdav::load_password(&cfg).unwrap_or_default();
         self.webdav.password_loaded = true;
         self.webdav_saved = cfg;
@@ -364,6 +528,7 @@ impl App {
         let password = self.webdav.password.clone();
         let user = cfg.user.clone();
         self.webdav.loading = true;
+        self.webdav.auto_tried = true;   // 设置页手动读过了，岛上不必再自动读一次
         self.webdav.error = None;
         let paint = ctx.clone();
         self.webdav.spawn(move |tx| {
@@ -375,7 +540,8 @@ impl App {
 
     fn webdav_browser(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         // 还没取过目录时不占地方：点过「测试连接」或「重新读取目录」才展开。
-        if !self.webdav.loaded && self.webdav.error.is_none() {
+        // 有缓存目录（上次启动留下的）也直接展开，避免看起来像没读到。
+        if !self.webdav.loaded && self.webdav.error.is_none() && self.webdav.entries.is_empty() {
             return;
         }
         settings_label(ui, "曲库");
@@ -431,6 +597,7 @@ impl App {
                         if entry.playable() && ui.small_button("＋序列").on_hover_text("加入播放序列").clicked() {
                             if !self.webdav.queue.iter().any(|item| item.url == entry.url) {
                                 self.webdav.queue.push(entry.clone());
+                                self.webdav.persist_queue();
                                 self.webdav.note = Some((true, format!("已将「{}」加入播放序列", entry.name)));
                             }
                         }
@@ -448,14 +615,17 @@ impl App {
                 }
                 if ui.small_button("清空").clicked() {
                     self.webdav.queue.clear();
+                    self.webdav.persist_queue();
                 }
             });
+            ui.label(RichText::new("有序列时岛仔只播序列；清空后退回按当前曲库目录播放。")
+                .size(10.5).color(ui.visuals().weak_text_color()));
             for (index, item) in self.webdav.queue.clone().iter().enumerate() {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(format!("{}. {}", index + 1, item.name)).size(11.5));
-                    if ui.small_button("↑").clicked() && index > 0 { self.webdav.queue.swap(index, index - 1); }
-                    if ui.small_button("↓").clicked() && index + 1 < self.webdav.queue.len() { self.webdav.queue.swap(index, index + 1); }
-                    if ui.small_button("×").clicked() { self.webdav.queue.remove(index); }
+                    if ui.small_button("↑").clicked() && index > 0 { self.webdav.queue.swap(index, index - 1); self.webdav.persist_queue(); }
+                    if ui.small_button("↓").clicked() && index + 1 < self.webdav.queue.len() { self.webdav.queue.swap(index, index + 1); self.webdav.persist_queue(); }
+                    if ui.small_button("×").clicked() { self.webdav.queue.remove(index); self.webdav.persist_queue(); }
                 });
             }
         }
@@ -475,7 +645,14 @@ impl App {
                 None => { self.webdav.note = Some((false, "无法启动播放线程".into())); return; }
             }
         }
-        if let Some(engine) = &self.webdav.engine { engine.play(playlist, 0); }
+        if let Some(engine) = &self.webdav.engine {
+            engine.play(playlist, 0);
+            engine.set_order(if self.webdav.shuffle {
+                crate::webdav_player::Order::Shuffle
+            } else {
+                crate::webdav_player::Order::Sequential
+            });
+        }
     }
 
     #[cfg(not(windows))]
@@ -504,6 +681,11 @@ impl App {
         }
         if let Some(engine) = &self.webdav.engine {
             engine.play(playlist, position);
+            engine.set_order(if self.webdav.shuffle {
+                crate::webdav_player::Order::Shuffle
+            } else {
+                crate::webdav_player::Order::Sequential
+            });
         }
     }
 
@@ -825,5 +1007,47 @@ mod tests {
         assert_eq!(size_text(0), "");
         assert_eq!(size_text(2048), "2 KB");
         assert_eq!(size_text(5 * 1_048_576), "5.0 MB");
+    }
+}
+
+#[cfg(test)]
+mod playlist_tests {
+    use super::*;
+
+    fn entry(name: &str, is_dir: bool) -> Entry {
+        Entry {
+            name: name.into(),
+            url: format!("https://nas.local/music/{name}"),
+            is_dir,
+            bytes: 1,
+        }
+    }
+
+    #[test]
+    fn playlist_prefers_the_saved_queue() {
+        let mut ui = Ui::default();
+        ui.queue = vec![entry("queued.mp3", false)];
+        ui.entries = vec![entry("dir.mp3", false)];
+        assert_eq!(ui.playlist().len(), 1);
+        assert_eq!(ui.playlist()[0].name, "queued.mp3");
+    }
+
+    #[test]
+    fn empty_queue_falls_back_to_the_current_directory() {
+        // 这就是「曲库里有歌、岛上却显示 0 首」的那个 bug：没加序列时要回落到目录。
+        let mut ui = Ui::default();
+        ui.queue.clear();
+        ui.entries = vec![entry("Music", true), entry("a.mp3", false), entry("b.flac", false), entry("c.jpg", false)];
+        let playlist = ui.playlist();
+        assert_eq!(playlist.len(), 2, "只保留音频，目录与图片不算");
+        assert_eq!(playlist[0].name, "a.mp3");
+    }
+
+    #[test]
+    fn both_empty_gives_an_empty_playlist() {
+        let mut ui = Ui::default();
+        ui.queue.clear();
+        ui.entries.clear();
+        assert!(ui.playlist().is_empty());
     }
 }

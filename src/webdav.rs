@@ -10,6 +10,10 @@ use std::path::{Path, PathBuf};
 /// 凭据管理器里的服务名。
 pub const SERVICE: &str = "Daozai.WebDav";
 const CONFIG_FILE: &str = "webdav.json";
+/// 播放序列与顺序单独落盘：岛仔重启后音乐页直接可用，不用重开设置页。
+const QUEUE_FILE: &str = "webdav-queue.json";
+/// 最近一次曲库目录的缓存：重启/离线时岛上也能立刻显示歌单。
+const DIR_FILE: &str = "webdav-dir.json";
 /// 一次列目录最多接受多少条，防止异常服务器把内存撑爆。
 const MAX_ENTRIES: usize = 2000;
 /// 单个文件上限：再大就不是歌曲了。
@@ -226,7 +230,7 @@ fn strip_track_number(stem: &str) -> &str {
     stem
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Entry {
     /// 显示名（已做百分号解码）。
     pub name: String,
@@ -234,6 +238,60 @@ pub struct Entry {
     pub url: String,
     pub is_dir: bool,
     pub bytes: u64,
+}
+
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct QueueFile {
+    pub tracks: Vec<Entry>,
+    /// 乱序播放；旧文件缺字段时按顺序处理。
+    pub shuffle: bool,
+}
+
+impl QueueFile {
+    fn path() -> PathBuf {
+        crate::model::config_dir().join(QUEUE_FILE)
+    }
+
+    pub fn load() -> Self {
+        std::fs::read(Self::path())
+            .ok()
+            .and_then(|raw| serde_json::from_slice(&raw).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save(&self) {
+        if let Ok(raw) = serde_json::to_vec_pretty(self) {
+            let _ = crate::model::atomic_write(&Self::path(), &raw);
+        }
+    }
+}
+
+/// 曲库目录缓存：只用来「先显示上一份」，联网成功后会覆盖。
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct DirCache {
+    pub collection: String,
+    pub entries: Vec<Entry>,
+}
+
+impl DirCache {
+    fn path() -> PathBuf {
+        crate::model::config_dir().join(DIR_FILE)
+    }
+
+    pub fn load() -> Self {
+        std::fs::read(Self::path())
+            .ok()
+            .and_then(|raw| serde_json::from_slice(&raw).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save(&self) {
+        if let Ok(raw) = serde_json::to_vec_pretty(self) {
+            let _ = crate::model::atomic_write(&Self::path(), &raw);
+        }
+    }
 }
 
 impl Entry {

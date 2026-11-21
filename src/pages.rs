@@ -19,6 +19,14 @@ fn mmss(secs: f64) -> String {
     format!("{:02}:{:02}", s / 60, s % 60)
 }
 
+/// 只取主机名给状态行用，地址很长时也不挤爆岛体。
+fn url_host(raw: &str) -> String {
+    url::Url::parse(raw)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_string))
+        .unwrap_or_else(|| raw.trim().trim_start_matches("https://").trim_start_matches("http://").to_string())
+}
+
 /// 由标题生成稳定的封面渐变色。
 pub(crate) fn cover_colors(title: &str) -> (Color32, Color32) {
     let mut h: u64 = 1469598103934665603;
@@ -38,6 +46,12 @@ pub(crate) fn cover_colors(title: &str) -> (Color32, Color32) {
 impl App {
     // ================= 音乐 =================
     pub(crate) fn page_music(&mut self, c: &Card, _env: &Env, cmds: &mut Vec<Cmd>) {
+        // 配了 WebDAV 就自动读一次目录：岛上的「N 首」和列表才不是空的。
+        // 只试一次（auto_tried），失败后到设置页手动重试，避免每帧刷网络。
+        if self.webdav.config().ready() && !self.webdav.loaded && !self.webdav.loading && !self.webdav.auto_tried {
+            let ctx=c.ui.ctx().clone();
+            self.webdav_ensure_listed(&ctx);
+        }
         let np=self.media.clone();
         let has=!np.title.is_empty();
         let with_lyrics=has && self.show_lyrics;
@@ -61,7 +75,25 @@ impl App {
         }
 
         if !has {
-            c.text(121.0,47.0,"暂无音乐",14.0,W::Bold,theme::WHITE,H::Left);
+            let cfg=self.webdav.config();
+            if cfg.ready() {
+                let host=url_host(&cfg.url);
+                let count=self.webdav.playlist().len();
+                c.text(121.0,47.0,"WebDAV 音乐",14.0,W::Bold,theme::WHITE,H::Left);
+                let status=if self.webdav.loading && count==0 {
+                    format!("{host} · 读取中…")
+                } else if count>0 {
+                    // 有缓存/已读到歌时优先报数量，网络错误不挡着看歌单。
+                    format!("{host} · {count} 首")
+                } else if let Some(error)=&self.webdav.error {
+                    format!("{host} · {error}")
+                } else {
+                    format!("{host} · 曲库为空")
+                };
+                c.text(121.0,67.0,&c.fit(&status,size::BODY,W::Regular,214.0),size::BODY,W::Regular,theme::GRAY,H::Left);
+            } else {
+                c.text(121.0,47.0,"暂无音乐",14.0,W::Bold,theme::WHITE,H::Left);
+            }
         } else {
             let text_x=if with_lyrics {99.0}else{121.0};
             let text_width=if with_lyrics {123.0}else{220.0};
@@ -141,6 +173,9 @@ impl App {
             if previous.clicked() {cmds.push(Cmd::Media(Transport::Prev));}
             if play.clicked() {cmds.push(Cmd::Media(Transport::Toggle));}
             if next.clicked() {cmds.push(Cmd::Media(Transport::Next));}
+        } else if self.webdav.config().ready() && !self.webdav.playlist().is_empty() && play.clicked() {
+            // 没有系统媒体时用同一颗播放键起播 WebDAV 曲库，位置与手势都不变。
+            cmds.push(Cmd::WebdavPlay);
         }
         if lyrics_button.on_hover_text(if self.show_lyrics {"隐藏歌词"}else{"显示歌词"}).clicked() {
             if !has {self.say("先放一首歌吧");}
@@ -148,6 +183,19 @@ impl App {
                 self.show_lyrics=!self.show_lyrics;
                 self.settings.lyrics_enabled=self.show_lyrics;
                 self.settings.save();
+            }
+        }
+        // WebDAV 曲库入口：标题行右侧的空闲区，与系统媒体是否在播无关。
+        {
+            let wd_ready=self.webdav.config().ready();
+            let count=self.webdav.playlist().len();
+            let label=if wd_ready {format!("{count}")}else{"·".to_string()};
+            let (wd,wd_card)=capsule(c,346.0,46.0,30.0,24.0,"m-webdav-list",
+                Color32::from_gray(36),Color32::from_gray(52));
+            wd_card.centered_text(361.0,62.0,&label,10.0,W::Semibold,
+                if wd_ready {theme::WHITE}else{theme::GRAY},H::Center);
+            if wd.on_hover_text(if wd_ready {"WebDAV 连接状态与播放列表"}else{"未配置 WebDAV，去设置里连接"}).clicked(){
+                self.webdav_list_open=!self.webdav_list_open;
             }
         }
         // 岛上歌词是横向的，只在顶部停靠时提供。
@@ -210,6 +258,84 @@ impl App {
         popup.circle(367.0,head,if track.dragged(){5.5}else{4.5},ink);
         popup.fill(353.0,82.0,28.0,20.0,6.0,paint::mix(theme::BTN,theme::BTN_HOVER,if muted{1.0}else{hover}));
         popup.scaled(367.0,92.0,1.0-0.06*press).centered_text(367.0,92.0,if muted{"恢复"}else{"静音"},9.5,W::Semibold,theme::WHITE,H::Center);
+    }
+
+    /// WebDAV 曲库面板：显示连接状态、播放列表与顺序切换。
+    /// 无系统媒体时占满标题与进度条区域；有媒体时仍可展开，不挡底部控制行。
+    pub(crate) fn draw_webdav_list(&mut self,c:&Card,cmds:&mut Vec<Cmd>){
+        let ctx=c.ui.ctx().clone();
+        // 面板可能常年不开设置页：后台列目录的结果要在这里收。
+        self.webdav.receive();
+        if self.webdav_list_open { self.webdav_ensure_listed(&ctx); }
+        let a=ctx.animate_bool_with_time(egui::Id::new("webdav-list-open"),self.webdav_list_open,0.12);
+        if a<0.01{return;}
+        // 面板落在内容区（y 24..104）：避开顶部圆角/肩部与底部控制行，不被岛体裁掉。
+        let panel=c.rect(40.0,24.0,340.0,80.0);
+        let trigger=c.rect(346.0,46.0,30.0,24.0);
+        if self.webdav_list_open && ctx.input(|i|i.pointer.any_pressed() && i.pointer.interact_pos().is_some_and(|p|!panel.contains(p) && !trigger.contains(p))){
+            self.webdav_list_open=false;
+        }
+        let popup=c.faded(a);
+        let popup=if self.webdav_list_open{popup}else{popup.ghost()};
+        // 面板占据命中区，防止点击穿到进度条 / 翻页。
+        popup.hit(40.0,24.0,340.0,80.0,"wd-list-surface");
+        popup.fill(40.0,24.0,340.0,80.0,10.0,Color32::from_gray(34));
+        popup.stroke(40.0,24.0,340.0,80.0,10.0,1.0,Color32::from_gray(58));
+
+        let cfg=self.webdav.config();
+        let ready=cfg.ready();
+        let host=url_host(&cfg.url);
+        let order=self.webdav_order();
+        let playlist=self.webdav.playlist();
+
+        // 左半：状态 + 顺序 / 播放全部。状态行兼作「重新读取」。
+        popup.text(52.0,42.0,"WebDAV 音乐",11.5,W::Bold,theme::WHITE,H::Left);
+        let state=if !ready {
+            "未配置".to_string()
+        } else if self.webdav.loading && playlist.is_empty() {
+            format!("{host} · 读取中…")
+        } else if playlist.is_empty() {
+            format!("{host} · 曲库为空，点此重读")
+        } else {
+            format!("{host} · {} 首",playlist.len())
+        };
+        let state_hit=popup.hit(52.0,46.0,168.0,14.0,"wd-reload");
+        let ink=if state_hit.hovered(){theme::WHITE}else{theme::GRAY};
+        popup.text(52.0,57.0,&popup.fit(&state,9.0,W::Regular,168.0),9.0,W::Regular,ink,H::Left);
+        if popup.live && ready && state_hit.on_hover_text("重新读取曲库目录").clicked(){
+            self.webdav.loaded=false;
+            self.webdav.auto_tried=false;
+        }
+        let (order_r,order_card)=paint::capsule(&popup,52.0,66.0,62.0,20.0,"wd-order",
+            Color32::from_gray(46),Color32::from_gray(60));
+        order_card.centered_text(83.0,80.0,order.label(),10.0,W::Semibold,theme::WHITE,H::Center);
+        if popup.live && order_r.on_hover_text("切换顺序 / 乱序播放").clicked(){
+            cmds.push(Cmd::WebdavToggleShuffle);
+        }
+        let (play_r,play_card)=paint::capsule(&popup,120.0,66.0,68.0,20.0,"wd-list-play",
+            Color32::from_gray(46),Color32::from_gray(60));
+        play_card.centered_text(154.0,80.0,"播放全部",10.0,W::Semibold,theme::WHITE,H::Center);
+        if popup.live && play_r.on_hover_text("从第一首开始播放").clicked(){
+            cmds.push(Cmd::WebdavPlay);
+        }
+
+        // 右半：曲目列表，最多 4 行（每行 15px，与歌词区同节奏）。
+        popup.seg((228.0,32.0),(228.0,96.0),1.0,Color32::from_gray(52));
+        if playlist.is_empty() {
+            let hint=if !ready {"先到设置里连接 WebDAV"}else if self.webdav.loading {"正在读取曲库…"}else{"还没有歌"};
+            popup.text(240.0,62.0,hint,9.0,W::Regular,theme::GRAY,H::Left);
+        } else {
+            for (index,item) in playlist.iter().take(4).enumerate(){
+                let y=40.0+index as f32*15.0;
+                let hit=popup.hit(238.0,y-10.0,136.0,15.0,("wd-track",index));
+                let ink=if hit.hovered(){theme::WHITE}else{theme::WHITE.gamma_multiply(0.72)};
+                popup.text(240.0,y,&popup.fit(&item.name,9.5,W::Regular,132.0),9.5,W::Regular,ink,H::Left);
+                if popup.live && hit.on_hover_text("点此播放").clicked(){
+                    cmds.push(Cmd::WebdavPlayIndex(index));
+                    self.webdav_list_open=false;
+                }
+            }
+        }
     }
 
     fn draw_music_lyrics(&mut self,c:&Card) {

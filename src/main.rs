@@ -906,6 +906,18 @@ impl eframe::App for Shell {
                         Ok(Some(rx))=>self.seek_rx=Some((message,rx)),Ok(None)=>{},Err(())=>self.app.say("播放器正在响应，请稍后重试"),
                     }
                 }
+                Cmd::WebdavPlay => {
+                    self.app.webdav_play_queue(&ctx);
+                    ctx.request_repaint();
+                }
+                Cmd::WebdavPlayIndex(index) => {
+                    self.app.webdav_play_index(index, &ctx);
+                    ctx.request_repaint();
+                }
+                Cmd::WebdavToggleShuffle => {
+                    self.app.webdav_toggle_shuffle();
+                    ctx.request_repaint();
+                }
                 Cmd::MusicVolume(command,source)=>{
                     if self.app.local_transport(&command) {
                         ctx.request_repaint();
