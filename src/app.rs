@@ -3371,6 +3371,41 @@ impl App {
         }
     }
 
+    /// 正在缓冲时的进度（0..1）与曲名。整首下完才播，所以要让人看见在走。
+    pub fn webdav_buffering(&self) -> Option<(f32, String)> {
+        #[cfg(windows)]
+        {
+            use crate::webdav_player::Status;
+            let state = self.webdav.engine.as_ref()?.snapshot();
+            let track = state.current()?.name.clone();
+            return match state.status {
+                Status::Downloading(progress) => Some((progress, track)),
+                _ => None,
+            };
+        }
+        #[cfg(not(windows))]
+        {
+            None
+        }
+    }
+
+    /// 播放失败的原因；下载/解码出错时非空。
+    pub fn webdav_failure(&self) -> Option<String> {
+        #[cfg(windows)]
+        {
+            use crate::webdav_player::Status;
+            let state = self.webdav.engine.as_ref()?.snapshot();
+            return match state.status {
+                Status::Error(message) => Some(message),
+                _ => None,
+            };
+        }
+        #[cfg(not(windows))]
+        {
+            None
+        }
+    }
+
     /// 当前 WebDAV 曲目的可续播地址（接力用）；没在放 WebDAV 时为空。
     pub fn webdav_current_url(&self) -> Option<String> {
         #[cfg(windows)]

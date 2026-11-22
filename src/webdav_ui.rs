@@ -322,9 +322,14 @@ impl App {
     pub fn webdav_play_queue(&mut self, ctx: &egui::Context) -> bool {
         #[cfg(windows)]
         {
+            // 已经在下载这一首：重复点播放只会从头再下一次，直接忽略。
+            if self.webdav_buffering().is_some() {
+                return true;
+            }
             let playlist = self.webdav.playlist();
             if playlist.is_empty() {
                 self.webdav.note = Some((false, "曲库还没读到歌，先到设置里「重新读取目录」".into()));
+                self.say("曲库还没读到歌，先到设置里「重新读取目录」");
                 return false;
             }
             let tracks: Vec<crate::webdav_player::Track> = playlist.iter()
@@ -333,14 +338,22 @@ impl App {
             let cfg = self.webdav.config();
             if !cfg.ready() {
                 self.webdav.note = Some((false, "WebDAV 未配置，请到设置里连接".into()));
+                self.say("WebDAV 未配置，请到设置里连接");
+                return false;
+            }
+            // 有用户名却没有本地密码：多半是没从 NOS 拉到，下载会 401，先说清楚。
+            // 放在 engine 判断之外：引擎可能早就用空密码起过，重试也只会 401。
+            let password = webdav::load_password(&cfg).unwrap_or_default();
+            if !cfg.user.trim().is_empty() && password.trim().is_empty() {
+                self.say("本地没有 WebDAV 密码，请到设置 → 音乐与歌词点「从 NOS 重新获取」");
                 return false;
             }
             if self.webdav.engine.is_none() {
-                let password = webdav::load_password(&cfg).unwrap_or_default();
                 match crate::webdav_player::Engine::start(ctx.clone(), cfg, password) {
                     Some(engine) => self.webdav.engine = Some(engine),
                     None => {
                         self.webdav.note = Some((false, "无法启动播放线程".into()));
+                        self.say("无法启动播放线程，请稍后重试");
                         return false;
                     }
                 }
@@ -371,13 +384,21 @@ impl App {
                 .collect();
             let cfg = self.webdav.config();
             if !cfg.ready() {
+                self.say("WebDAV 未配置，请到设置里连接");
+                return;
+            }
+            let password = webdav::load_password(&cfg).unwrap_or_default();
+            if !cfg.user.trim().is_empty() && password.trim().is_empty() {
+                self.say("本地没有 WebDAV 密码，请到设置 → 音乐与歌词点「从 NOS 重新获取」");
                 return;
             }
             if self.webdav.engine.is_none() {
-                let password = webdav::load_password(&cfg).unwrap_or_default();
                 match crate::webdav_player::Engine::start(ctx.clone(), cfg, password) {
                     Some(engine) => self.webdav.engine = Some(engine),
-                    None => return,
+                    None => {
+                        self.say("无法启动播放线程，请稍后重试");
+                        return;
+                    }
                 }
             }
             if let Some(engine) = &self.webdav.engine {
@@ -455,13 +476,21 @@ impl App {
                 };
             let cfg = self.webdav.config();
             if !cfg.ready() {
+                self.say("WebDAV 未配置，请到设置里连接");
+                return;
+            }
+            let password = webdav::load_password(&cfg).unwrap_or_default();
+            if !cfg.user.trim().is_empty() && password.trim().is_empty() {
+                self.say("本地没有 WebDAV 密码，请到设置 → 音乐与歌词点「从 NOS 重新获取」");
                 return;
             }
             if self.webdav.engine.is_none() {
-                let password = webdav::load_password(&cfg).unwrap_or_default();
                 match crate::webdav_player::Engine::start(ctx.clone(), cfg, password) {
                     Some(engine) => self.webdav.engine = Some(engine),
-                    None => return,
+                    None => {
+                        self.say("无法启动播放线程，请稍后重试");
+                        return;
+                    }
                 }
             }
             if let Some(engine) = &self.webdav.engine {

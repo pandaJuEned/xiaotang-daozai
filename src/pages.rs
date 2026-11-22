@@ -54,10 +54,14 @@ impl App {
         }
         let np=self.media.clone();
         let has=!np.title.is_empty();
+        // 整首下完才播：缓冲中要让人看见进度，否则点了播放像卡死。
+        let buffering=self.webdav_buffering();
+        let failure=self.webdav_failure();
         // 本机没在放、但别的设备在放：显示对方曲目，播放键变成「接手」。
         let remote=self.sync.music_remote.clone().filter(|item| !item.title.trim().is_empty());
         // 本机暂停也算「没在放」：被接手后引擎停在 Paused，仍应显示对方。
-        let remote_only=!np.playing && remote.is_some();
+        // 正在缓冲时不显示对方——我们已经在抢这台机器的播放权了。
+        let remote_only=!np.playing && remote.is_some() && buffering.is_none();
         let drift=remote.as_ref().map(|item| {
             (chrono::Local::now().timestamp()-item.updated_at).clamp(0,6) as f64
         }).unwrap_or(0.0);
@@ -68,7 +72,7 @@ impl App {
             }
             _=>(np.title.clone(),np.artist.clone(),np.position,np.duration,np.playing),
         };
-        let shown=has||remote_only;
+        let shown=has||remote_only||buffering.is_some();
         let with_lyrics=has && self.show_lyrics;
         let ctx=c.ui.ctx().clone();
         let playing_t=ctx.animate_bool_with_time(egui::Id::new("np-playing"),np.playing,0.22);
@@ -94,6 +98,15 @@ impl App {
             c.text(121.0,47.0,&c.fit(&title,14.0,W::Bold,214.0),14.0,W::Bold,theme::WHITE,H::Left);
             c.text(121.0,67.0,&c.fit(&artist,size::BODY,W::Regular,214.0),size::BODY,W::Regular,theme::GRAY,H::Left);
         } else if !has {
+            if let Some((progress,track))=&buffering {
+                // 缓冲中：曲名 + 百分比，进度条直接当下载进度用。
+                c.text(121.0,47.0,&c.fit(track,14.0,W::Bold,214.0),14.0,W::Bold,theme::WHITE,H::Left);
+                let text=format!("正在缓冲 {:.0}% · 整首下完自动开始",progress*100.0);
+                c.text(121.0,67.0,&text,size::BODY,W::Regular,theme::GRAY,H::Left);
+            } else if let Some(error)=&failure {
+                c.text(121.0,47.0,"播放失败",14.0,W::Bold,theme::WHITE,H::Left);
+                c.text(121.0,67.0,&c.fit(error,size::BODY,W::Regular,214.0),size::BODY,W::Regular,theme::GRAY,H::Left);
+            } else {
             let cfg=self.webdav.config();
             if cfg.ready() {
                 let host=url_host(&cfg.url);
@@ -113,6 +126,7 @@ impl App {
             } else {
                 c.text(121.0,47.0,"暂无音乐",14.0,W::Bold,theme::WHITE,H::Left);
             }
+            }
         } else {
             let text_x=if with_lyrics {99.0}else{121.0};
             let text_width=if with_lyrics {123.0}else{220.0};
@@ -130,7 +144,7 @@ impl App {
                 .map(|pointer|((c.to_local(pointer).x-bx)/bw).clamp(0.0,1.0) as f64*np.duration)
         }else{None};
         let position=seek_position.unwrap_or(position);
-        let frac=if duration>0.0 {(position/duration).clamp(0.0,1.0) as f32}else{0.0};
+        let frac=if let Some((progress,_))=&buffering { progress.clamp(0.0,1.0) } else if duration>0.0 {(position/duration).clamp(0.0,1.0) as f32}else{0.0};
         let (time_y,time_size,right)=if with_lyrics {(100.0,10.0,220.0)}else{(97.0,15.0,375.0)};
         c.text(44.0,time_y,&mmss(position),time_size,W::Regular,tc,H::Left);
         let remaining=if shown && duration<=0.0{"--:--".into()}else{format!("-{}",mmss((duration-position).max(0.0)))};

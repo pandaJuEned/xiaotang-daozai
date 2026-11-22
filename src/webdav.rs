@@ -378,6 +378,21 @@ fn agent() -> ureq::Agent {
         .build()
 }
 
+/// 下载专用：**不设整体超时**。
+///
+/// 这里是把整首歌下完才播，`timeout` 会在 40 秒时把整个请求掐掉 ——
+/// 远端曲库一首无损几十 MB，慢链路必然超时，表现就是「点了播放一直没反应」。
+/// 只保留连接与单次读取超时：只要还在往下走就允许它继续。
+fn download_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_connect(std::time::Duration::from_secs(10))
+        .timeout_read(std::time::Duration::from_secs(30))
+        .timeout_write(std::time::Duration::from_secs(30))
+        .redirects(0)
+        .user_agent(concat!("Daozai/", env!("CARGO_PKG_VERSION")))
+        .build()
+}
+
 fn auth(user: &str, password: &str) -> String {
     use base64::Engine;
     format!(
@@ -432,6 +447,7 @@ impl Failure {
 /// GET，返回 401 —— 界面上看着像密码错了，实际是跳转把凭据弄丢了。
 /// 这里只跟同源、且不会降级成明文 http 的跳转，其余直接报错说明原因。
 fn send(
+    agent: &ureq::Agent,
     method: &str,
     url: &str,
     body: Option<&str>,
@@ -444,7 +460,7 @@ fn send(
         if !transport_ok(&parsed) {
             return Err(Failure::Redirect("只支持 https 地址（本机可用 http）".to_string()));
         }
-        let mut request = agent().request(method, &current).set("Authorization", &auth(user, password));
+        let mut request = agent.request(method, &current).set("Authorization", &auth(user, password));
         if body.is_some() {
             request = request.set("Depth", "1").set("Content-Type", "application/xml; charset=utf-8");
         }
@@ -491,7 +507,7 @@ fn next_hop(current: &str, location: &str) -> Result<String, Failure> {
 /// 列出一个集合下的直接子项，返回实际生效的集合地址（跟过跳转后可能补上尾斜杠）。
 /// `collection` 必须是绝对地址。
 pub fn list(collection: &str, user: &str, password: &str) -> Result<(String, Vec<Entry>), String> {
-    let (response, collection) = send("PROPFIND", collection, Some(PROPFIND_BODY), user, password)
+    let (response, collection) = send(&agent(), "PROPFIND", collection, Some(PROPFIND_BODY), user, password)
         .map_err(Failure::for_list)?;
     let status = response.status();
     if status >= 300 {
@@ -518,7 +534,7 @@ pub fn download(
     if !same_origin(base, url) {
         return Err("文件地址与服务器不同源，已拒绝下载".into());
     }
-    let (response, _) = send("GET", url, None, user, password).map_err(Failure::for_download)?;
+    let (response, _) = send(&download_agent(), "GET", url, None, user, password).map_err(Failure::for_download)?;
     let total: u64 = response
         .header("Content-Length")
         .and_then(|value| value.parse().ok())
