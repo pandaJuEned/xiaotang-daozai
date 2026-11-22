@@ -399,6 +399,8 @@ fn query(_artwork:&mut ArtworkCache) -> Option<NowPlaying> {
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Transport {
     Toggle,
+    /// 只暂停，不会把已暂停的播放器重新唤起（跨设备接力时用）。
+    Pause,
     Next,
     Prev,
     /// 跳到第几秒。
@@ -464,6 +466,7 @@ pub fn control(cmd: Transport,source:&str) {
     };
     let _=media_result(||match cmd {
         Transport::Toggle => session.TryTogglePlayPauseAsync(),
+        Transport::Pause => session.TryPauseAsync(),
         Transport::Next => session.TrySkipNextAsync(),
         Transport::Prev => session.TrySkipPreviousAsync(),
         Transport::Seek(secs) => session.TryChangePlaybackPositionAsync((secs.max(0.0) * 10_000_000.0) as i64),

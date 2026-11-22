@@ -197,6 +197,10 @@ pub enum Cmd {
     WebdavPlayIndex(usize),
     /// 岛仔音乐页：切换顺序 / 乱序播放。
     WebdavToggleShuffle,
+    /// 在本机接手播放：向 NOS 抢占播放权，其它设备随即暂停。
+    MusicClaim,
+    /// 从别的设备接手：url 为空表示只抢播放权（系统播放器的曲目无法续播）。
+    MusicTakeover { url: String, track: String, position: f64 },
     MailManage(crate::mail_manage::Request),
     /// v0.5.6：用临时密码试连日历，成功后才允许落盘。
     CalendarTest(calendar::Config, String),
@@ -1372,6 +1376,14 @@ impl App {
                 title: self.media.title.clone(),
                 artist: self.media.artist.clone(),
                 playing: self.media.playing,
+                position: self.media.position,
+                duration: self.media.duration,
+                // 只有自家 WebDAV 曲库能给出可续播地址；系统播放器的曲目只能展示。
+                url: self
+                    .local_now_playing()
+                    .filter(|now| now.source.eq_ignore_ascii_case("Daozai.WebDav"))
+                    .and_then(|_| self.webdav_current_url())
+                    .unwrap_or_default(),
             }),
         }
     }
@@ -3359,6 +3371,38 @@ impl App {
         }
     }
 
+    /// 当前 WebDAV 曲目的可续播地址（接力用）；没在放 WebDAV 时为空。
+    pub fn webdav_current_url(&self) -> Option<String> {
+        #[cfg(windows)]
+        {
+            let state = self.webdav.engine.as_ref()?.snapshot();
+            return state.current().map(|track| track.url.clone());
+        }
+        #[cfg(not(windows))]
+        {
+            None
+        }
+    }
+
+    /// 被其它设备接管：本机立刻停止出声。
+    /// WebDAV 由岛仔自己出声，直接暂停；系统播放器返回来源名，由 Shell 发 Pause。
+    pub fn pause_local_music(&mut self) -> Option<String> {
+        #[cfg(windows)]
+        {
+            if self.local_now_playing().is_some() {
+                if let Some(engine) = &self.webdav.engine {
+                    engine.pause();
+                }
+                return None;
+            }
+        }
+        // 只在确实在播时要来源：避免把已暂停的应用唤醒。
+        if self.media.playing && !self.media.source.trim().is_empty() {
+            return Some(self.media.source.clone());
+        }
+        None
+    }
+
     /// 岛上与音乐页的播放控制：WebDAV 出声时改为控制它自己，返回 true 表示已处理。
     pub fn local_transport(&mut self, command: &Transport) -> bool {
         #[cfg(windows)]
@@ -3369,6 +3413,7 @@ impl App {
             let Some(engine) = self.webdav.engine.as_ref() else { return false };
             match command {
                 Transport::Toggle => engine.toggle(),
+                Transport::Pause => engine.pause(),
                 Transport::Next => engine.next(),
                 Transport::Prev => engine.prev(),
                 Transport::Seek(position) => engine.seek(*position),

@@ -737,6 +737,18 @@ impl eframe::App for Shell {
                 self.app.sync=snapshot;
             }
         }
+        // 被别的设备接手：立刻停掉本机出声，并提示一句谁接走了。
+        if self.app.sync.music_lost {
+            self.app.sync.music_lost=false;
+            let who=self.app.sync.music_remote.as_ref()
+                .map(|remote| if remote.device_name.is_empty(){remote.device.clone()}else{remote.device_name.clone()})
+                .unwrap_or_else(||"另一台设备".into());
+            if let Some(source)=self.app.pause_local_music() {
+                if self.media_control.is_none(){self.media_control=smtc::ControlWorker::start(ctx.clone());}
+                if let Some(worker)=&self.media_control{let _=worker.submit(smtc::Transport::Pause,source);}
+            }
+            self.app.say(format!("{who} 接手播放，本机已暂停"));
+        }
         if let Some(rx)=&self.sync_test_rx {
             if let Ok(message)=rx.try_recv() {
                 self.app.say(message);
@@ -907,11 +919,21 @@ impl eframe::App for Shell {
                     }
                 }
                 Cmd::WebdavPlay => {
+                    // 在本机起播就等于要在这里出声：先抢播放权，对方随即暂停。
+                    if let Some(service)=&self.sync { service.request_claim(); }
                     self.app.webdav_play_queue(&ctx);
                     ctx.request_repaint();
                 }
                 Cmd::WebdavPlayIndex(index) => {
                     self.app.webdav_play_index(index, &ctx);
+                    ctx.request_repaint();
+                }
+                Cmd::MusicClaim => {
+                    if let Some(service)=&self.sync { service.request_claim(); }
+                }
+                Cmd::MusicTakeover{url,track,position} => {
+                    if let Some(service)=&self.sync { service.request_claim(); }
+                    self.app.webdav_takeover(&url,&track,position,&ctx);
                     ctx.request_repaint();
                 }
                 Cmd::WebdavToggleShuffle => {

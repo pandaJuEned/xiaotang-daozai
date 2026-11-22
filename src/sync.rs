@@ -778,6 +778,14 @@ pub struct PresenceMusic {
     pub artist: String,
     #[serde(default)]
     pub playing: bool,
+    /// 已播秒数：其他设备据此显示「到哪了」，接力时也从这里继续。
+    #[serde(default)]
+    pub position: f64,
+    #[serde(default)]
+    pub duration: f64,
+    /// 只有 WebDAV 曲目才有可续播地址；系统播放器的曲目只能展示。
+    #[serde(default)]
+    pub url: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -870,6 +878,35 @@ pub struct Snapshot {
     pub skew_ms: i64,
     pub last_batch: usize,
     pub inbox: usize,
+    /// 当前其它设备正在播的曲目（服务端仲裁结果）；没人播时为 None。
+    pub music_remote: Option<RemoteMusic>,
+    /// 服务端的播放权版本号：比本机大就说明别人接手了。
+    pub music_epoch: i64,
+    /// 本机被其它设备接管，Shell 取到后立刻暂停本地播放并清掉这个标记。
+    pub music_lost: bool,
+}
+
+/// 服务端返回的「谁在播」。
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct RemoteMusic {
+    #[serde(default)]
+    pub device: String,
+    #[serde(default)]
+    pub device_name: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub artist: String,
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub position: f64,
+    #[serde(default)]
+    pub duration: f64,
+    #[serde(default)]
+    pub updated_at: i64,
 }
 
 impl Snapshot {
@@ -905,6 +942,8 @@ fn device_views(list: Vec<Device>) -> Vec<DeviceView> {
 pub struct Service {
     rx: Receiver<Snapshot>,
     stop: Arc<AtomicBool>,
+    /// 请求抢占播放权：UI 点「在手边设备上继续」时置位，同步线程下一轮发出。
+    claim: Arc<AtomicBool>,
 }
 
 impl Service {
@@ -916,11 +955,18 @@ impl Service {
     ) -> Self {
         let (tx, rx) = mpsc::sync_channel(2);
         let stop = Arc::new(AtomicBool::new(false));
+        let claim = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&stop);
+        let ask = Arc::clone(&claim);
         let _ = crate::resources::SYNC.spawn(move || {
-            run(ctx, cfg, initial, tx, flag, presence_state)
+            run(ctx, cfg, initial, tx, flag, presence_state, ask)
         });
-        Self { rx, stop }
+        Self { rx, stop, claim }
+    }
+
+    /// 请求在当前设备接手播放（其它设备会在下一轮轮询时暂停）。
+    pub fn request_claim(&self) {
+        self.claim.store(true, Ordering::Relaxed);
     }
 
     pub fn try_recv(&self) -> Option<Snapshot> {
@@ -985,8 +1031,10 @@ fn run(
     tx: SyncSender<Snapshot>,
     stop: Arc<AtomicBool>,
     presence_state: Arc<Mutex<PresenceOut>>,
+    claim_request: Arc<AtomicBool>,
 ) {
     let agent = crate::nos::http_agent();
+    let mut music = MusicClock::default();
     let mut state = StateFile::load();
     let mut clock = PollClock::default();
     let mut failures: u32 = 0;
@@ -1174,6 +1222,28 @@ fn run(
             }
         }
 
+        // 5) 跨设备播放权：本机在放或别人在放时 2 秒一轮，空闲 5 秒一轮
+        //    （空闲也要轮，否则第二台设备要等十几秒才看见有人在播）。
+        let music_busy = {
+            let state = presence_state
+                .lock()
+                .map(|state| state.clone())
+                .unwrap_or_default();
+            state.music.as_ref().is_some_and(|music| music.playing)
+                || snap.music_remote.is_some()
+                || claim_request.load(Ordering::Relaxed)
+        };
+        if hello_ok && snap.connected {
+            music_tick(
+                &agent,
+                &cfg,
+                &presence_state,
+                &mut music,
+                &mut snap,
+                &claim_request,
+            );
+        }
+
         if cycle_ok {
             failures = 0;
             snap.connected = true;
@@ -1181,13 +1251,210 @@ fn run(
         let _ = tx.try_send(snap.clone());
         ctx.request_repaint();
 
-        let interval = if snap.pending > 0 { 5 } else { INTERVAL };
+        // 有同步就保持 5 秒一轮：播放状态靠这轮询才能被别人看见；
+        // 正在出声或有人接手时收到 2 秒，让「接手即停」跟手。
+        let interval = if music_busy { 2 } else { 5 };
         let wait_secs = if failures == 0 {
             interval
         } else {
             backoff_secs(failures)
         };
         wait(&stop, wait_secs);
+    }
+}
+
+// ---------------------------------------------------------------- 跨设备播放权
+
+/// 本机播放权的本地视图：服务端 epoch 是唯一事实源。
+#[derive(Default)]
+struct MusicClock {
+    epoch: i64,
+    /// 本机当前持有播放权。
+    owned: bool,
+    /// 已请求认领，等下一轮发出去。
+    claim_pending: bool,
+    /// 被别的设备接手过：在本机停下再重新开始之前不再自动抢回来，
+    /// 否则两台机器会互相抢、来回切歌。
+    stood_down: bool,
+    /// 上一轮本机是否在出声，用来识别「重新开始播放」这个动作。
+    was_playing: bool,
+}
+
+enum MusicErr {
+    /// 服务端 409：别人接手了，带回服务端 epoch。
+    Taken(i64),
+    Other,
+}
+
+fn music_post<T: DeserializeOwned>(
+    agent: &ureq::Agent,
+    url: &str,
+    token: &str,
+    body: &impl Serialize,
+) -> Result<T, MusicErr> {
+    let payload = serde_json::to_vec(body).map_err(|_| MusicErr::Other)?;
+    let request = agent
+        .post(url)
+        .set("Authorization", &format!("Bearer {token}"))
+        .set("Content-Type", "application/json");
+    match request.send_bytes(&payload) {
+        Ok(response) => read_json(response).map_err(|_| MusicErr::Other),
+        Err(ureq::Error::Status(409, response)) => {
+            let mut raw = String::new();
+            let _ = response.into_reader().take(8 * 1024).read_to_string(&mut raw);
+            let epoch = serde_json::from_str::<serde_json::Value>(&raw)
+                .ok()
+                .map(|value| {
+                    value["detail"]["epoch"]
+                        .as_i64()
+                        .or_else(|| value["epoch"].as_i64())
+                        .unwrap_or(0)
+                })
+                .unwrap_or(0);
+            Err(MusicErr::Taken(epoch))
+        }
+        Err(_) => Err(MusicErr::Other),
+    }
+}
+
+/// 解析服务端的 `/music` 响应：没有 `now`（没人播或已过期）时返回 None。
+fn parse_remote(value: &serde_json::Value) -> Option<RemoteMusic> {
+    let now = value["now"].as_object()?;
+    let text = |key: &str| {
+        now.get(key)
+            .and_then(|item| item.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    Some(RemoteMusic {
+        device: text("device"),
+        device_name: text("device_name"),
+        title: text("title"),
+        artist: text("artist"),
+        source: text("source"),
+        url: text("url"),
+        position: now.get("position").and_then(|v| v.as_f64()).unwrap_or(0.0),
+        duration: now.get("duration").and_then(|v| v.as_f64()).unwrap_or(0.0),
+        updated_at: now.get("updated_at").and_then(|v| v.as_i64()).unwrap_or(0),
+    })
+}
+
+fn music_body(cfg: &Config, music: &PresenceMusic, epoch: i64) -> serde_json::Value {    serde_json::json!({
+        "device": cfg.device_id,
+        "name": cfg.device_name,
+        "title": music.title,
+        "artist": music.artist,
+        "source": music.source,
+        "url": music.url,
+        "position": music.position,
+        "duration": music.duration,
+        "playing": music.playing,
+        "epoch": epoch,
+    })
+}
+
+/// 每轮同步做一次播放权维护。三条规则：
+/// 1. 本机开始出声但还没拿权 → 自动 claim（别的设备随即暂停）；
+/// 2. 持权时持续上报进度；收到 409 说明被接手，交给 Shell 暂停本机；
+/// 3. 停止出声时 release，网页和其他设备不再显示在播。
+fn music_tick(
+    agent: &ureq::Agent,
+    cfg: &Config,
+    presence: &Arc<Mutex<PresenceOut>>,
+    clock: &mut MusicClock,
+    snap: &mut Snapshot,
+    claim_request: &AtomicBool,
+) {
+    let base = normalize_base(&cfg.base_url);
+    // 每轮重新判定：Shell 处理完暂停后，本机不再出声，下一轮自然不会再置位。
+    snap.music_lost = false;
+    let music = presence
+        .lock()
+        .ok()
+        .and_then(|state| state.music.clone())
+        .filter(|music| !music.title.trim().is_empty() && !music.source.is_empty())
+        .unwrap_or_default();
+    let playing = music.playing;
+
+    if claim_request.swap(false, Ordering::Relaxed) {
+        clock.claim_pending = true;
+        clock.stood_down = false;
+    }
+    // 从「没在放」变成「在放」= 用户明确要在这台机器上听：解除退让并重新拿权。
+    if playing && !clock.was_playing {
+        clock.stood_down = false;
+    }
+    clock.was_playing = playing;
+    // 被接管过就别自动抢回来，否则两台机器会来回抢。
+    if playing && !clock.owned && !clock.claim_pending && !clock.stood_down {
+        clock.claim_pending = true;
+    }
+
+    if clock.claim_pending {
+        match music_post::<serde_json::Value>(
+            agent,
+            &format!("{base}/api/daozai/music/claim"),
+            &cfg.token,
+            &music_body(cfg, &music, 0),
+        ) {
+            Ok(value) => {
+                clock.epoch = value["epoch"].as_i64().unwrap_or(clock.epoch);
+                clock.owned = true;
+                clock.claim_pending = false;
+                snap.music_lost = false;
+            }
+            // 拿不到权就先不上报，避免用旧 epoch 反被误判。
+            Err(_) => {}
+        }
+    } else if clock.owned && playing {
+        match music_post::<serde_json::Value>(
+            agent,
+            &format!("{base}/api/daozai/music/state"),
+            &cfg.token,
+            &music_body(cfg, &music, clock.epoch),
+        ) {
+            Ok(_) => {}
+            Err(MusicErr::Taken(epoch)) => {
+                clock.epoch = epoch.max(clock.epoch);
+                clock.owned = false;
+                clock.stood_down = true;
+                snap.music_lost = true;
+            }
+            Err(MusicErr::Other) => {}
+        }
+    } else if clock.owned && !playing {
+        let _ = music_post::<serde_json::Value>(
+            agent,
+            &format!("{base}/api/daozai/music/release"),
+            &cfg.token,
+            &music_body(cfg, &music, clock.epoch),
+        );
+        clock.owned = false;
+    }
+
+    if let Ok(value) = get_json::<serde_json::Value>(
+        agent,
+        &format!("{base}/api/daozai/music"),
+        &cfg.token,
+    ) {
+        let epoch = value["epoch"].as_i64().unwrap_or(0);
+        snap.music_epoch = epoch;
+        if let Some(remote) = parse_remote(&value) {
+            if remote.device == cfg.device_id {
+                snap.music_remote = None;
+            } else {
+                snap.music_remote = Some(remote);
+            }
+        } else {
+            snap.music_remote = None;
+        }
+        // 别人 epoch 更大且本机还在放：立刻让出播放权。
+        if playing && clock.owned && epoch > clock.epoch {
+            clock.epoch = epoch;
+            clock.owned = false;
+            clock.stood_down = true;
+            snap.music_lost = true;
+        }
     }
 }
 
@@ -1332,5 +1599,85 @@ mod tests {
         assert_eq!(view.weather().unwrap().temp, 18.5);
         assert_eq!(view.monitor().unwrap().cpu, Some(12.0));
         assert_eq!(view.monitor().unwrap().gpu, Some(30.0));
+    }
+}
+
+#[cfg(test)]
+mod music_tests {
+    use super::*;
+
+    fn cfg() -> Config {
+        Config {
+            base_url: "https://nos.example.com".into(),
+            token: "t".into(),
+            device_id: "dev-b".into(),
+            device_name: "宿舍笔记本".into(),
+        }
+    }
+
+    #[test]
+    fn music_body_carries_progress_and_takeover_url() {
+        let music = PresenceMusic {
+            source: "Daozai.WebDav".into(),
+            title: "晴天".into(),
+            artist: "周杰伦".into(),
+            playing: true,
+            position: 42.5,
+            duration: 269.0,
+            url: "https://nas.local/a.mp3".into(),
+        };
+        let body = music_body(&cfg(), &music, 7);
+        assert_eq!(body["device"], "dev-b");
+        assert_eq!(body["name"], "宿舍笔记本");
+        assert_eq!(body["title"], "晴天");
+        assert_eq!(body["position"], 42.5);
+        assert_eq!(body["duration"], 269.0);
+        assert_eq!(body["epoch"], 7);
+        assert_eq!(body["url"], "https://nas.local/a.mp3");
+        assert_eq!(body["playing"], true);
+    }
+
+    #[test]
+    fn remote_snapshot_parses_every_field_used_by_the_island() {
+        let value = serde_json::json!({
+            "epoch": 4,
+            "now": {
+                "device": "dev-a",
+                "device_name": "书房台式",
+                "title": "十年",
+                "artist": "陈奕迅",
+                "source": "Daozai.WebDav",
+                "url": "https://nas.local/10.mp3",
+                "position": 12.0,
+                "duration": 200.0,
+                "updated_at": 1700000000
+            }
+        });
+        let remote = parse_remote(&value).expect("应解析出远端在播");
+        assert_eq!(remote.device, "dev-a");
+        assert_eq!(remote.device_name, "书房台式");
+        assert_eq!(remote.title, "十年");
+        assert_eq!(remote.artist, "陈奕迅");
+        assert_eq!(remote.url, "https://nas.local/10.mp3");
+        assert_eq!(remote.position, 12.0);
+        assert_eq!(remote.duration, 200.0);
+    }
+
+    #[test]
+    fn nobody_playing_parses_to_none() {
+        assert!(parse_remote(&serde_json::json!({"epoch": 2, "now": null})).is_none());
+        assert!(parse_remote(&serde_json::json!({"epoch": 0})).is_none());
+    }
+
+    #[test]
+    fn presence_music_defaults_keep_old_payloads_readable() {
+        // 老版本心跳没有 position/url：serde 默认值要让它们仍然能解析。
+        let music: PresenceMusic = serde_json::from_str(
+            r#"{"source":"QQMusic.exe","title":"歌","artist":"人","playing":true}"#,
+        )
+        .unwrap();
+        assert_eq!(music.position, 0.0);
+        assert_eq!(music.duration, 0.0);
+        assert!(music.url.is_empty());
     }
 }

@@ -8683,3 +8683,86 @@ fn webdav_panel_preview(){
     let image=image::RgbaImage::from_raw(raster.w as u32,raster.h as u32,rgba).unwrap();
     image::imageops::crop_imm(&image,((WIN_W-crate::app::PW)/2.0*ppp-12.0) as u32,0,((crate::app::PW+12.0)*ppp+12.0) as u32,((crate::app::PH+12.0)*ppp) as u32).to_image().save(dest.join("webdav-panel.png")).unwrap();
 }
+
+#[test]
+fn island_shows_another_device_playing_and_offers_takeover() {
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+    let mut h=H::new();
+    h.app.sync.music_remote=Some(crate::sync::RemoteMusic{
+        device:"dev-a".into(),device_name:"书房台式".into(),
+        title:"晴天".into(),artist:"周杰伦".into(),
+        source:"Daozai.WebDav".into(),url:"https://nas.local/a.mp3".into(),
+        position:42.0,duration:269.0,
+        updated_at:chrono::Local::now().timestamp(),
+    });
+    h.hover(Pos2::new(WIN_W/2.0,12.0),1.0);
+    h.frame(vec![]);
+    fn shows(h:&H,text:&str)->bool{h.shapes.iter().any(|s|matches!(&s.shape,egui::Shape::Text(t)if t.galley.text().contains(text)))}
+    assert!(shows(&h,"晴天"),"岛上应显示对方的曲名");
+    assert!(shows(&h,"书房台式 正在播放"),"应写明是谁在播");
+    assert!(!shows(&h,"暂无音乐"));
+
+    // 播放键变成「接手」：发出 MusicTakeover，并带上可续播地址与进度。
+    h.cmds.clear();
+    h.click(H::local(210.5,118.0));
+    let takeover=h.cmds.iter().find_map(|cmd|match cmd{
+        crate::app::Cmd::MusicTakeover{url,track,position}=>Some((url.clone(),track.clone(),*position)),
+        _=>None,
+    }).expect("应发出接手命令");
+    assert_eq!(takeover.0,"https://nas.local/a.mp3");
+    assert_eq!(takeover.1,"晴天");
+    assert!(takeover.2>=42.0,"应从对方停下的进度继续");
+}
+
+#[test]
+fn local_playback_wins_over_a_remote_snapshot() {
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+    let mut h=H::new();
+    h.media=crate::smtc::NowPlaying{source:"QQMusic.exe".into(),title:"本机歌曲".into(),artist:"歌手".into(),playing:true,..Default::default()};
+    h.app.sync.music_remote=Some(crate::sync::RemoteMusic{
+        device:"dev-a".into(),device_name:"书房台式".into(),title:"对方歌曲".into(),
+        position:1.0,duration:100.0,..Default::default()
+    });
+    h.hover(Pos2::new(WIN_W/2.0,12.0),1.0);
+    h.frame(vec![]);
+    fn shows(h:&H,text:&str)->bool{h.shapes.iter().any(|s|matches!(&s.shape,egui::Shape::Text(t)if t.galley.text().contains(text)))}
+    assert!(shows(&h,"本机歌曲"),"本机在播时显示自己的");
+    assert!(!shows(&h,"对方歌曲"));
+}
+
+#[test]
+fn losing_playback_rights_returns_the_source_to_pause() {
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+    let mut h=H::new();
+    h.media=crate::smtc::NowPlaying{
+        source:"QQMusic.exe".into(),title:"歌".into(),playing:true,
+        playback_type:crate::smtc::MediaKind::Music,..Default::default()
+    };
+    h.frame(vec![]);
+    assert_eq!(h.app.media.playing,true,"媒体状态应先更新");
+    assert_eq!(h.app.pause_local_music().as_deref(),Some("QQMusic.exe"));
+    // 已经暂停时不再发指令，免得把播放器重新唤醒。
+    h.media.playing=false;
+    h.frame(vec![]);
+    assert!(h.app.pause_local_music().is_none());
+}
+
+#[test]
+fn paused_local_track_yields_to_another_device() {
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+    let mut h=H::new();
+    // 本机引擎停在暂停态（被接手后就是这样），仍应显示正在放的对方。
+    h.media=crate::smtc::NowPlaying{
+        source:"Daozai.WebDav".into(),title:"本机暂停的歌".into(),playing:false,
+        playback_type:crate::smtc::MediaKind::Music,..Default::default()
+    };
+    h.app.sync.music_remote=Some(crate::sync::RemoteMusic{
+        device:"dev-a".into(),device_name:"书房台式".into(),title:"对方歌曲".into(),
+        position:5.0,duration:100.0,..Default::default()
+    });
+    h.hover(Pos2::new(WIN_W/2.0,12.0),1.0);
+    h.frame(vec![]);
+    fn shows(h:&H,text:&str)->bool{h.shapes.iter().any(|s|matches!(&s.shape,egui::Shape::Text(t)if t.galley.text().contains(text)))}
+    assert!(shows(&h,"对方歌曲"),"本机只是暂停，应让位给正在播放的对方");
+    assert!(!shows(&h,"本机暂停的歌"));
+}

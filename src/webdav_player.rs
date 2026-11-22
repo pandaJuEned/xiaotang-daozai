@@ -115,6 +115,8 @@ impl State {
 enum Cmd {
     Play(Vec<Track>, usize),
     Toggle,
+    /// 只暂停：跨设备接力时被抢占方调用，不会反向唤起。
+    Pause,
     Next,
     Prev,
     Seek(f64),
@@ -167,6 +169,10 @@ impl Engine {
             current.duration = 0.0;
         }
         let _ = self.tx.send(Cmd::Play(playlist, index));
+    }
+
+    pub fn pause(&self) {
+        let _ = self.tx.send(Cmd::Pause);
     }
 
     pub fn toggle(&self) {
@@ -346,6 +352,11 @@ fn handle(
             if player.is_paused() {
                 player.play();
             } else {
+                player.pause();
+            }
+        }
+        Cmd::Pause => {
+            if !player.is_paused() {
                 player.pause();
             }
         }

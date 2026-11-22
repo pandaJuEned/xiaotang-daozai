@@ -429,6 +429,54 @@ impl App {
         });
     }
 
+    /// 从另一台设备接手：曲目若在本地播放列表里就从原下标继续，否则单曲起播。
+    pub fn webdav_takeover(&mut self, url: &str, track: &str, position: f64, ctx: &egui::Context) {
+        let url = url.trim();
+        if url.is_empty() {
+            // 对方放的是系统播放器里的歌，拿不到可续播地址：只保留播放权，由用户自己开播。
+            self.say("已接手播放；对方的曲目只能在它那台机器上续播");
+            return;
+        }
+        #[cfg(windows)]
+        {
+            let playlist = self.webdav.playlist();
+            let (tracks, index): (Vec<crate::webdav_player::Track>, usize) =
+                match playlist.iter().position(|item| item.url == url) {
+                    Some(index) => (
+                        playlist.iter()
+                            .map(|item| crate::webdav_player::Track { name: item.name.clone(), url: item.url.clone() })
+                            .collect(),
+                        index,
+                    ),
+                    None => (
+                        vec![crate::webdav_player::Track { name: track.to_string(), url: url.to_string() }],
+                        0,
+                    ),
+                };
+            let cfg = self.webdav.config();
+            if !cfg.ready() {
+                return;
+            }
+            if self.webdav.engine.is_none() {
+                let password = webdav::load_password(&cfg).unwrap_or_default();
+                match crate::webdav_player::Engine::start(ctx.clone(), cfg, password) {
+                    Some(engine) => self.webdav.engine = Some(engine),
+                    None => return,
+                }
+            }
+            if let Some(engine) = &self.webdav.engine {
+                engine.play(tracks, index);
+                engine.set_order(self.webdav_order());
+                // 从对方停下的位置继续，而不是从头播。
+                engine.seek(position.max(0.0));
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (track, position, ctx);
+        }
+    }
+
     /// 当前播放顺序（顺序 / 乱序）。
     pub fn webdav_order(&self) -> crate::webdav_player::Order {
         if self.webdav.shuffle {

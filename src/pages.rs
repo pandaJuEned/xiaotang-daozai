@@ -54,6 +54,21 @@ impl App {
         }
         let np=self.media.clone();
         let has=!np.title.is_empty();
+        // 本机没在放、但别的设备在放：显示对方曲目，播放键变成「接手」。
+        let remote=self.sync.music_remote.clone().filter(|item| !item.title.trim().is_empty());
+        // 本机暂停也算「没在放」：被接手后引擎停在 Paused，仍应显示对方。
+        let remote_only=!np.playing && remote.is_some();
+        let drift=remote.as_ref().map(|item| {
+            (chrono::Local::now().timestamp()-item.updated_at).clamp(0,6) as f64
+        }).unwrap_or(0.0);
+        let (title,artist,position,duration,playing)=match (&remote,remote_only) {
+            (Some(item),true)=>{
+                let who=if item.device_name.trim().is_empty(){item.device.clone()}else{item.device_name.clone()};
+                (item.title.clone(),format!("{who} 正在播放"),item.position+drift,item.duration,true)
+            }
+            _=>(np.title.clone(),np.artist.clone(),np.position,np.duration,np.playing),
+        };
+        let shown=has||remote_only;
         let with_lyrics=has && self.show_lyrics;
         let ctx=c.ui.ctx().clone();
         let playing_t=ctx.animate_bool_with_time(egui::Id::new("np-playing"),np.playing,0.22);
@@ -74,7 +89,11 @@ impl App {
             paint::note(c,75.0,44.0,26.0,Color32::from_rgb(110,110,114));
         }
 
-        if !has {
+        if remote_only {
+            // 别的设备在放：标题区直接显示对方曲目与进度，播放键变成「接手」。
+            c.text(121.0,47.0,&c.fit(&title,14.0,W::Bold,214.0),14.0,W::Bold,theme::WHITE,H::Left);
+            c.text(121.0,67.0,&c.fit(&artist,size::BODY,W::Regular,214.0),size::BODY,W::Regular,theme::GRAY,H::Left);
+        } else if !has {
             let cfg=self.webdav.config();
             if cfg.ready() {
                 let host=url_host(&cfg.url);
@@ -98,38 +117,38 @@ impl App {
             let text_x=if with_lyrics {99.0}else{121.0};
             let text_width=if with_lyrics {123.0}else{220.0};
             let title_size=if with_lyrics {12.0}else{14.0};
-            c.text(text_x,if with_lyrics {41.0}else{53.0},&c.fit(&np.title,title_size,W::Bold,text_width),title_size,W::Bold,theme::WHITE,H::Left);
-            c.text(text_x,if with_lyrics {57.0}else{67.0},&c.fit(&np.artist,size::BODY,W::Regular,text_width),size::BODY,W::Regular,theme::GRAY,H::Left);
+            c.text(text_x,if with_lyrics {41.0}else{53.0},&c.fit(&title,title_size,W::Bold,text_width),title_size,W::Bold,theme::WHITE,H::Left);
+            c.text(text_x,if with_lyrics {57.0}else{67.0},&c.fit(&artist,size::BODY,W::Regular,text_width),size::BODY,W::Regular,theme::GRAY,H::Left);
             if with_lyrics {self.draw_music_lyrics(c);}
         }
 
-        let tc=if has {theme::WHITE}else{Color32::from_rgb(78,78,82)};
+        let tc=if shown {theme::WHITE}else{Color32::from_rgb(78,78,82)};
         let (bx,bw,by)=if with_lyrics {(44.0,176.0,82.0)}else{(96.0,221.0,92.6)};
         let bar=c.hit_drag(bx-4.0,by-7.0,bw+8.0,14.0,"m-seek");
         let seek_position=if has && np.duration>0.0 && (bar.is_pointer_button_down_on() || bar.clicked() || bar.drag_stopped()) {
             bar.interact_pointer_pos().or_else(||ctx.input(|i|i.pointer.interact_pos()))
                 .map(|pointer|((c.to_local(pointer).x-bx)/bw).clamp(0.0,1.0) as f64*np.duration)
         }else{None};
-        let position=seek_position.unwrap_or(np.position);
-        let frac=if np.duration>0.0 {(position/np.duration).clamp(0.0,1.0) as f32}else{0.0};
+        let position=seek_position.unwrap_or(position);
+        let frac=if duration>0.0 {(position/duration).clamp(0.0,1.0) as f32}else{0.0};
         let (time_y,time_size,right)=if with_lyrics {(100.0,10.0,220.0)}else{(97.0,15.0,375.0)};
         c.text(44.0,time_y,&mmss(position),time_size,W::Regular,tc,H::Left);
-        let remaining=if has && np.duration<=0.0{"--:--".into()}else{format!("-{}",mmss((np.duration-position).max(0.0)))};
+        let remaining=if shown && duration<=0.0{"--:--".into()}else{format!("-{}",mmss((duration-position).max(0.0)))};
         c.text(right,time_y,&remaining,time_size,W::Regular,tc,H::Right);
         let (bh,_)=c.hover_t(&bar);
-        let bh=if has {bh}else{0.0};
+        let bh=if shown {bh}else{0.0};
         let th=lerp(3.5,5.0,bh);
-        c.fill(bx,by-th/2.0,bw,th,th/2.0,if has {Color32::from_gray(90)}else{theme::TRACK});
+        c.fill(bx,by-th/2.0,bw,th,th/2.0,if shown {Color32::from_gray(90)}else{theme::TRACK});
         if self.settings.skin==crate::model::Skin::Fluid {
             let head=bx+bw*frac;
-            let hot=if bar.is_pointer_button_down_on(){1.0}else if np.playing{0.62}else{0.45};
-            if has && frac>0.0 {
+            let hot=if bar.is_pointer_button_down_on(){1.0}else if playing{0.62}else{0.45};
+            if shown && frac>0.0 {
                 c.fill(bx,by-th/2.0,bw*frac,th,th/2.0,self.fluid.tint_color(0.78));
                 paint::chase(c,bx,head,by,th,self.fluid.tint_color(0.30),hot);
             }
             if c.live {
                 let pos=c.pos(head,by)-self.fluid_origin;
-                self.fluid.set_seek((has && frac>0.0).then_some((pos.x,pos.y)),hot);
+                self.fluid.set_seek((shown && frac>0.0).then_some((pos.x,pos.y)),hot);
             }
         }else{
         if frac>0.0 {c.fill(bx,by-th/2.0,(bw*frac).max(th),th,th/2.0,theme::WHITE);}
@@ -140,19 +159,19 @@ impl App {
         }
 
         let y=118.0;
-        let ic=if has {theme::WHITE}else{Color32::from_rgb(88,88,92)};
+        let ic=if shown {theme::WHITE}else{Color32::from_rgb(88,88,92)};
         let btn=|x:f32,w:f32,id:&str| {
             let response=c.hit(x-w/2.0,y-12.0,w,24.0,id);
             let (hover,pressed)=c.hover_t(&response);
-            if has && hover>0.01 {c.faded(hover).circle(x,y,12.5,Color32::from_white_alpha(20));}
+            if shown && hover>0.01 {c.faded(hover).circle(x,y,12.5,Color32::from_white_alpha(20));}
             (response,c.scaled(x,y,1.0-0.1*pressed))
         };
         let (lyrics_button,lyrics_card)=btn(74.0,26.0,"m-lyr");
-        lyrics_card.text(74.0,y+5.0,"词",14.0,W::Semibold,if !has {ic}else if self.show_lyrics {theme::WHITE}else{theme::GRAY},H::Center);
+        lyrics_card.text(74.0,y+5.0,"词",14.0,W::Semibold,if !shown {ic}else if self.show_lyrics {theme::WHITE}else{theme::GRAY},H::Center);
         let (previous,previous_card)=btn(162.0,30.0,"m-prev");
         paint::skip(&previous_card,162.0,y,-1.0,ic);
         let (play,play_card)=btn(210.5,30.0,"m-play");
-        paint::play_pause(&play_card,211.0,y,15.0,playing_t,ic);
+        paint::play_pause(&play_card,211.0,y,15.0,if remote_only {0.0}else{playing_t},ic);
         let (next,next_card)=btn(258.0,30.0,"m-next");
         paint::skip(&next_card,258.0,y,1.0,ic);
         let (volume_button,volume_card)=btn(367.0,26.0,"m-volume");
@@ -173,6 +192,12 @@ impl App {
             if previous.clicked() {cmds.push(Cmd::Media(Transport::Prev));}
             if play.clicked() {cmds.push(Cmd::Media(Transport::Toggle));}
             if next.clicked() {cmds.push(Cmd::Media(Transport::Next));}
+        } else if remote_only {
+            // 接手：先抢播放权（对方随即暂停），再在本机从同一进度继续。
+            if play.clicked() {
+                let (url,track,at)=remote.as_ref().map(|item|(item.url.clone(),item.title.clone(),item.position+drift)).unwrap_or_default();
+                cmds.push(Cmd::MusicTakeover{url,track,position:at});
+            }
         } else if self.webdav.config().ready() && !self.webdav.playlist().is_empty() && play.clicked() {
             // 没有系统媒体时用同一颗播放键起播 WebDAV 曲库，位置与手势都不变。
             cmds.push(Cmd::WebdavPlay);
