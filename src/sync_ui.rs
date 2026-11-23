@@ -149,6 +149,7 @@ impl App {
                 }
                 let me = device.id == self.sync_device.id;
                 let is_primary = !primary.is_empty() && device.id == primary;
+                let deleting = self.sync_delete_confirm.as_deref() == Some(device.id.as_str());
                 ui.horizontal(|ui| {
                     let color = if device.online {
                         egui::Color32::from_rgb(90, 190, 120)
@@ -172,7 +173,7 @@ impl App {
                         );
                     }
                 });
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     let status = if device.online {
                         "在线".to_string()
                     } else if device.last_seen.is_empty() {
@@ -197,17 +198,74 @@ impl App {
                             .size(11.0)
                             .color(egui::Color32::from_gray(150)),
                     );
-                    if !me && !is_primary && ui.small_button("设为主设备").clicked() {
-                        self.settings.sync_primary_device = device.id.clone();
-                        self.settings.save();
-                        self.say(format!("已指定「{}」负责提醒", device.name));
+                    if !me {
+                        if !is_primary && ui.small_button("设为主设备").clicked() {
+                            self.settings.sync_primary_device = device.id.clone();
+                            self.settings.save();
+                            self.say(format!("已指定「{}」负责提醒", device.name));
+                        }
+                        if ui.small_button("删除").clicked() {
+                            self.sync_delete_confirm = if deleting {
+                                None
+                            } else {
+                                Some(device.id.clone())
+                            };
+                        }
                     }
                 });
+                if deleting {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            RichText::new(format!(
+                                "确定从设备列表删除「{}」？只删登记记录，不撤销它的令牌；对方下次启动或重连后会重新出现。",
+                                device.name
+                            ))
+                            .size(11.0)
+                            .color(egui::Color32::from_gray(150)),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        let confirm = egui::Button::new(
+                            RichText::new("确认删除")
+                                .size(12.0)
+                                .color(egui::Color32::from_rgb(235, 120, 120)),
+                        );
+                        if ui.add(confirm).clicked() {
+                            if self.settings.sync_primary_device == device.id {
+                                self.settings.sync_primary_device.clear();
+                                self.settings.save();
+                            }
+                            self.sync_delete_confirm = None;
+                            self.say(format!("正在删除设备「{}」…", device.name));
+                            pending.push(Cmd::SyncForgetDevice(device.id.clone()));
+                        }
+                        if ui.button("取消").clicked() {
+                            self.sync_delete_confirm = None;
+                        }
+                    });
+                }
                 if is_primary && !self.settings.sync_primary_device.trim().is_empty() {
                     if ui.small_button("恢复为自动（最近活跃）").clicked() {
                         self.settings.sync_primary_device.clear();
                         self.settings.save();
                     }
+                }
+            }
+            let explicit_primary = self.settings.sync_primary_device.trim().to_string();
+            if !explicit_primary.is_empty()
+                && !self.sync.devices.iter().any(|device| device.id == explicit_primary)
+            {
+                ui.separator();
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        RichText::new("指定的主设备已不在列表中，提醒会自动回退到最近活跃的设备。")
+                            .size(11.0)
+                            .color(egui::Color32::from_gray(150)),
+                    );
+                });
+                if ui.small_button("恢复为自动（最近活跃）").clicked() {
+                    self.settings.sync_primary_device.clear();
+                    self.settings.save();
                 }
             }
         });

@@ -124,30 +124,7 @@ impl App {
         if refresh.clicked() {
             self.monitor_trend.clear();
         }
-        if self.settings.show_remote_monitor {
-            let count = self
-                .sync
-                .devices
-                .iter()
-                .filter(|device| device.online && device.id != self.sync_device.id && device.monitor().is_some())
-                .count();
-            if count > 0 {
-                let (button, body) = crate::paint::capsule(
-                    c,
-                    42.0,
-                    5.0,
-                    78.0,
-                    22.0,
-                    "monitor-remote",
-                    theme::BTN,
-                    theme::BTN_HOVER,
-                );
-                body.text(81.0, 21.0, &format!("异地 {count}"), 10.0, W::Semibold, theme::WHITE, H::Center);
-                if button.clicked() {
-                    self.remote_monitor_open = true;
-                }
-            }
-        }
+        // 异地设备统一从「异地」功能页进入，本页不再显示「异地 N」胶囊。
 
         let Some(m) = env.monitor else {
             c.text(209.5, 96.0, "还没有监控数据", 13.0, W::Bold, theme::WHITE, H::Center);
@@ -175,7 +152,7 @@ impl App {
             .map(|v| format!(" · {:.2} GHz", v as f32 / 1000.0))
             .unwrap_or_default();
         c.text(LEFT, 90.0, &format!("{state}{freq}"), 9.5, W::Semibold, theme::GRAY, H::Left);
-        // 温度单独 emphasized，机器名过长时收缩，避免挤进右侧指标格。
+        // 温度和机器名分两行：温度强调显示，机器名独占下一行，长名字截断在左栏内。
         // 桌面平台没有 ACPI 热区，此时退回显卡温度并加 `GPU` 前缀，避免把显卡温度当成机身温度。
         let (temperature, color) = match m.temperature_c {
             Some(v) => (format!("{v:.0}°C"), load_color(v)),
@@ -184,9 +161,9 @@ impl App {
                 None => ("温度 --".to_string(), theme::DIM),
             },
         };
-        let tw = c.text(LEFT, 104.0, &temperature, 10.5, W::Bold, color, H::Left);
-        let machine = c.fit(&crate::monitor::machine_name(), 8.5, W::Regular, 72.0);
-        c.text(LEFT + tw + 6.0, 104.0, &machine, 8.5, W::Regular, theme::DIM, H::Left);
+        c.text(LEFT, 104.0, &temperature, 10.5, W::Bold, color, H::Left);
+        let machine = c.fit(&crate::monitor::machine_name(), 8.5, W::Regular, CELL_X[0] - LEFT - 2.0);
+        c.text(LEFT, 116.0, &machine, 8.5, W::Regular, theme::DIM, H::Left);
 
         /* ---------- 右侧 2×2 指标格 + 电源条 ---------- */
         let mem_sub = format!(
@@ -247,7 +224,7 @@ impl App {
 
         /* ---------- 分隔线 ---------- */
         c.painter
-            .line_segment([c.pos(LEFT, 114.0), c.pos(RIGHT, 114.0)], Stroke::new(1.0_f32, HAIR));
+            .line_segment([c.pos(LEFT, 122.0), c.pos(RIGHT, 122.0)], Stroke::new(1.0_f32, HAIR));
 
         /* ---------- 翻页：负载 / 网络 ---------- */
         let load = self.monitor_page == 0;
@@ -255,7 +232,7 @@ impl App {
             // 从左到右：负载、网络；网络贴右边界。
             let right = RIGHT - (1 - i) as f32 * 38.0;
             let w = c.text_w(label, 9.0, W::Regular);
-            let hit = c.hit(right - w - 6.0, 116.0, w + 12.0, 14.0, ("monitor-page-tab", i));
+            let hit = c.hit(right - w - 6.0, 124.0, w + 12.0, 14.0, ("monitor-page-tab", i));
             let on = self.monitor_page == target;
             let color = if on {
                 theme::WHITE
@@ -264,7 +241,7 @@ impl App {
             } else {
                 theme::DIM
             };
-            c.text(right, 127.0, label, 9.0, if on { W::Semibold } else { W::Regular }, color, H::Right);
+            c.text(right, 135.0, label, 9.0, if on { W::Semibold } else { W::Regular }, color, H::Right);
             if hit.clicked() {
                 self.monitor_page = target;
             }
@@ -288,7 +265,7 @@ impl App {
             } else {
                 sample.map(|s| stamp(s.at)).unwrap_or_else(|| "--:--".into())
             };
-            c.text(cx, 146.0, &time, 8.5, W::Regular, if is_now { theme::WHITE } else { theme::DIM }, H::Center);
+            c.text(cx, 152.0, &time, 8.5, W::Regular, if is_now { theme::WHITE } else { theme::DIM }, H::Center);
             let s = sample.unwrap_or_default();
             let has = sample.is_some();
             let (big, small, dot) = if load {
@@ -304,9 +281,9 @@ impl App {
                     net_color(s.down),
                 )
             };
-            c.painter.circle_filled(c.pos(cx - 13.0, 160.0), 2.0, dot);
-            c.text(cx + 2.0, 164.0, &big, 12.0, W::Bold, theme::WHITE, H::Center);
-            c.text(cx, 176.0, &small, 8.5, W::Regular, theme::DIM, H::Center);
+            c.painter.circle_filled(c.pos(cx - 13.0, 166.0), 2.0, dot);
+            c.text(cx + 2.0, 170.0, &big, 12.0, W::Bold, theme::WHITE, H::Center);
+            c.text(cx, 182.0, &small, 8.5, W::Regular, theme::DIM, H::Center);
         }
 
         // 折线：两条序列共用一条时间轴，与上方六列对齐。
@@ -327,7 +304,7 @@ impl App {
                 .enumerate()
                 .filter_map(|(i, s)| {
                     s.map(|s| {
-                        let y = 210.0 - (get(&s) / max).clamp(0.0, 1.0) * 28.0;
+                        let y = 214.0 - (get(&s) / max).clamp(0.0, 1.0) * 28.0;
                         c.pos(center(i), y)
                     })
                 })

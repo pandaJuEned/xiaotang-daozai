@@ -1198,9 +1198,14 @@ fn island_position_drag_clamps_to_existing_limits_and_stays_resident(){
         assert!(h.app.progress()<0.01,"拖动期间不应保留展开面板");
         assert!(!h.shapes.iter().any(|s|matches!(&s.shape,egui::Shape::Text(t) if t.galley.text()=="10月28日 周三")),"拖动期间不应显示展开顶栏");
         assert_eq!(h.app.settings.island_offset,crate::model::ISLAND_OFFSET_MAX);
-        let end=if dock.is_side(){Pos2::new(start.x,65.0)}else{Pos2::new(65.0,start.y)};
+        // 左右停靠时贴住当前侧边的顶端：光标留在当前边附近，才不会先触发换边；
+        // 面板统一加高后把手位置也更高，需要拖到边缘极值才能落到最小偏移。
+        let end=if dock.is_side(){
+            let x=if dock==crate::model::Dock::Left {20.0}else{1900.0};
+            Pos2::new(x,0.0)
+        }else{Pos2::new(65.0,start.y)};
         island_drag_frame(&mut h,bounds,1.0,Some(end),None);
-        assert_eq!(h.app.settings.island_offset,-crate::model::ISLAND_OFFSET_MAX);
+        assert_eq!(h.app.settings.island_offset,-crate::model::ISLAND_OFFSET_MAX,"{dock:?} {shape:?} 拖到另一端应落在最小偏移");
         assert_eq!(h.app.settings.dock,dock);
         island_drag_frame(&mut h,bounds,1.0,Some(end),Some(false));
         let offset=h.app.settings.island_offset;
@@ -2884,7 +2889,7 @@ fn quota_update_status_is_visible_for_every_provider_and_keeps_failed_data(){
             shoot_feature(&mut h,&mut raster,&dest,&format!("quota-{}",provider.name()),90,Some(H::local(300.0,60.0)),"2026-11-07");
         }
         h.hover(H::local(300.0,60.0),1.0);
-        assert_eq!(h.app.expanded_height(),176.0,"{provider:?} 额度页应采用同宽加高的布局");
+        assert_eq!(h.app.expanded_height(),PH,"{provider:?} 所有功能页应共用同一个展开高度");
         assert!((h.app.current_width()-PW).abs()<0.1,"{provider:?} 额度页应保持原有宽度：{}",h.app.current_width());
         let expected=if provider==Provider::Claude{format!("本地记录 · {time}")}else if provider==Provider::DeepSeek{format!("CNY · {time} 更新")}else{format!("{time} 更新")};
         let status=h.shapes.iter().find_map(|s|match &s.shape{egui::Shape::Text(t)if t.galley.text()==expected=>Some(t.visual_bounding_rect()),_=>None}).unwrap_or_else(||panic!("{provider:?} 缺少更新时间：{expected}"));
@@ -3007,10 +3012,10 @@ fn workbuddy_limit_window_shows_the_resolved_moment(){
 fn quota_page_navigation_tracks_the_taller_panel(){
     let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());let mut h=H::new();h.quota_accounts(1);
     h.app.show_page(6);h.hover(H::local(300.0,60.0),0.8);
-    assert!((h.hit.height()-178.0).abs()<0.2,"额度页新增的底部空间应属于命中区域");
+    assert!((h.hit.height()-(PH+2.0)).abs()<0.2,"统一高度后新增的底部空间应属于命中区域");
     let dot=h.shapes.iter().find_map(|shape|match &shape.shape{
-        egui::Shape::Rect(rect) if (rect.rect.width()-4.0).abs()<0.1&&(rect.rect.height()-4.0).abs()<0.1&&(rect.rect.center().y-168.8).abs()<0.1=>Some(rect.rect.center()),_=>None,
-    }).expect("分页圆点应随加高的面板下移");
+        egui::Shape::Rect(rect) if (rect.rect.width()-4.0).abs()<0.1&&(rect.rect.height()-4.0).abs()<0.1&&(rect.rect.center().y-(PH-7.2)).abs()<0.1=>Some(rect.rect.center()),_=>None,
+    }).expect("分页圆点应落在统一高度的面板底部");
     h.click(dot);assert_ne!(h.app.page,6,"新增底部区域中的分页应可点击");
     h.app.show_page(6);h.hover(H::local(300.0,60.0),0.8);
     h.click(H::local(21.0,88.0));assert_eq!(h.app.page,5);
@@ -3140,7 +3145,7 @@ fn page_visibility_skips_hidden_pages_in_every_navigation_control() {
         assert_eq!(h.app.page,expected);
         h.hover(H::local(300.0,60.0),0.7);
     }
-    h.click(H::local(PW/2.0+6.0,132.8));
+    h.click(H::local(PW/2.0+6.0,PH-7.2));
     assert_eq!(h.app.page,2,"底部圆点应仅包含启用的页面");
     h.hover(H::local(300.0,60.0),0.7);
     h.frame(vec![egui::Event::Key{key:egui::Key::ArrowRight,physical_key:None,pressed:true,repeat:false,modifiers:Default::default()}]);
@@ -7025,7 +7030,7 @@ fn side_dock_opens_from_the_edge_and_collapses_back(){
         // 推到边缘停留 → 展开，面板从边缘滑出且完整留在画布内。
         for _ in 0..60 {out=side_frame(&mut h,Some(Pos2::new(edge,hgt/2.0)));}
         assert!(h.app.open && h.app.progress()>0.95,"{dock:?} 应展开");
-        assert!(out.hit.width()>crate::app::PW-1.0 && out.hit.height()<200.0,"{:?}",out.hit);
+        assert!(out.hit.width()>crate::app::PW-1.0 && out.hit.height()<PH+8.0,"{:?}",out.hit);
         assert!(Rect::from_min_size(Pos2::ZERO,Vec2::new(w,hgt)).contains_rect(out.region),"区域不能超出画布：{:?}",out.region);
         if dock==crate::model::Dock::Left {assert!(out.hit.left()<=0.5)} else {assert!(out.hit.right()>=w-0.5)}
         // 离开 → 收起。

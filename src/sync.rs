@@ -684,6 +684,34 @@ fn devices(agent: &ureq::Agent, cfg: &Config) -> Result<DevicesResponse, String>
     get_json(agent, &format!("{base}/api/daozai/devices"), &cfg.token)
 }
 
+/// 从账号的设备列表里删掉一台设备。只删登记记录，不撤销它的令牌；
+/// 那台设备如果还在运行，下次启动 / 重新连接时会再次注册。
+pub fn delete_device(cfg: &Config, device_id: &str) -> Result<(), String> {
+    let base = normalize_base(&cfg.base_url);
+    if base.is_empty() {
+        return Err("请先填写服务器地址".into());
+    }
+    if cfg.token.trim().is_empty() {
+        return Err("请先填写访问令牌".into());
+    }
+    let id = device_id.trim();
+    if id.is_empty() {
+        return Err("设备 id 为空".into());
+    }
+    let mut url = url::Url::parse(&format!("{base}/api/daozai/devices/"))
+        .map_err(|_| "服务器地址无效".to_string())?;
+    url.path_segments_mut()
+        .map_err(|_| "服务器地址无效".to_string())?
+        .push(id);
+    let response = crate::nos::http_agent()
+        .delete(url.as_str())
+        .set("Authorization", &format!("Bearer {}", cfg.token.trim()))
+        .call()
+        .map_err(http_error)?;
+    let _: serde_json::Value = read_json(response)?;
+    Ok(())
+}
+
 /// 在场心跳：不进变更流、90 秒过期，只给其他设备「看一眼」本机天气与监控。
 fn send_presence(agent: &ureq::Agent, cfg: &Config, state: &PresenceOut) -> Result<(), String> {
     let base = normalize_base(&cfg.base_url);

@@ -47,6 +47,64 @@ fn sync_and_devices_tabs_render_without_panicking() {
 }
 
 #[test]
+fn sync_device_list_offers_delete_only_for_other_devices() {
+    use super::{ENV_LOCK, H};
+    let _g = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let mut h = H::new();
+    h.app.settings.sync_enabled = true;
+    h.app.settings.nos_base_url = "https://nos.example.com".into();
+    h.app.sync_device.id = "dev-home".into();
+    h.app.sync_device.name = "书房台式".into();
+    h.app.sync = crate::sync::Snapshot {
+        configured: true,
+        connected: true,
+        devices: vec![
+            crate::sync::DeviceView {
+                id: "dev-home".into(),
+                name: "书房台式".into(),
+                online: true,
+                platform: "windows".into(),
+                last_seen: String::new(),
+                presence: Default::default(),
+            },
+            crate::sync::DeviceView {
+                id: "dev-laptop".into(),
+                name: "宿舍笔记本".into(),
+                online: false,
+                platform: "windows".into(),
+                last_seen: "2026-11-18T10:00:00.000Z".into(),
+                presence: Default::default(),
+            },
+        ],
+        ..Default::default()
+    };
+    h.app.settings_tab = 15;
+    h.app.nos_sync_section = 1;
+    h.app.open_settings();
+    h.ctx.set_embed_viewports(false);
+    let mut texts = Vec::new();
+    for _ in 0..4 {
+        let output = h
+            .ctx
+            .run(eframe::egui::RawInput::default(), |ctx| h.app.settings_ui(ctx, false));
+        texts = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                eframe::egui::Shape::Text(text) => Some(text.galley.text().to_owned()),
+                _ => None,
+            })
+            .collect();
+    }
+    assert_eq!(
+        texts.iter().filter(|text| text.as_str() == "删除").count(),
+        1,
+        "只有非本机设备才应出现删除入口：{texts:?}"
+    );
+    assert!(texts.iter().any(|text| text == "设为主设备"), "非主设备仍应保留设为主设备入口");
+}
+
+#[test]
 fn sync_pump_uploads_only_after_first_pull_and_applies_remote_todos() {
     use super::{ENV_LOCK, H};
     let _g = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());

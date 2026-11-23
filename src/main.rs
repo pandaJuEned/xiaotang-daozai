@@ -109,6 +109,8 @@ struct Shell {
     sync: Option<daozai::sync::Service>,
     /// 「测试连接」的结果通道。
     sync_test_rx: Option<std::sync::mpsc::Receiver<String>>,
+    /// 「删除设备」的结果通道：(是否成功, 提示文字)。
+    sync_forget_rx: Option<std::sync::mpsc::Receiver<(bool, String)>>,
     /// 待办对账节流：500ms 一次，扫描当前 todo.txt 与上次同步快照的差异。
     sync_pump: PollClock,
     /// 本机天气 / 监控的 presence 快照；UI 线程更新，同步线程读取。
@@ -286,6 +288,7 @@ impl Shell {
             nos_server_ready_rx: None,
             sync: None,
             sync_test_rx: None,
+            sync_forget_rx: None,
             sync_pump: PollClock::default(),
             presence: std::sync::Arc::new(std::sync::Mutex::new(Default::default())),
         }
@@ -755,6 +758,17 @@ impl eframe::App for Shell {
                 self.sync_test_rx=None;
             }
         }
+        if let Some(rx)=&self.sync_forget_rx {
+            if let Ok((ok,message))=rx.try_recv() {
+                self.app.say(message);
+                self.sync_forget_rx=None;
+                if ok {
+                    // 重建同步服务：立即重新 hello，设备列表马上少一台。
+                    self.sync=None;
+                    self.app.sync.error=None;
+                }
+            }
+        }
         // 待办对账：UI 线程独占 todo.txt，先采纳远端，再把本地差异推进 outbox。
         if self.app.settings.sync_enabled && self.sync_pump.ready(Duration::from_millis(500)) {
             self.sync_pump=PollClock::now();
@@ -1129,6 +1143,24 @@ impl eframe::App for Shell {
                 Cmd::SyncNow => {
                     self.sync=None;
                     self.app.sync.error=None;
+                },
+                Cmd::SyncForgetDevice(id) => {
+                    let cfg=self.app.sync_config();
+                    let name=self.app.sync.devices.iter()
+                        .find(|device|device.id==id)
+                        .map(|device|device.name.clone())
+                        .unwrap_or_else(||id.clone());
+                    let ctx=ctx.clone();
+                    let (tx,rx)=std::sync::mpsc::channel::<(bool,String)>();
+                    std::thread::Builder::new().name("daozai-sync-forget".into()).spawn(move||{
+                        let (ok,message)=match daozai::sync::delete_device(&cfg,&id) {
+                            Ok(())=>(true,format!("已删除设备「{name}」")),
+                            Err(error)=>(false,format!("删除设备失败：{error}")),
+                        };
+                        let _=tx.send((ok,message));
+                        ctx.request_repaint();
+                    }).ok();
+                    self.sync_forget_rx=Some(rx);
                 },
                 Cmd::SyncTest(base_url, token) => {
                     let ctx=ctx.clone();
